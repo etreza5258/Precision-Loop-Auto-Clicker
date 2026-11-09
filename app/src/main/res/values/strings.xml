@@ -1,0 +1,26 @@
+
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <string name="app_name">Precision Loop Auto Clicker</string>
+    <string name="accessibility_description">سرویس اجرای لمس خودکار برای برنامه Precision Loop</string>
+
+    <string name="start">شروع</string>
+    <string name="stop">توقف کلیک‌ها</string>
+    <string name="shutdown">خاموش کردن کامل برنامه</string>
+    <string name="open_app">صفحه اصلی برنامه</string>
+    <string name="clear_reports">پاک کردن گزارش‌ها</string>
+
+    <string name="cycle_duration">زمان چرخه</string>
+    <string name="click_count">تعداد کلیک در هر چرخه</string>
+    <string name="touch_duration">مدت لمس</string>
+    <string name="pause_duration">مکث بین چرخه‌ها</string>
+
+    <string name="clock">ساعت گوشی</string>
+    <string name="countdown">شمارش معکوس</string>
+    <string name="cycle_reports">گزارش ۲۰ چرخه آخر</string>
+
+    <string name="seconds">ثانیه</string>
+    <string name="milliseconds">میلی‌ثانیه</string>
+
+</resources>
