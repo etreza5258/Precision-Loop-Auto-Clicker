@@ -1,3 +1,4 @@
+
 package com.precision.loopclicker;
 
 import android.accessibilityservice.AccessibilityService;
@@ -5,13 +6,15 @@ import android.accessibilityservice.GestureDescription;
 import android.graphics.Path;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.view.accessibility.AccessibilityEvent;
 
 public class AutoClickService extends AccessibilityService {
 
     private static AutoClickService instance;
 
-    private final Handler handler = new Handler(Looper.getMainLooper());
+    private final Handler handler =
+            new Handler(Looper.getMainLooper());
 
     private int targetX = 500;
     private int targetY = 500;
@@ -24,6 +27,13 @@ public class AutoClickService extends AccessibilityService {
 
     private long successfulClicks = 0;
     private long failedClicks = 0;
+
+    // اطلاعات اندازه‌گیری تأخیر Gesture
+    private long dispatchStartNanos = 0;
+    private long lastGestureLatencyNanos = 0;
+    private long totalGestureLatencyNanos = 0;
+    private long maxGestureLatencyNanos = 0;
+    private long measuredGestures = 0;
 
     public static AutoClickService getInstance() {
         return instance;
@@ -47,6 +57,7 @@ public class AutoClickService extends AccessibilityService {
 
     @Override
     public void onDestroy() {
+
         handler.post(() -> finishGesture(false));
 
         if (instance == this) {
@@ -57,11 +68,13 @@ public class AutoClickService extends AccessibilityService {
     }
 
     public void setTarget(int x, int y) {
+
         targetX = Math.max(0, x);
         targetY = Math.max(0, y);
     }
 
     public void setTouchDuration(long durationMs) {
+
         touchDurationMs = Math.max(1, durationMs);
     }
 
@@ -77,14 +90,42 @@ public class AutoClickService extends AccessibilityService {
         return failedClicks;
     }
 
+    public long getLastGestureLatencyNanos() {
+        return lastGestureLatencyNanos;
+    }
+
+    public long getMaxGestureLatencyNanos() {
+        return maxGestureLatencyNanos;
+    }
+
+    public long getAverageGestureLatencyNanos() {
+
+        if (measuredGestures == 0) {
+            return 0;
+        }
+
+        return totalGestureLatencyNanos / measuredGestures;
+    }
+
+    public long getMeasuredGestures() {
+        return measuredGestures;
+    }
+
     public void resetClickCounters() {
+
         successfulClicks = 0;
         failedClicks = 0;
+
+        lastGestureLatencyNanos = 0;
+        totalGestureLatencyNanos = 0;
+        maxGestureLatencyNanos = 0;
+        measuredGestures = 0;
     }
 
     public void performClick(Runnable completion) {
 
         if (gestureInProgress) {
+
             failedClicks++;
 
             if (completion != null) {
@@ -116,7 +157,11 @@ public class AutoClickService extends AccessibilityService {
 
         boolean accepted;
 
+        dispatchStartNanos =
+                SystemClock.elapsedRealtimeNanos();
+
         try {
+
             accepted = dispatchGesture(
                     gesture,
                     new GestureResultCallback() {
@@ -125,7 +170,9 @@ public class AutoClickService extends AccessibilityService {
                         public void onCompleted(
                                 GestureDescription description
                         ) {
+
                             super.onCompleted(description);
+
                             finishGesture(true);
                         }
 
@@ -133,7 +180,9 @@ public class AutoClickService extends AccessibilityService {
                         public void onCancelled(
                                 GestureDescription description
                         ) {
+
                             super.onCancelled(description);
+
                             finishGesture(false);
                         }
                     },
@@ -141,6 +190,7 @@ public class AutoClickService extends AccessibilityService {
             );
 
         } catch (Exception e) {
+
             accepted = false;
         }
 
@@ -154,6 +204,31 @@ public class AutoClickService extends AccessibilityService {
         if (!gestureInProgress) {
             return;
         }
+
+        long completionNanos =
+                SystemClock.elapsedRealtimeNanos();
+
+        long latencyNanos = Math.max(
+                0,
+                completionNanos - dispatchStartNanos
+        );
+
+        lastGestureLatencyNanos = latencyNanos;
+
+        if (measuredGestures < Long.MAX_VALUE) {
+            measuredGestures++;
+        }
+
+        if (totalGestureLatencyNanos
+                <= Long.MAX_VALUE - latencyNanos) {
+
+            totalGestureLatencyNanos += latencyNanos;
+        }
+
+        maxGestureLatencyNanos = Math.max(
+                maxGestureLatencyNanos,
+                latencyNanos
+        );
 
         gestureInProgress = false;
 
