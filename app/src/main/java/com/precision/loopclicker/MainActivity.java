@@ -10,19 +10,20 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.provider.Settings;
-import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import java.text.SimpleDateFormat;
-import java.util.Date;
+import java.util.Calendar;
 import java.util.List;
 import java.util.Locale;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class MainActivity extends Activity {
 
+    private EditText startTimeInput;
     private EditText cycleSecondsInput;
     private EditText cycleMillisInput;
     private EditText clickCountInput;
@@ -36,9 +37,6 @@ public class MainActivity extends Activity {
 
     private final Handler handler = new Handler();
 
-    private final SimpleDateFormat clockFormat =
-            new SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault());
-
     private static final String ACTION_START =
             "com.precision.loopclicker.START";
 
@@ -48,13 +46,25 @@ public class MainActivity extends Activity {
     private static final String ACTION_SHUTDOWN =
             "com.precision.loopclicker.SHUTDOWN";
 
+    private static final Pattern TIME_PATTERN =
+            Pattern.compile("^(\\d{2}):(\\d{2}):(\\d{2})\\.(\\d{3})$");
+
+    private final java.text.SimpleDateFormat clockFormat =
+            new java.text.SimpleDateFormat(
+                    "HH:mm:ss.SSS",
+                    Locale.getDefault()
+            );
+
     private final Runnable clockUpdater = new Runnable() {
         @Override
         public void run() {
 
             if (phoneClock != null) {
                 phoneClock.setText(
-                        "ساعت گوشی: " + clockFormat.format(new Date())
+                        "ساعت گوشی: "
+                                + clockFormat.format(
+                                        new java.util.Date()
+                                )
                 );
             }
 
@@ -79,6 +89,8 @@ public class MainActivity extends Activity {
 
     private void initializeViews() {
 
+        startTimeInput = findViewById(R.id.startTimeInput);
+
         cycleSecondsInput = findViewById(R.id.cycleSecondsInput);
         cycleMillisInput = findViewById(R.id.cycleMillisInput);
         clickCountInput = findViewById(R.id.clickCountInput);
@@ -89,6 +101,8 @@ public class MainActivity extends Activity {
         phoneClock = findViewById(R.id.phoneClock);
         countdownText = findViewById(R.id.countdownText);
         reportSummary = findViewById(R.id.reportSummary);
+
+        startTimeInput.setText("");
 
         cycleSecondsInput.setText("1");
         cycleMillisInput.setText("0");
@@ -152,6 +166,46 @@ public class MainActivity extends Activity {
         );
     }
 
+    private long parseStartTime(String value)
+            throws IllegalArgumentException {
+
+        Matcher matcher = TIME_PATTERN.matcher(value);
+
+        if (!matcher.matches()) {
+            throw new IllegalArgumentException(
+                    "زمان را با قالب HH:mm:ss.SSS وارد کنید"
+            );
+        }
+
+        int hour = Integer.parseInt(matcher.group(1));
+        int minute = Integer.parseInt(matcher.group(2));
+        int second = Integer.parseInt(matcher.group(3));
+        int millisecond = Integer.parseInt(matcher.group(4));
+
+        if (hour > 23 || minute > 59 || second > 59) {
+            throw new IllegalArgumentException(
+                    "ساعت واردشده معتبر نیست"
+            );
+        }
+
+        Calendar calendar = Calendar.getInstance();
+
+        calendar.set(Calendar.HOUR_OF_DAY, hour);
+        calendar.set(Calendar.MINUTE, minute);
+        calendar.set(Calendar.SECOND, second);
+        calendar.set(Calendar.MILLISECOND, millisecond);
+
+        long targetTime = calendar.getTimeInMillis();
+
+        if (targetTime <= System.currentTimeMillis()) {
+            throw new IllegalArgumentException(
+                    "زمان واردشده گذشته است. ساعت آینده را وارد کنید."
+            );
+        }
+
+        return targetTime;
+    }
+
     private void startClicking() {
 
         if (!isAccessibilityEnabled()) {
@@ -162,7 +216,8 @@ public class MainActivity extends Activity {
             return;
         }
 
-        if (!Settings.canDrawOverlays(this)) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+                && !Settings.canDrawOverlays(this)) {
 
             showError("ابتدا مجوز پنل شناور را فعال کنید");
 
@@ -171,6 +226,16 @@ public class MainActivity extends Activity {
         }
 
         try {
+
+            String startTimeText =
+                    startTimeInput.getText().toString().trim();
+
+            if (startTimeText.isEmpty()) {
+                showError("زمان دقیق شروع را وارد کنید");
+                return;
+            }
+
+            long startTimeEpoch = parseStartTime(startTimeText);
 
             long cycleSeconds = readValue(cycleSecondsInput);
             long cycleMillis = readValue(cycleMillisInput);
@@ -210,15 +275,15 @@ public class MainActivity extends Activity {
                 return;
             }
 
-            // جلوگیری از سرریز در محاسبه زمان چرخه
-            if (cycleSeconds > (Long.MAX_VALUE - cycleMillis) / 1000L) {
+            if (cycleSeconds >
+                    (Long.MAX_VALUE - cycleMillis) / 1000L) {
 
                 showError("زمان چرخه بیش از حد بزرگ است");
                 return;
             }
 
-            // جلوگیری از سرریز در محاسبه مکث
-            if (pauseSeconds > (Long.MAX_VALUE - pauseMillis) / 1000L) {
+            if (pauseSeconds >
+                    (Long.MAX_VALUE - pauseMillis) / 1000L) {
 
                 showError("زمان مکث بیش از حد بزرگ است");
                 return;
@@ -241,15 +306,19 @@ public class MainActivity extends Activity {
             if (touchMillis > cycleDuration / clickCount) {
 
                 showError(
-                        "مجموع زمان لمس‌ها برای این چرخه کافی نیست"
+                        "زمان لمس برای تعداد کلیک و مدت چرخه زیاد است"
                 );
                 return;
             }
 
-            Intent intent = new Intent(this, FloatingService.class);
+            Intent intent = new Intent(
+                    this,
+                    FloatingService.class
+            );
 
             intent.setAction(ACTION_START);
 
+            intent.putExtra("start_time_epoch_ms", startTimeEpoch);
             intent.putExtra("cycle_duration", cycleDuration);
             intent.putExtra("click_count", clickCount);
             intent.putExtra("touch_duration", touchMillis);
@@ -261,11 +330,17 @@ public class MainActivity extends Activity {
                 startService(intent);
             }
 
-            countdownText.setText("درخواست شروع ارسال شد");
+            countdownText.setText(
+                    "منتظر زمان شروع: " + startTimeText
+            );
 
         } catch (NumberFormatException e) {
 
-            showError("لطفاً تمام مقادیر را به‌صورت عدد وارد کنید");
+            showError("لطفاً تمام مقادیر عددی را صحیح وارد کنید");
+
+        } catch (IllegalArgumentException e) {
+
+            showError(e.getMessage());
 
         } catch (Exception e) {
 
@@ -296,7 +371,8 @@ public class MainActivity extends Activity {
 
     private void showFloatingPanel() {
 
-        if (!Settings.canDrawOverlays(this)) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+                && !Settings.canDrawOverlays(this)) {
 
             requestOverlayPermission();
             return;
@@ -323,9 +399,6 @@ public class MainActivity extends Activity {
         intent.setAction(ACTION_SHUTDOWN);
 
         startService(intent);
-
-        // سرویس خودش پس از دریافت فرمان خاموش می‌شود.
-        // اینجا stopService را اجرا نمی‌کنیم تا فرمان لغو نشود.
 
         finishAffinity();
     }
@@ -370,8 +443,9 @@ public class MainActivity extends Activity {
     private void requestNotificationPermission() {
 
         if (Build.VERSION.SDK_INT >= 33
-                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
-                != PackageManager.PERMISSION_GRANTED) {
+                && checkSelfPermission(
+                        Manifest.permission.POST_NOTIFICATIONS
+                ) != PackageManager.PERMISSION_GRANTED) {
 
             requestPermissions(
                     new String[]{
