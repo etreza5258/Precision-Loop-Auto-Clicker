@@ -4,6 +4,7 @@ package com.precision.loopclicker;
 import android.Manifest;
 import android.app.Activity;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -34,6 +35,7 @@ public class MainActivity extends Activity {
     private TextView reportSummary;
 
     private final Handler handler = new Handler();
+
     private final SimpleDateFormat clockFormat =
             new SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault());
 
@@ -49,9 +51,12 @@ public class MainActivity extends Activity {
     private final Runnable clockUpdater = new Runnable() {
         @Override
         public void run() {
-            phoneClock.setText(
-                    "ساعت گوشی: " + clockFormat.format(new Date())
-            );
+
+            if (phoneClock != null) {
+                phoneClock.setText(
+                        "ساعت گوشی: " + clockFormat.format(new Date())
+                );
+            }
 
             handler.postDelayed(this, 20);
         }
@@ -67,6 +72,7 @@ public class MainActivity extends Activity {
         initializeButtons();
 
         refreshReports();
+        requestNotificationPermission();
 
         handler.post(clockUpdater);
     }
@@ -149,22 +155,16 @@ public class MainActivity extends Activity {
     private void startClicking() {
 
         if (!isAccessibilityEnabled()) {
-            Toast.makeText(
-                    this,
-                    "ابتدا دسترسی Accessibility را فعال کنید",
-                    Toast.LENGTH_LONG
-            ).show();
+
+            showError("ابتدا دسترسی Accessibility را فعال کنید");
 
             openAccessibilitySettings();
             return;
         }
 
         if (!Settings.canDrawOverlays(this)) {
-            Toast.makeText(
-                    this,
-                    "ابتدا مجوز پنل شناور را فعال کنید",
-                    Toast.LENGTH_LONG
-            ).show();
+
+            showError("ابتدا مجوز پنل شناور را فعال کنید");
 
             requestOverlayPermission();
             return;
@@ -175,12 +175,54 @@ public class MainActivity extends Activity {
             long cycleSeconds = readValue(cycleSecondsInput);
             long cycleMillis = readValue(cycleMillisInput);
 
-            int clickCount = (int) readValue(clickCountInput);
+            long clickCountValue = readValue(clickCountInput);
 
             long touchMillis = readValue(touchMillisInput);
 
             long pauseSeconds = readValue(pauseSecondsInput);
             long pauseMillis = readValue(pauseMillisInput);
+
+            if (cycleSeconds < 0 || cycleMillis < 0
+                    || cycleMillis > 999) {
+
+                showError("مقدار زمان چرخه معتبر نیست");
+                return;
+            }
+
+            if (pauseSeconds < 0 || pauseMillis < 0
+                    || pauseMillis > 999) {
+
+                showError("مقدار مکث معتبر نیست");
+                return;
+            }
+
+            if (clickCountValue <= 0 || clickCountValue > 100000) {
+
+                showError("تعداد لمس باید بین ۱ تا ۱۰۰۰۰۰ باشد");
+                return;
+            }
+
+            if (touchMillis < 1 || touchMillis > 60000) {
+
+                showError(
+                        "مدت لمس باید بین ۱ تا ۶۰۰۰۰ میلی‌ثانیه باشد"
+                );
+                return;
+            }
+
+            // جلوگیری از سرریز در محاسبه زمان چرخه
+            if (cycleSeconds > (Long.MAX_VALUE - cycleMillis) / 1000L) {
+
+                showError("زمان چرخه بیش از حد بزرگ است");
+                return;
+            }
+
+            // جلوگیری از سرریز در محاسبه مکث
+            if (pauseSeconds > (Long.MAX_VALUE - pauseMillis) / 1000L) {
+
+                showError("زمان مکث بیش از حد بزرگ است");
+                return;
+            }
 
             long cycleDuration =
                     cycleSeconds * 1000L + cycleMillis;
@@ -188,28 +230,19 @@ public class MainActivity extends Activity {
             long pauseDuration =
                     pauseSeconds * 1000L + pauseMillis;
 
+            int clickCount = (int) clickCountValue;
+
             if (cycleDuration <= 0) {
+
                 showError("زمان چرخه باید بیشتر از صفر باشد");
                 return;
             }
 
-            if (clickCount <= 0 || clickCount > 100000) {
-                showError("تعداد لمس معتبر نیست");
-                return;
-            }
+            if (touchMillis > cycleDuration / clickCount) {
 
-            if (touchMillis < 1 || touchMillis > 60000) {
-                showError("مدت لمس باید بین ۱ تا ۶۰۰۰۰ میلی‌ثانیه باشد");
-                return;
-            }
-
-            if (cycleDuration < clickCount) {
-                showError("زمان چرخه برای تعداد لمس انتخابی کافی نیست");
-                return;
-            }
-
-            if (pauseDuration < 0) {
-                showError("مقدار مکث معتبر نیست");
+                showError(
+                        "مجموع زمان لمس‌ها برای این چرخه کافی نیست"
+                );
                 return;
             }
 
@@ -231,7 +264,12 @@ public class MainActivity extends Activity {
             countdownText.setText("درخواست شروع ارسال شد");
 
         } catch (NumberFormatException e) {
-            showError("لطفاً تمام مقادیر را صحیح وارد کنید");
+
+            showError("لطفاً تمام مقادیر را به‌صورت عدد وارد کنید");
+
+        } catch (Exception e) {
+
+            showError("خطا در شروع برنامه: " + e.getMessage());
         }
     }
 
@@ -259,6 +297,7 @@ public class MainActivity extends Activity {
     private void showFloatingPanel() {
 
         if (!Settings.canDrawOverlays(this)) {
+
             requestOverlayPermission();
             return;
         }
@@ -285,7 +324,8 @@ public class MainActivity extends Activity {
 
         startService(intent);
 
-        stopService(new Intent(this, FloatingService.class));
+        // سرویس خودش پس از دریافت فرمان خاموش می‌شود.
+        // اینجا stopService را اجرا نمی‌کنیم تا فرمان لغو نشود.
 
         finishAffinity();
     }
@@ -327,15 +367,32 @@ public class MainActivity extends Activity {
         }
     }
 
+    private void requestNotificationPermission() {
+
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+
+            requestPermissions(
+                    new String[]{
+                            Manifest.permission.POST_NOTIFICATIONS
+                    },
+                    1001
+            );
+        }
+    }
+
     private void refreshReports() {
 
         List<String> reports =
                 CycleReportStore.getReports(this);
 
         if (reports.isEmpty()) {
+
             reportSummary.setText(
                     "هنوز گزارشی ثبت نشده است."
             );
+
             return;
         }
 
