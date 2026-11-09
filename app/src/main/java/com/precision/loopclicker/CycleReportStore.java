@@ -25,7 +25,9 @@ public class CycleReportStore {
             long actualDurationMs,
             int successfulClicks,
             int failedClicks,
-            long pauseMs
+            long pauseMs,
+            String scheduledStartTime,
+            long startErrorMs
     ) {
 
         SharedPreferences prefs = context.getApplicationContext()
@@ -44,6 +46,9 @@ public class CycleReportStore {
             report.put("success", successfulClicks);
             report.put("failed", failedClicks);
             report.put("pause", pauseMs);
+
+            report.put("scheduled_start", scheduledStartTime);
+            report.put("start_error", startErrorMs);
 
             JSONArray updated = new JSONArray();
 
@@ -74,6 +79,34 @@ public class CycleReportStore {
         }
     }
 
+    /*
+     * سازگاری با نسخه قبلی برنامه
+     */
+    public static synchronized boolean addReport(
+            Context context,
+            long cycleNumber,
+            String startTime,
+            String endTime,
+            long actualDurationMs,
+            int successfulClicks,
+            int failedClicks,
+            long pauseMs
+    ) {
+
+        return addReport(
+                context,
+                cycleNumber,
+                startTime,
+                endTime,
+                actualDurationMs,
+                successfulClicks,
+                failedClicks,
+                pauseMs,
+                "نامشخص",
+                0
+        );
+    }
+
     public static synchronized List<String> getReports(Context context) {
 
         SharedPreferences prefs = context.getApplicationContext()
@@ -91,11 +124,40 @@ public class CycleReportStore {
                 continue;
             }
 
+            String scheduledStart =
+                    item.optString("scheduled_start", "");
+
+            String startError;
+
+            if (item.has("start_error")
+                    && !scheduledStart.isEmpty()
+                    && !"نامشخص".equals(scheduledStart)) {
+
+                long error = item.optLong("start_error", 0);
+
+                if (error > 0) {
+                    startError = error + " ms دیرتر";
+                } else if (error < 0) {
+                    startError = Math.abs(error) + " ms زودتر";
+                } else {
+                    startError = "دقیقاً مطابق زمان هدف";
+                }
+
+            } else {
+                startError = "اطلاعات موجود نیست";
+            }
+
             String line =
                     "چرخه شماره: " + item.optLong("cycle") + "\n" +
-                    "شروع: " + item.optString("start") + "\n" +
+                    "زمان هدف شروع: " +
+                    (scheduledStart.isEmpty()
+                            ? "نامشخص"
+                            : scheduledStart) + "\n" +
+                    "شروع واقعی: " + item.optString("start") + "\n" +
+                    "اختلاف شروع: " + startError + "\n" +
                     "پایان: " + item.optString("end") + "\n" +
-                    "مدت واقعی: " + item.optLong("duration") + " ms\n" +
+                    "مدت واقعی: " +
+                    item.optLong("duration") + " ms\n" +
                     "لمس موفق: " + item.optInt("success") + "\n" +
                     "لمس ناموفق: " + item.optInt("failed") + "\n" +
                     "مکث بعدی: " + item.optLong("pause") + " ms";
