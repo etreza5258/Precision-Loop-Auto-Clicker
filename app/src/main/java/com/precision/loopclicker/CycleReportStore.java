@@ -10,14 +10,47 @@ import org.json.JSONObject;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 public class CycleReportStore {
 
-    private static final String PREFS = "cycle_reports";
+    private static final String PREF_NAME = "cycle_reports";
     private static final String KEY_REPORTS = "reports";
     private static final int MAX_REPORTS = 20;
 
-    public static synchronized boolean addReport(
+    private CycleReportStore() {
+    }
+
+    // نسخه سازگار با گزارش‌های قدیمی
+    public static synchronized void addReport(
+            Context context,
+            long cycleNumber,
+            String startTime,
+            String endTime,
+            long actualDurationMs,
+            int successfulClicks,
+            int failedClicks,
+            long pauseMs
+    ) {
+        addReport(
+                context,
+                cycleNumber,
+                startTime,
+                endTime,
+                actualDurationMs,
+                successfulClicks,
+                failedClicks,
+                pauseMs,
+                "",
+                0L,
+                0L,
+                0L,
+                0L
+        );
+    }
+
+    // نسخه شامل زمان برنامه‌ریزی‌شده و خطای شروع
+    public static synchronized void addReport(
             Context context,
             long cycleNumber,
             String startTime,
@@ -29,16 +62,49 @@ public class CycleReportStore {
             String scheduledStartTime,
             long startErrorMs
     ) {
+        addReport(
+                context,
+                cycleNumber,
+                startTime,
+                endTime,
+                actualDurationMs,
+                successfulClicks,
+                failedClicks,
+                pauseMs,
+                scheduledStartTime,
+                startErrorMs,
+                0L,
+                0L,
+                0L
+        );
+    }
 
-        SharedPreferences prefs = context.getApplicationContext()
-                .getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+    // نسخه کامل شامل آمار تأخیر Gesture
+    public static synchronized void addReport(
+            Context context,
+            long cycleNumber,
+            String startTime,
+            String endTime,
+            long actualDurationMs,
+            int successfulClicks,
+            int failedClicks,
+            long pauseMs,
+            String scheduledStartTime,
+            long startErrorMs,
+            long averageGestureLatencyNanos,
+            long maxGestureLatencyNanos,
+            long measuredGestures
+    ) {
+        SharedPreferences preferences = context.getSharedPreferences(
+                PREF_NAME,
+                Context.MODE_PRIVATE
+        );
 
-        JSONArray reports = loadArray(prefs);
+        JSONArray reports = loadArray(preferences);
 
         JSONObject report = new JSONObject();
 
         try {
-
             report.put("cycle", cycleNumber);
             report.put("start", startTime);
             report.put("end", endTime);
@@ -50,144 +116,199 @@ public class CycleReportStore {
             report.put("scheduled_start", scheduledStartTime);
             report.put("start_error", startErrorMs);
 
-            JSONArray updated = new JSONArray();
-
-            updated.put(report);
-
-            int startIndex = Math.max(
-                    0,
-                    reports.length() - (MAX_REPORTS - 1)
+            report.put(
+                    "avg_gesture_latency_ns",
+                    averageGestureLatencyNanos
             );
 
-            for (int i = startIndex; i < reports.length(); i++) {
+            report.put(
+                    "max_gesture_latency_ns",
+                    maxGestureLatencyNanos
+            );
 
-                JSONObject oldReport = reports.optJSONObject(i);
-
-                if (oldReport != null) {
-                    updated.put(oldReport);
-                }
-            }
-
-            return prefs.edit()
-                    .putString(KEY_REPORTS, updated.toString())
-                    .commit();
+            report.put("measured_gestures", measuredGestures);
 
         } catch (JSONException e) {
-
-            e.printStackTrace();
-            return false;
+            return;
         }
-    }
 
-    /*
-     * سازگاری با نسخه قبلی برنامه
-     */
-    public static synchronized boolean addReport(
-            Context context,
-            long cycleNumber,
-            String startTime,
-            String endTime,
-            long actualDurationMs,
-            int successfulClicks,
-            int failedClicks,
-            long pauseMs
-    ) {
+        JSONArray updatedReports = new JSONArray();
 
-        return addReport(
-                context,
-                cycleNumber,
-                startTime,
-                endTime,
-                actualDurationMs,
-                successfulClicks,
-                failedClicks,
-                pauseMs,
-                "نامشخص",
-                0
-        );
+        // گزارش جدید در ابتدای فهرست قرار می‌گیرد.
+        updatedReports.put(report);
+
+        // فقط ۱۹ گزارش قبلی را نگه می‌داریم.
+        int oldCount = Math.min(reports.length(), MAX_REPORTS - 1);
+
+        for (int i = 0; i < oldCount; i++) {
+            JSONObject oldReport = reports.optJSONObject(i);
+
+            if (oldReport != null) {
+                updatedReports.put(oldReport);
+            }
+        }
+
+        preferences.edit()
+                .putString(KEY_REPORTS, updatedReports.toString())
+                .commit();
     }
 
     public static synchronized List<String> getReports(Context context) {
+        SharedPreferences preferences = context.getSharedPreferences(
+                PREF_NAME,
+                Context.MODE_PRIVATE
+        );
 
-        SharedPreferences prefs = context.getApplicationContext()
-                .getSharedPreferences(PREFS, Context.MODE_PRIVATE);
-
-        JSONArray reports = loadArray(prefs);
-
+        JSONArray reports = loadArray(preferences);
         List<String> result = new ArrayList<>();
 
-        for (int i = reports.length() - 1; i >= 0; i--) {
+        for (int i = 0; i < reports.length(); i++) {
+            JSONObject report = reports.optJSONObject(i);
 
-            JSONObject item = reports.optJSONObject(i);
-
-            if (item == null) {
+            if (report == null) {
                 continue;
             }
 
-            String scheduledStart =
-                    item.optString("scheduled_start", "");
+            long cycle = report.optLong("cycle", 0L);
+            String start = report.optString("start", "-");
+            String end = report.optString("end", "-");
 
-            String startError;
+            long duration = report.optLong("duration", 0L);
+            int success = report.optInt("success", 0);
+            int failed = report.optInt("failed", 0);
+            long pause = report.optLong("pause", 0L);
 
-            if (item.has("start_error")
-                    && !scheduledStart.isEmpty()
-                    && !"نامشخص".equals(scheduledStart)) {
+            String scheduledStart = report.optString(
+                    "scheduled_start",
+                    ""
+            );
 
-                long error = item.optLong("start_error", 0);
+            long startError = report.optLong("start_error", 0L);
 
-                if (error > 0) {
-                    startError = error + " ms دیرتر";
-                } else if (error < 0) {
-                    startError = Math.abs(error) + " ms زودتر";
-                } else {
-                    startError = "دقیقاً مطابق زمان هدف";
-                }
+            long averageLatency = report.optLong(
+                    "avg_gesture_latency_ns",
+                    0L
+            );
 
+            long maxLatency = report.optLong(
+                    "max_gesture_latency_ns",
+                    0L
+            );
+
+            long measuredGestures = report.optLong(
+                    "measured_gestures",
+                    0L
+            );
+
+            StringBuilder text = new StringBuilder();
+
+            text.append("چرخه شماره ")
+                    .append(cycle)
+                    .append("\n");
+
+            if (!scheduledStart.isEmpty()) {
+                text.append("زمان هدف شروع: ")
+                        .append(scheduledStart)
+                        .append("\n");
+
+                text.append("زمان شروع واقعی: ")
+                        .append(start)
+                        .append("\n");
+
+                text.append("خطای شروع: ")
+                        .append(formatSignedMs(startError))
+                        .append("\n");
             } else {
-                startError = "اطلاعات موجود نیست";
+                text.append("شروع: ")
+                        .append(start)
+                        .append("\n");
             }
 
-            String line =
-                    "چرخه شماره: " + item.optLong("cycle") + "\n" +
-                    "زمان هدف شروع: " +
-                    (scheduledStart.isEmpty()
-                            ? "نامشخص"
-                            : scheduledStart) + "\n" +
-                    "شروع واقعی: " + item.optString("start") + "\n" +
-                    "اختلاف شروع: " + startError + "\n" +
-                    "پایان: " + item.optString("end") + "\n" +
-                    "مدت واقعی: " +
-                    item.optLong("duration") + " ms\n" +
-                    "لمس موفق: " + item.optInt("success") + "\n" +
-                    "لمس ناموفق: " + item.optInt("failed") + "\n" +
-                    "مکث بعدی: " + item.optLong("pause") + " ms";
+            text.append("پایان: ")
+                    .append(end)
+                    .append("\n");
 
-            result.add(line);
+            text.append("مدت واقعی چرخه: ")
+                    .append(duration)
+                    .append(" ms\n");
+
+            text.append("کلیک موفق: ")
+                    .append(success)
+                    .append("\n");
+
+            text.append("کلیک ناموفق: ")
+                    .append(failed)
+                    .append("\n");
+
+            text.append("مکث تنظیم‌شده: ")
+                    .append(pause)
+                    .append(" ms");
+
+            if (measuredGestures > 0) {
+                text.append("\nمیانگین زمان Gesture: ")
+                        .append(formatNanosAsMs(averageLatency))
+                        .append(" ms");
+
+                text.append("\nبیشترین زمان Gesture: ")
+                        .append(formatNanosAsMs(maxLatency))
+                        .append(" ms");
+
+                text.append("\nتعداد Gesture اندازه‌گیری‌شده: ")
+                        .append(measuredGestures);
+            } else {
+                text.append("\nآمار زمان Gesture: موجود نیست");
+            }
+
+            result.add(text.toString());
         }
 
         return result;
     }
 
-    public static synchronized boolean clearReports(Context context) {
+    public static synchronized void clearReports(Context context) {
+        SharedPreferences preferences = context.getSharedPreferences(
+                PREF_NAME,
+                Context.MODE_PRIVATE
+        );
 
-        SharedPreferences prefs = context.getApplicationContext()
-                .getSharedPreferences(PREFS, Context.MODE_PRIVATE);
-
-        return prefs.edit()
+        preferences.edit()
                 .remove(KEY_REPORTS)
                 .commit();
     }
 
-    private static JSONArray loadArray(SharedPreferences prefs) {
+    private static JSONArray loadArray(SharedPreferences preferences) {
+        String json = preferences.getString(KEY_REPORTS, "[]");
 
-        String saved = prefs.getString(KEY_REPORTS, "[]");
-
-        try {
-            return new JSONArray(saved);
-
-        } catch (JSONException e) {
-
+        if (json == null || json.trim().isEmpty()) {
             return new JSONArray();
         }
+
+        try {
+            return new JSONArray(json);
+        } catch (JSONException e) {
+            return new JSONArray();
+        }
+    }
+
+    private static String formatSignedMs(long value) {
+        if (value > 0) {
+            return "+" + value + " ms (دیرتر)";
+        }
+
+        if (value < 0) {
+            return value + " ms (زودتر)";
+        }
+
+        return "0 ms (دقیق)";
+    }
+
+    private static String formatNanosAsMs(long nanos) {
+        double milliseconds = nanos / 1_000_000.0;
+
+        return String.format(
+                Locale.US,
+                "%.3f",
+                milliseconds
+        );
     }
 }
