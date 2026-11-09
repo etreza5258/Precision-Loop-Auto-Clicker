@@ -77,11 +77,9 @@ public class FloatingService extends Service {
     private long cycleNumber = 0;
     private long cycleIndex = 0;
 
-    // زمان مبنای کل اجرای برنامه
     private long anchorElapsedMs = 0;
     private long anchorWallMs = 0;
 
-    // زمان هدف چرخه جاری
     private long scheduledCycleElapsedMs = 0;
     private long scheduledCycleWallMs = 0;
 
@@ -753,10 +751,6 @@ public class FloatingService extends Service {
         scheduleCycleStart(runGeneration, 0);
     }
 
-    /*
-     * زمان هدف هر چرخه از زمان شروع اولیه محاسبه می‌شود.
-     * بنابراین تأخیر چرخه قبلی به زمان چرخه بعدی اضافه نمی‌شود.
-     */
     private void scheduleCycleStart(
             int generation,
             long index
@@ -828,7 +822,6 @@ public class FloatingService extends Service {
             return;
         }
 
-        // هیچ دو Gesture هم‌زمان اجرا نمی‌شوند.
         if (accessibility.isGestureInProgress()) {
 
             handler.postDelayed(
@@ -859,6 +852,7 @@ public class FloatingService extends Service {
                 Math.round(targetY)
         );
 
+        // شروع آمارگیری مستقل برای این چرخه
         accessibility.resetClickCounters();
 
         successAtStart = accessibility.getSuccessfulClicks();
@@ -1025,6 +1019,11 @@ public class FloatingService extends Service {
         long successful = 0;
         long failed = 0;
 
+        // آمار تأخیر Gesture برای همین چرخه
+        long averageGestureLatencyNanos = 0;
+        long maxGestureLatencyNanos = 0;
+        long measuredGestures = 0;
+
         if (accessibility != null) {
 
             successful = Math.max(
@@ -1036,6 +1035,15 @@ public class FloatingService extends Service {
                     0,
                     accessibility.getFailedClicks() - failedAtStart
             );
+
+            averageGestureLatencyNanos =
+                    accessibility.getAverageGestureLatencyNanos();
+
+            maxGestureLatencyNanos =
+                    accessibility.getMaxGestureLatencyNanos();
+
+            measuredGestures =
+                    accessibility.getMeasuredGestures();
         }
 
         String actualStartText =
@@ -1060,12 +1068,14 @@ public class FloatingService extends Service {
                 (int) Math.min(Integer.MAX_VALUE, failed),
                 pauseDurationMs,
                 scheduledStartText,
-                startErrorMs
+                startErrorMs,
+                averageGestureLatencyNanos,
+                maxGestureLatencyNanos,
+                measuredGestures
         );
 
         updateStatus("پایان چرخه " + cycleNumber);
 
-        // چرخه بعدی بر اساس زمان شروع اولیه زمان‌بندی می‌شود.
         scheduleCycleStart(generation, cycleIndex + 1);
     }
 
