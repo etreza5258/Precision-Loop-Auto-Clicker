@@ -1,4 +1,3 @@
-
 package com.precision.loopclicker;
 
 import android.accessibilityservice.AccessibilityService;
@@ -16,9 +15,12 @@ public class AutoClickService extends AccessibilityService {
 
     private int targetX = 500;
     private int targetY = 500;
+
     private long touchDurationMs = 5;
 
     private boolean gestureInProgress = false;
+
+    private Runnable activeCompletion;
 
     private long successfulClicks = 0;
     private long failedClicks = 0;
@@ -35,19 +37,17 @@ public class AutoClickService extends AccessibilityService {
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-        // این سرویس فقط برای ارسال Gesture استفاده می‌شود.
+        // نیازی به پردازش رویدادهای صفحه نداریم.
     }
 
     @Override
     public void onInterrupt() {
-        gestureInProgress = false;
-        FloatingService.setOverlaysHidden(false);
+        handler.post(() -> finishGesture(false));
     }
 
     @Override
     public void onDestroy() {
-        gestureInProgress = false;
-        FloatingService.setOverlaysHidden(false);
+        handler.post(() -> finishGesture(false));
 
         if (instance == this) {
             instance = null;
@@ -90,12 +90,13 @@ public class AutoClickService extends AccessibilityService {
             if (completion != null) {
                 handler.post(completion);
             }
+
             return;
         }
 
         gestureInProgress = true;
+        activeCompletion = completion;
 
-        // پیش از لمس، پنل و نشانگر موقتاً از روی صفحه کنار می‌روند.
         FloatingService.setOverlaysHidden(true);
 
         Path path = new Path();
@@ -121,15 +122,19 @@ public class AutoClickService extends AccessibilityService {
                     new GestureResultCallback() {
 
                         @Override
-                        public void onCompleted(GestureDescription description) {
+                        public void onCompleted(
+                                GestureDescription description
+                        ) {
                             super.onCompleted(description);
-                            finishGesture(true, completion);
+                            finishGesture(true);
                         }
 
                         @Override
-                        public void onCancelled(GestureDescription description) {
+                        public void onCancelled(
+                                GestureDescription description
+                        ) {
                             super.onCancelled(description);
-                            finishGesture(false, completion);
+                            finishGesture(false);
                         }
                     },
                     handler
@@ -140,13 +145,11 @@ public class AutoClickService extends AccessibilityService {
         }
 
         if (!accepted) {
-            // callback در این مسیر ممکن است اجرا نشود؛
-            // بنابراین پایان لمس را خودمان مدیریت می‌کنیم.
-            handler.post(() -> finishGesture(false, completion));
+            finishGesture(false);
         }
     }
 
-    private void finishGesture(boolean success, Runnable completion) {
+    private void finishGesture(boolean success) {
 
         if (!gestureInProgress) {
             return;
@@ -160,11 +163,13 @@ public class AutoClickService extends AccessibilityService {
             failedClicks++;
         }
 
-        // بازگرداندن پنل و نشانگر پس از پایان Gesture
         FloatingService.setOverlaysHidden(false);
 
-        if (completion != null) {
-            completion.run();
+        Runnable callback = activeCompletion;
+        activeCompletion = null;
+
+        if (callback != null) {
+            callback.run();
         }
     }
 }
