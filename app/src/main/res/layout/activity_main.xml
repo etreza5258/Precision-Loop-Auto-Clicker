@@ -1,0 +1,207 @@
+
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true"
+    android:background="#101820"
+    android:padding="16dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="PRECISION LOOP AUTO CLICKER"
+            android:textColor="#FFFFFF"
+            android:textSize="22sp"
+            android:textStyle="bold"
+            android:gravity="center"
+            android:padding="16dp"/>
+
+        <TextView
+            android:id="@+id/phoneClock"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="ساعت گوشی: --:--:--.---"
+            android:textColor="#03DAC5"
+            android:textSize="18sp"
+            android:gravity="center"
+            android:padding="12dp"/>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="تنظیمات اجرای چرخه"
+            android:textColor="#FF9800"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:padding="10dp"/>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="زمان چرخه - ثانیه"
+            android:textColor="#FFFFFF"/>
+
+        <EditText
+            android:id="@+id/cycleSecondsInput"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="مثلاً 1"
+            android:inputType="number"
+            android:textColor="#FFFFFF"
+            android:textColorHint="#AAAAAA"/>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="زمان چرخه - میلی‌ثانیه"
+            android:textColor="#FFFFFF"/>
+
+        <EditText
+            android:id="@+id/cycleMillisInput"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="مثلاً 0"
+            android:inputType="number"
+            android:textColor="#FFFFFF"
+            android:textColorHint="#AAAAAA"/>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="تعداد لمس در هر چرخه"
+            android:textColor="#FFFFFF"/>
+
+        <EditText
+            android:id="@+id/clickCountInput"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="مثلاً 20"
+            android:inputType="number"
+            android:textColor="#FFFFFF"
+            android:textColorHint="#AAAAAA"/>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="مدت نگه‌داشتن هر لمس (میلی‌ثانیه)"
+            android:textColor="#FFFFFF"/>
+
+        <EditText
+            android:id="@+id/touchMillisInput"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="مثلاً 5"
+            android:inputType="number"
+            android:textColor="#FFFFFF"
+            android:textColorHint="#AAAAAA"/>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="مکث بین چرخه‌ها - ثانیه"
+            android:textColor="#FFFFFF"/>
+
+        <EditText
+            android:id="@+id/pauseSecondsInput"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="مثلاً 1"
+            android:inputType="number"
+            android:textColor="#FFFFFF"
+            android:textColorHint="#AAAAAA"/>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="مکث بین چرخه‌ها - میلی‌ثانیه"
+            android:textColor="#FFFFFF"/>
+
+        <EditText
+            android:id="@+id/pauseMillisInput"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="مثلاً 0"
+            android:inputType="number"
+            android:textColor="#FFFFFF"
+            android:textColorHint="#AAAAAA"/>
+
+        <TextView
+            android:id="@+id/countdownText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="شمارش معکوس: آماده"
+            android:textColor="#03DAC5"
+            android:textSize="18sp"
+            android:gravity="center"
+            android:padding="16dp"/>
+
+        <Button
+            android:id="@+id/startButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="شروع اجرای لوپی"/>
+
+        <Button
+            android:id="@+id/stopButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="توقف کلیک‌ها"/>
+
+        <Button
+            android:id="@+id/accessibilityButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="فعال‌سازی دسترسی لمس"/>
+
+        <Button
+            android:id="@+id/overlayButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="فعال‌سازی پنل شناور"/>
+
+        <Button
+            android:id="@+id/showFloatingButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="نمایش نشانگر و پنل شناور"/>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="گزارش ۲۰ چرخه آخر"
+            android:textColor="#FF9800"
+            android:textSize="20sp"
+            android:textStyle="bold"
+            android:padding="14dp"/>
+
+        <TextView
+            android:id="@+id/reportSummary"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="هنوز گزارشی ثبت نشده است."
+            android:textColor="#FFFFFF"
+            android:textSize="14sp"
+            android:padding="10dp"/>
+
+        <Button
+            android:id="@+id/clearReportsButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="پاک کردن گزارش‌ها"/>
+
+        <Button
+            android:id="@+id/shutdownButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="خاموش کردن کامل برنامه"/>
+
+    </LinearLayout>
+
+</ScrollView>
