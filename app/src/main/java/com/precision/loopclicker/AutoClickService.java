@@ -14,15 +14,14 @@ public class AutoClickService extends AccessibilityService {
 
     private final Handler handler = new Handler(Looper.getMainLooper());
 
+    private int targetX = 500;
+    private int targetY = 500;
+    private long touchDurationMs = 5;
+
     private boolean gestureInProgress = false;
 
-    private float targetX = 500f;
-    private float targetY = 500f;
-
-    private long touchDurationMs = 5L;
-
-    private int successfulClicks = 0;
-    private int failedClicks = 0;
+    private long successfulClicks = 0;
+    private long failedClicks = 0;
 
     public static AutoClickService getInstance() {
         return instance;
@@ -36,58 +35,68 @@ public class AutoClickService extends AccessibilityService {
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-        // No window content retrieval is required.
+        // این سرویس فقط برای ارسال Gesture استفاده می‌شود.
     }
 
     @Override
     public void onInterrupt() {
         gestureInProgress = false;
+        FloatingService.setOverlaysHidden(false);
     }
 
     @Override
     public void onDestroy() {
-        super.onDestroy();
-
         gestureInProgress = false;
+        FloatingService.setOverlaysHidden(false);
 
         if (instance == this) {
             instance = null;
         }
+
+        super.onDestroy();
     }
 
-    public void setTarget(float x, float y) {
-        targetX = x;
-        targetY = y;
+    public void setTarget(int x, int y) {
+        targetX = Math.max(0, x);
+        targetY = Math.max(0, y);
     }
 
     public void setTouchDuration(long durationMs) {
-        touchDurationMs = Math.max(1L, durationMs);
-    }
-
-    public int getSuccessfulClicks() {
-        return successfulClicks;
-    }
-
-    public int getFailedClicks() {
-        return failedClicks;
-    }
-
-    public void resetCounters() {
-        successfulClicks = 0;
-        failedClicks = 0;
+        touchDurationMs = Math.max(1, durationMs);
     }
 
     public boolean isGestureInProgress() {
         return gestureInProgress;
     }
 
-    public boolean performClick(Runnable completion) {
+    public long getSuccessfulClicks() {
+        return successfulClicks;
+    }
+
+    public long getFailedClicks() {
+        return failedClicks;
+    }
+
+    public void resetClickCounters() {
+        successfulClicks = 0;
+        failedClicks = 0;
+    }
+
+    public void performClick(Runnable completion) {
 
         if (gestureInProgress) {
-            return false;
+            failedClicks++;
+
+            if (completion != null) {
+                handler.post(completion);
+            }
+            return;
         }
 
         gestureInProgress = true;
+
+        // پیش از لمس، پنل و نشانگر موقتاً از روی صفحه کنار می‌روند.
+        FloatingService.setOverlaysHidden(true);
 
         Path path = new Path();
         path.moveTo(targetX, targetY);
@@ -96,66 +105,66 @@ public class AutoClickService extends AccessibilityService {
                 new GestureDescription.StrokeDescription(
                         path,
                         0,
-                        touchDurationMs
+                        Math.max(1, touchDurationMs)
                 );
 
-        GestureDescription.Builder builder =
-                new GestureDescription.Builder();
+        GestureDescription gesture =
+                new GestureDescription.Builder()
+                        .addStroke(stroke)
+                        .build();
 
-        builder.addStroke(stroke);
-
-        boolean dispatched;
+        boolean accepted;
 
         try {
-            dispatched = dispatchGesture(
-                    builder.build(),
+            accepted = dispatchGesture(
+                    gesture,
                     new GestureResultCallback() {
 
                         @Override
-                        public void onCompleted(
-                                GestureDescription gestureDescription
-                        ) {
-                            super.onCompleted(gestureDescription);
-
-                            gestureInProgress = false;
-                            successfulClicks++;
-
-                            if (completion != null) {
-                                completion.run();
-                            }
+                        public void onCompleted(GestureDescription description) {
+                            super.onCompleted(description);
+                            finishGesture(true, completion);
                         }
 
                         @Override
-                        public void onCancelled(
-                                GestureDescription gestureDescription
-                        ) {
-                            super.onCancelled(gestureDescription);
-
-                            gestureInProgress = false;
-                            failedClicks++;
-
-                            if (completion != null) {
-                                completion.run();
-                            }
+                        public void onCancelled(GestureDescription description) {
+                            super.onCancelled(description);
+                            finishGesture(false, completion);
                         }
-
                     },
                     handler
             );
 
         } catch (Exception e) {
-            dispatched = false;
+            accepted = false;
         }
 
-        if (!dispatched) {
-            gestureInProgress = false;
+        if (!accepted) {
+            // callback در این مسیر ممکن است اجرا نشود؛
+            // بنابراین پایان لمس را خودمان مدیریت می‌کنیم.
+            handler.post(() -> finishGesture(false, completion));
+        }
+    }
+
+    private void finishGesture(boolean success, Runnable completion) {
+
+        if (!gestureInProgress) {
+            return;
+        }
+
+        gestureInProgress = false;
+
+        if (success) {
+            successfulClicks++;
+        } else {
             failedClicks++;
-
-            if (completion != null) {
-                completion.run();
-            }
         }
 
-        return dispatched;
+        // بازگرداندن پنل و نشانگر پس از پایان Gesture
+        FloatingService.setOverlaysHidden(false);
+
+        if (completion != null) {
+            completion.run();
+        }
     }
 }
