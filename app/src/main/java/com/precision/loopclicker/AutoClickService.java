@@ -7,11 +7,14 @@ import android.graphics.Path;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.util.Log;
 import android.view.accessibility.AccessibilityEvent;
 
 public class AutoClickService extends AccessibilityService {
 
-    private static AutoClickService instance;
+    private static final String TAG = "PrecisionAutoClick";
+
+    private static volatile AutoClickService instance;
 
     private final Handler handler =
             new Handler(Looper.getMainLooper());
@@ -19,64 +22,92 @@ public class AutoClickService extends AccessibilityService {
     private volatile int targetX = 500;
     private volatile int targetY = 500;
 
-    private volatile long touchDurationMs = 5;
+    private volatile long touchDurationMs = 20;
 
     private volatile boolean gestureInProgress = false;
+    private volatile boolean serviceReady = false;
 
     private Runnable activeCompletion;
 
     private long activeGestureId = 0;
-
-    private long successfulClicks = 0;
-    private long failedClicks = 0;
-
     private long dispatchStartNanos = 0;
 
-    private long lastGestureLatencyNanos = 0;
-    private long totalGestureLatencyNanos = 0;
-    private long maxGestureLatencyNanos = 0;
-    private long measuredGestures = 0;
+    private volatile long successfulClicks = 0;
+    private volatile long failedClicks = 0;
+
+    private volatile long lastGestureLatencyNanos = 0;
+    private volatile long totalGestureLatencyNanos = 0;
+    private volatile long maxGestureLatencyNanos = 0;
+    private volatile long measuredGestures = 0;
+
+    private volatile String lastError = "هنوز کلیکی ارسال نشده";
 
     public static AutoClickService getInstance() {
-        return instance;
+        AutoClickService service = instance;
+
+        if (service == null || !service.serviceReady) {
+            return null;
+        }
+
+        return service;
     }
 
     @Override
     protected void onServiceConnected() {
         super.onServiceConnected();
+
+        serviceReady = true;
         instance = this;
+
+        Log.i(TAG, "Accessibility service connected");
     }
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-        // نیازی به پردازش رویدادهای صفحه نیست.
+        // رویدادهای صفحه نیاز نیستند.
     }
 
     @Override
     public void onInterrupt() {
         handler.post(() -> {
+            serviceReady = false;
+
             if (gestureInProgress) {
-                finishGesture(activeGestureId, false);
+                finishGesture(activeGestureId, false,
+                        "سرویس دسترسی‌پذیری قطع شد");
             }
         });
     }
 
     @Override
     public void onDestroy() {
+        serviceReady = false;
 
         if (Looper.myLooper() == Looper.getMainLooper()) {
-            finishGesture(activeGestureId, false);
+            if (gestureInProgress) {
+                finishGesture(activeGestureId, false,
+                        "سرویس بسته شد");
+            }
         } else {
-            handler.post(() ->
-                    finishGesture(activeGestureId, false)
-            );
+            handler.post(() -> {
+                if (gestureInProgress) {
+                    finishGesture(activeGestureId, false,
+                            "سرویس بسته شد");
+                }
+            });
         }
 
         if (instance == this) {
             instance = null;
         }
 
+        Log.i(TAG, "Accessibility service destroyed");
+
         super.onDestroy();
+    }
+
+    public boolean isServiceReady() {
+        return serviceReady;
     }
 
     public void setTarget(int x, int y) {
@@ -84,8 +115,16 @@ public class AutoClickService extends AccessibilityService {
         targetY = Math.max(0, y);
     }
 
+    public int getTargetX() {
+        return targetX;
+    }
+
+    public int getTargetY() {
+        return targetY;
+    }
+
     public void setTouchDuration(long durationMs) {
-        touchDurationMs = Math.max(1, durationMs);
+        touchDurationMs = Math.max(10, Math.min(durationMs, 10000));
     }
 
     public boolean isGestureInProgress() {
@@ -100,6 +139,10 @@ public class AutoClickService extends AccessibilityService {
         return failedClicks;
     }
 
+    public String getLastError() {
+        return lastError;
+    }
+
     public long getLastGestureLatencyNanos() {
         return lastGestureLatencyNanos;
     }
@@ -109,7 +152,6 @@ public class AutoClickService extends AccessibilityService {
     }
 
     public long getAverageGestureLatencyNanos() {
-
         if (measuredGestures == 0) {
             return 0;
         }
@@ -122,7 +164,6 @@ public class AutoClickService extends AccessibilityService {
     }
 
     public void resetClickCounters() {
-
         successfulClicks = 0;
         failedClicks = 0;
 
@@ -130,49 +171,54 @@ public class AutoClickService extends AccessibilityService {
         totalGestureLatencyNanos = 0;
         maxGestureLatencyNanos = 0;
         measuredGestures = 0;
+
+        lastError = "آماده";
     }
 
     public void performClick(Runnable completion) {
 
         if (Looper.myLooper() != Looper.getMainLooper()) {
-
             handler.post(() -> performClick(completion));
+            return;
+        }
 
+        if (!serviceReady) {
+            lastError = "سرویس دسترسی‌پذیری آماده نیست";
+            Log.e(TAG, lastError);
+
+            if (completion != null) {
+                completion.run();
+            }
             return;
         }
 
         if (gestureInProgress) {
-
-            // کلیک هم‌زمان ارسال نمی‌شود.
-            // این درخواست در شمارنده خطا ثبت نمی‌شود؛
-            // سرویس زمان‌بندی باید پس از پایان Gesture دوباره تلاش کند.
+            lastError = "لمس قبلی هنوز تمام نشده است";
+            Log.w(TAG, lastError);
 
             if (completion != null) {
-                handler.post(completion);
+                handler.postDelayed(completion, 10);
             }
-
             return;
         }
 
         final int clickX = targetX;
         final int clickY = targetY;
-        final long duration = touchDurationMs;
+        final long duration = Math.max(10, touchDurationMs);
 
         gestureInProgress = true;
-
         activeCompletion = completion;
 
         final long gestureId = ++activeGestureId;
 
         Path path = new Path();
-
         path.moveTo(clickX, clickY);
 
         GestureDescription.StrokeDescription stroke =
                 new GestureDescription.StrokeDescription(
                         path,
                         0,
-                        Math.max(1, duration)
+                        duration
                 );
 
         GestureDescription gesture =
@@ -183,113 +229,112 @@ public class AutoClickService extends AccessibilityService {
         dispatchStartNanos =
                 SystemClock.elapsedRealtimeNanos();
 
+        Log.d(TAG, "Dispatch click: x=" + clickX
+                + " y=" + clickY
+                + " duration=" + duration);
+
         boolean accepted;
 
         try {
-
             accepted = dispatchGesture(
                     gesture,
                     new GestureResultCallback() {
 
                         @Override
                         public void onCompleted(
-                                GestureDescription description
-                        ) {
-
+                                GestureDescription description) {
                             super.onCompleted(description);
 
-                            finishGesture(gestureId, true);
+                            finishGesture(
+                                    gestureId,
+                                    true,
+                                    "کلیک با موفقیت ارسال شد"
+                            );
                         }
 
                         @Override
                         public void onCancelled(
-                                GestureDescription description
-                        ) {
-
+                                GestureDescription description) {
                             super.onCancelled(description);
 
-                            finishGesture(gestureId, false);
+                            finishGesture(
+                                    gestureId,
+                                    false,
+                                    "اندروید Gesture را لغو کرد"
+                            );
                         }
                     },
                     handler
             );
 
         } catch (Exception e) {
-
             accepted = false;
+            lastError = "خطای ارسال لمس: " + e.getMessage();
+
+            Log.e(TAG, lastError, e);
         }
 
         if (!accepted) {
-
-            finishGesture(gestureId, false);
+            finishGesture(
+                    gestureId,
+                    false,
+                    "dispatchGesture درخواست را نپذیرفت"
+            );
         }
     }
 
     private void finishGesture(
             long gestureId,
-            boolean success
+            boolean success,
+            String message
     ) {
 
         if (Looper.myLooper() != Looper.getMainLooper()) {
-
             handler.post(() ->
-                    finishGesture(gestureId, success)
+                    finishGesture(gestureId, success, message)
             );
-
             return;
         }
 
-        // جلوگیری از callback تکراری یا قدیمی
         if (!gestureInProgress
                 || gestureId != activeGestureId) {
             return;
         }
 
-        long completionNanos =
-                SystemClock.elapsedRealtimeNanos();
+        long latency =
+                Math.max(0,
+                        SystemClock.elapsedRealtimeNanos()
+                                - dispatchStartNanos);
 
-        long latencyNanos = Math.max(
-                0,
-                completionNanos - dispatchStartNanos
-        );
+        lastGestureLatencyNanos = latency;
 
-        lastGestureLatencyNanos = latencyNanos;
-
-        if (measuredGestures < Long.MAX_VALUE) {
-            measuredGestures++;
-        }
+        measuredGestures++;
 
         if (totalGestureLatencyNanos
-                <= Long.MAX_VALUE - latencyNanos) {
-
-            totalGestureLatencyNanos += latencyNanos;
+                <= Long.MAX_VALUE - latency) {
+            totalGestureLatencyNanos += latency;
         }
 
-        maxGestureLatencyNanos = Math.max(
-                maxGestureLatencyNanos,
-                latencyNanos
-        );
+        maxGestureLatencyNanos =
+                Math.max(maxGestureLatencyNanos, latency);
 
         if (success) {
+            successfulClicks++;
+            lastError = message;
 
-            if (successfulClicks < Long.MAX_VALUE) {
-                successfulClicks++;
-            }
-
+            Log.d(TAG, message
+                    + " | latency=" + latency);
         } else {
+            failedClicks++;
+            lastError = message;
 
-            if (failedClicks < Long.MAX_VALUE) {
-                failedClicks++;
-            }
+            Log.e(TAG, message);
         }
 
         gestureInProgress = false;
 
         Runnable callback = activeCompletion;
-
         activeCompletion = null;
-
-        // پنل و نشانگر دیگر مخفی یا دوباره نمایان نمی‌شوند.
 
         if (callback != null) {
             callback.run();
