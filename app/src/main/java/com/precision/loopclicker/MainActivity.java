@@ -1,3 +1,4 @@
+
 package com.precision.loopclicker;
 
 import android.app.Activity;
@@ -43,11 +44,22 @@ public class MainActivity extends Activity {
     private long scheduledStartTime = 0L;
     private boolean countdownActive = false;
 
+    private long lastReportRefreshTime = 0L;
+
     private final Runnable clockRunnable = new Runnable() {
         @Override
         public void run() {
+
             updatePhoneClock();
             updateCountdown();
+
+            long now = System.currentTimeMillis();
+
+            if (now - lastReportRefreshTime >= 1000L) {
+                refreshReports();
+                lastReportRefreshTime = now;
+            }
+
             handler.postDelayed(this, 50);
         }
     };
@@ -55,6 +67,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+
         setContentView(R.layout.activity_main);
 
         bindViews();
@@ -66,6 +79,7 @@ public class MainActivity extends Activity {
     }
 
     private void bindViews() {
+
         startHourInput = findViewById(R.id.startHourInput);
         startMinuteInput = findViewById(R.id.startMinuteInput);
         startSecondInput = findViewById(R.id.startSecondInput);
@@ -89,20 +103,24 @@ public class MainActivity extends Activity {
         countdownMinute = findViewById(R.id.countdownMinute);
         countdownSecond = findViewById(R.id.countdownSecond);
         countdownMillis = findViewById(R.id.countdownMillis);
-        countdownText = findViewById(R.id.countdownText);
 
+        countdownText = findViewById(R.id.countdownText);
         reportSummary = findViewById(R.id.reportSummary);
 
         startButton = findViewById(R.id.startButton);
         stopButton = findViewById(R.id.stopButton);
+
         accessibilityButton = findViewById(R.id.accessibilityButton);
         overlayButton = findViewById(R.id.overlayButton);
+
         showFloatingButton = findViewById(R.id.showFloatingButton);
         clearReportsButton = findViewById(R.id.clearReportsButton);
+
         shutdownButton = findViewById(R.id.shutdownButton);
     }
 
     private void setDefaultValues() {
+
         setIfEmpty(intervalSecondsInput, "0");
         setIfEmpty(intervalMillisInput, "20");
 
@@ -117,64 +135,88 @@ public class MainActivity extends Activity {
     }
 
     private void setIfEmpty(EditText input, String value) {
+
         if (input.getText().toString().trim().isEmpty()) {
             input.setText(value);
         }
     }
 
     private void setupButtons() {
+
         startButton.setOnClickListener(v -> startClicking());
 
         stopButton.setOnClickListener(v -> stopClicking());
 
         accessibilityButton.setOnClickListener(v -> {
+
             Intent intent = new Intent(
-                    Settings.ACTION_ACCESSIBILITY_SETTINGS);
+                    Settings.ACTION_ACCESSIBILITY_SETTINGS
+            );
+
             startActivity(intent);
         });
 
         overlayButton.setOnClickListener(v -> {
+
             if (!hasOverlayPermission()) {
+
                 Intent intent = new Intent(
                         Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                        Uri.parse("package:" + getPackageName()));
+                        Uri.parse("package:" + getPackageName())
+                );
+
                 startActivity(intent);
+
             } else {
+
                 showMessage("مجوز پنل شناور فعال است.");
             }
         });
 
         showFloatingButton.setOnClickListener(v -> {
+
             if (!hasOverlayPermission()) {
                 showMessage("ابتدا مجوز پنل شناور را فعال کنید.");
                 return;
             }
 
-            Intent intent = new Intent(this, FloatingService.class);
+            Intent intent = new Intent(
+                    this,
+                    FloatingService.class
+            );
+
             intent.setAction("SHOW_PANEL");
 
             try {
+
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     startForegroundService(intent);
                 } else {
                     startService(intent);
                 }
+
             } catch (Exception e) {
+
                 showMessage("نمایش پنل شناور ناموفق بود.");
             }
         });
 
         clearReportsButton.setOnClickListener(v -> {
+
             CycleReportStore.clearReports(this);
+
             refreshReports();
+
             showMessage("گزارش‌ها پاک شدند.");
         });
 
         shutdownButton.setOnClickListener(v -> {
+
             stopClicking();
 
             Intent serviceIntent =
                     new Intent(this, FloatingService.class);
+
             stopService(serviceIntent);
 
             finish();
@@ -200,21 +242,25 @@ public class MainActivity extends Activity {
 
         Long intervalSecondsValue =
                 readLong(intervalSecondsInput, "ثانیه فاصله کلیک");
+
         Long intervalMillisValue =
                 readLong(intervalMillisInput, "میلی‌ثانیه فاصله کلیک");
 
         Long cycleSecondsValue =
                 readLong(cycleSecondsInput, "ثانیه چرخه");
+
         Long cycleMillisValue =
                 readLong(cycleMillisInput, "میلی‌ثانیه چرخه");
 
         Long clickCountValue =
                 readLong(clickCountInput, "تعداد کلیک");
+
         Long touchMillisValue =
                 readLong(touchMillisInput, "مدت لمس");
 
         Long pauseSecondsValue =
                 readLong(pauseSecondsInput, "ثانیه مکث");
+
         Long pauseMillisValue =
                 readLong(pauseMillisInput, "میلی‌ثانیه مکث");
 
@@ -228,6 +274,7 @@ public class MainActivity extends Activity {
                 || touchMillisValue == null
                 || pauseSecondsValue == null
                 || pauseMillisValue == null) {
+
             return;
         }
 
@@ -250,6 +297,7 @@ public class MainActivity extends Activity {
 
         if (hour > 23 || minute > 59
                 || second > 59 || millis > 999) {
+
             showMessage("زمان شروع معتبر نیست.");
             return;
         }
@@ -261,6 +309,7 @@ public class MainActivity extends Activity {
 
         if (cycleMillis > 999
                 || (cycleSeconds == 0 && cycleMillis == 0)) {
+
             showMessage("مدت چرخه معتبر نیست.");
             return;
         }
@@ -280,9 +329,13 @@ public class MainActivity extends Activity {
             return;
         }
 
-        if (intervalSeconds > (Long.MAX_VALUE - intervalMillis) / 1000L
-                || cycleSeconds > (Long.MAX_VALUE - cycleMillis) / 1000L
-                || pauseSeconds > (Long.MAX_VALUE - pauseMillis) / 1000L) {
+        if (intervalSeconds >
+                (Long.MAX_VALUE - intervalMillis) / 1000L
+                || cycleSeconds >
+                (Long.MAX_VALUE - cycleMillis) / 1000L
+                || pauseSeconds >
+                (Long.MAX_VALUE - pauseMillis) / 1000L) {
+
             showMessage("یکی از زمان‌ها بیش از حد بزرگ است.");
             return;
         }
@@ -297,6 +350,7 @@ public class MainActivity extends Activity {
                 pauseSeconds * 1000L + pauseMillis;
 
         Calendar startCalendar = Calendar.getInstance();
+
         startCalendar.set(Calendar.HOUR_OF_DAY, (int) hour);
         startCalendar.set(Calendar.MINUTE, (int) minute);
         startCalendar.set(Calendar.SECOND, (int) second);
@@ -309,7 +363,11 @@ public class MainActivity extends Activity {
             return;
         }
 
-        Intent intent = new Intent(this, FloatingService.class);
+        Intent intent = new Intent(
+                this,
+                FloatingService.class
+        );
+
         intent.setAction("ACTION_START");
 
         intent.putExtra("start_time_epoch_ms", startTime);
@@ -320,6 +378,7 @@ public class MainActivity extends Activity {
         intent.putExtra("click_interval_ms", intervalDuration);
 
         try {
+
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 startForegroundService(intent);
             } else {
@@ -328,52 +387,85 @@ public class MainActivity extends Activity {
 
             scheduledStartTime = startTime;
             countdownActive = true;
+
             countdownText.setText("در انتظار زمان شروع");
 
             updateCountdown();
+
             showMessage("زمان‌بندی اجرا ثبت شد.");
 
         } catch (Exception e) {
+
             countdownActive = false;
-            showMessage("شروع سرویس ناموفق بود: " + e.getMessage());
+
+            showMessage(
+                    "شروع سرویس ناموفق بود: " + e.getMessage()
+            );
         }
     }
 
-    private Long readLong(EditText input, String fieldName) {
+    private Long readLong(
+            EditText input,
+            String fieldName
+    ) {
+
         String value = input.getText().toString().trim();
 
         if (value.isEmpty()) {
-            showMessage("مقدار «" + fieldName + "» را وارد کنید.");
+
+            showMessage(
+                    "مقدار «" + fieldName + "» را وارد کنید."
+            );
+
             input.requestFocus();
+
             return null;
         }
 
         try {
+
             long number = Long.parseLong(value);
 
             if (number < 0) {
-                showMessage("مقدار «" + fieldName + "» نمی‌تواند منفی باشد.");
+
+                showMessage(
+                        "مقدار «" + fieldName
+                                + "» نمی‌تواند منفی باشد."
+                );
+
                 input.requestFocus();
+
                 return null;
             }
 
             return number;
 
         } catch (NumberFormatException e) {
-            showMessage("مقدار «" + fieldName + "» معتبر نیست.");
+
+            showMessage(
+                    "مقدار «" + fieldName + "» معتبر نیست."
+            );
+
             input.requestFocus();
+
             return null;
         }
     }
 
     private void stopClicking() {
+
         countdownActive = false;
         scheduledStartTime = 0L;
 
         setCountdownValues(0, 0, 0, 0);
+
         countdownText.setText("متوقف شد");
 
-        Intent intent = new Intent(this, FloatingService.class);
+        Intent intent = new Intent(
+                this,
+                FloatingService.class
+        );
+
         intent.setAction("ACTION_STOP");
 
         try {
@@ -383,6 +475,7 @@ public class MainActivity extends Activity {
     }
 
     private void updatePhoneClock() {
+
         Calendar calendar = Calendar.getInstance();
 
         String time = String.format(
@@ -391,12 +484,14 @@ public class MainActivity extends Activity {
                 calendar.get(Calendar.HOUR_OF_DAY),
                 calendar.get(Calendar.MINUTE),
                 calendar.get(Calendar.SECOND),
-                calendar.get(Calendar.MILLISECOND));
+                calendar.get(Calendar.MILLISECOND)
+        );
 
         phoneClock.setText(time);
     }
 
     private void updateCountdown() {
+
         if (!countdownActive || scheduledStartTime == 0L) {
             return;
         }
@@ -405,9 +500,15 @@ public class MainActivity extends Activity {
                 scheduledStartTime - System.currentTimeMillis();
 
         if (remaining <= 0) {
+
             setCountdownValues(0, 0, 0, 0);
-            countdownText.setText("زمان شروع فرا رسیده است.");
+
+            countdownText.setText(
+                    "زمان شروع فرا رسیده است."
+            );
+
             countdownActive = false;
+
             return;
         }
 
@@ -416,38 +517,54 @@ public class MainActivity extends Activity {
         long seconds = (remaining % 60000L) / 1000L;
         long milliseconds = remaining % 1000L;
 
-        setCountdownValues(hours, minutes, seconds, milliseconds);
-        countdownText.setText("زمان باقی‌مانده تا شروع");
+        setCountdownValues(
+                hours,
+                minutes,
+                seconds,
+                milliseconds
+        );
+
+        countdownText.setText(
+                "زمان باقی‌مانده تا شروع"
+        );
     }
 
     private void setCountdownValues(
             long hours,
             long minutes,
             long seconds,
-            long milliseconds) {
+            long milliseconds
+    ) {
 
         countdownHour.setText(
-                String.format(Locale.US, "%02d", hours));
+                String.format(Locale.US, "%02d", hours)
+        );
 
         countdownMinute.setText(
-                String.format(Locale.US, "%02d", minutes));
+                String.format(Locale.US, "%02d", minutes)
+        );
 
         countdownSecond.setText(
-                String.format(Locale.US, "%02d", seconds));
+                String.format(Locale.US, "%02d", seconds)
+        );
 
         countdownMillis.setText(
-                String.format(Locale.US, "%03d", milliseconds));
+                String.format(Locale.US, "%03d", milliseconds)
+        );
     }
 
     private boolean hasOverlayPermission() {
+
         return Build.VERSION.SDK_INT < Build.VERSION_CODES.M
                 || Settings.canDrawOverlays(this);
     }
 
     private boolean hasAccessibilityPermission() {
+
         String enabledServices = Secure.getString(
                 getContentResolver(),
-                Secure.ENABLED_ACCESSIBILITY_SERVICES);
+                Secure.ENABLED_ACCESSIBILITY_SERVICES
+        );
 
         if (enabledServices == null) {
             return false;
@@ -458,23 +575,34 @@ public class MainActivity extends Activity {
     }
 
     private void refreshReports() {
+
         reportSummary.setText(
-                CycleReportStore.getReportSummary(this));
+                CycleReportStore.getReportSummary(this)
+        );
     }
 
     private void showMessage(String message) {
-        Toast.makeText(this, message, Toast.LENGTH_SHORT).show();
+
+        Toast.makeText(
+                this,
+                message,
+                Toast.LENGTH_SHORT
+        ).show();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
+
         refreshReports();
+        lastReportRefreshTime = System.currentTimeMillis();
     }
 
     @Override
     protected void onDestroy() {
+
         handler.removeCallbacks(clockRunnable);
+
         super.onDestroy();
     }
 }
