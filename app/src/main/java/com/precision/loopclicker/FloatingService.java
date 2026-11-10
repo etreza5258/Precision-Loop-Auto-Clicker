@@ -19,6 +19,7 @@ import android.os.Looper;
 import android.os.SystemClock;
 import android.provider.Settings;
 import android.view.Gravity;
+import android.view.View;
 import android.view.WindowManager;
 import android.view.ViewGroup;
 import android.widget.LinearLayout;
@@ -36,9 +37,13 @@ public class FloatingService extends Service {
     private static final String CHANNEL_ID = "precision_clicker_channel";
     private static final int NOTIFICATION_ID = 1001;
 
-    private final Handler handler = new Handler(Looper.getMainLooper());
+    private static FloatingService instance;
+
+    private final Handler handler =
+            new Handler(Looper.getMainLooper());
 
     private WindowManager windowManager;
+
     private LinearLayout panel;
     private TextView statusView;
     private TextView counterView;
@@ -81,7 +86,10 @@ public class FloatingService extends Service {
     public void onCreate() {
         super.onCreate();
 
-        windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
+        instance = this;
+
+        windowManager =
+                (WindowManager) getSystemService(WINDOW_SERVICE);
 
         createNotificationChannel();
         startForegroundNotification();
@@ -90,22 +98,62 @@ public class FloatingService extends Service {
             @Override
             public void run() {
                 updateDisplay();
-                handler.postDelayed(this, 50);
+
+                if (displayRunnable != null) {
+                    handler.postDelayed(this, 50);
+                }
             }
         };
 
         handler.post(displayRunnable);
     }
 
-    private void createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            NotificationChannel channel = new NotificationChannel(
-                    CHANNEL_ID,
-                    "Precision Loop Auto Clicker",
-                    NotificationManager.IMPORTANCE_LOW
-            );
+    /*
+     * این متد توسط AutoClickService فراخوانی می‌شود.
+     * پنل هنگام اجرای Gesture مخفی می‌شود.
+     */
+    public static void setOverlaysHidden(boolean hidden) {
 
-            channel.setDescription("وضعیت اجرای اتوکلیکر");
+        FloatingService service = instance;
+
+        if (service == null) {
+            return;
+        }
+
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            service.changePanelVisibility(hidden);
+        } else {
+            service.handler.post(
+                    () -> service.changePanelVisibility(hidden)
+            );
+        }
+    }
+
+    private void changePanelVisibility(boolean hidden) {
+
+        if (panel == null) {
+            return;
+        }
+
+        panel.setVisibility(
+                hidden ? View.INVISIBLE : View.VISIBLE
+        );
+    }
+
+    private void createNotificationChannel() {
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+
+            NotificationChannel channel =
+                    new NotificationChannel(
+                            CHANNEL_ID,
+                            "Precision Loop Auto Clicker",
+                            NotificationManager.IMPORTANCE_LOW
+                    );
+
+            channel.setDescription(
+                    "وضعیت اجرای اتوکلیکر"
+            );
 
             NotificationManager manager =
                     getSystemService(NotificationManager.class);
@@ -117,15 +165,18 @@ public class FloatingService extends Service {
     }
 
     private void startForegroundNotification() {
-        Intent openIntent = new Intent(this, MainActivity.class);
 
-        PendingIntent pendingIntent = PendingIntent.getActivity(
-                this,
-                0,
-                openIntent,
-                PendingIntent.FLAG_UPDATE_CURRENT
-                        | PendingIntent.FLAG_IMMUTABLE
-        );
+        Intent openIntent =
+                new Intent(this, MainActivity.class);
+
+        PendingIntent pendingIntent =
+                PendingIntent.getActivity(
+                        this,
+                        0,
+                        openIntent,
+                        PendingIntent.FLAG_UPDATE_CURRENT
+                                | PendingIntent.FLAG_IMMUTABLE
+                );
 
         Notification.Builder builder;
 
@@ -144,26 +195,35 @@ public class FloatingService extends Service {
                 .build();
 
         if (Build.VERSION.SDK_INT >= 34) {
+
             startForeground(
                     NOTIFICATION_ID,
                     notification,
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
             );
+
         } else {
-            startForeground(NOTIFICATION_ID, notification);
+
+            startForeground(
+                    NOTIFICATION_ID,
+                    notification
+            );
         }
     }
 
     @Override
-    public int onStartCommand(Intent intent, int flags, int startId) {
+    public int onStartCommand(
+            Intent intent,
+            int flags,
+            int startId
+    ) {
 
-        String action = intent == null ? null : intent.getAction();
+        String action =
+                intent == null ? null : intent.getAction();
 
         if (ACTION_START.equals(action)) {
 
             createFloatingViews();
-
-            // تنظیمات مستقیماً از Intent ارسالی MainActivity خوانده می‌شوند.
             startLoop(intent);
 
         } else if (ACTION_STOP.equals(action)) {
@@ -202,13 +262,16 @@ public class FloatingService extends Service {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(18, 14, 18, 14);
-        root.setBackground(makeBackground("#202B38", 18));
+        root.setBackground(
+                makeBackground("#202B38", 18)
+        );
 
         TextView title = new TextView(this);
         title.setText("Precision Loop Auto Clicker");
         title.setTextColor(Color.WHITE);
         title.setTextSize(14);
         title.setTypeface(null, Typeface.BOLD);
+
         root.addView(title);
 
         statusView = new TextView(this);
@@ -216,29 +279,35 @@ public class FloatingService extends Service {
         statusView.setTextColor(Color.WHITE);
         statusView.setTextSize(13);
         statusView.setPadding(0, 12, 0, 6);
+
         root.addView(statusView);
 
         counterView = new TextView(this);
         counterView.setText("در انتظار شروع");
-        counterView.setTextColor(Color.rgb(255, 193, 7));
+        counterView.setTextColor(
+                Color.rgb(255, 193, 7)
+        );
         counterView.setTextSize(13);
         counterView.setPadding(0, 5, 0, 10);
+
         root.addView(counterView);
 
-        TextView stopButton = makeButton(
-                "توقف کلیک‌ها",
-                "#C62828"
+        TextView stopButton =
+                makeButton("توقف کلیک‌ها", "#C62828");
+
+        stopButton.setOnClickListener(
+                v -> stopLoop()
         );
 
-        stopButton.setOnClickListener(v -> stopLoop());
         root.addView(stopButton);
 
-        TextView closeButton = makeButton(
-                "بستن پنل",
-                "#455A64"
+        TextView closeButton =
+                makeButton("بستن پنل", "#455A64");
+
+        closeButton.setOnClickListener(
+                v -> removeFloatingViews()
         );
 
-        closeButton.setOnClickListener(v -> removeFloatingViews());
         root.addView(closeButton);
 
         panel = root;
@@ -246,9 +315,12 @@ public class FloatingService extends Service {
         int overlayType;
 
         if (Build.VERSION.SDK_INT >= 26) {
+
             overlayType =
                     WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY;
+
         } else {
+
             overlayType =
                     WindowManager.LayoutParams.TYPE_PHONE;
         }
@@ -263,14 +335,18 @@ public class FloatingService extends Service {
                         PixelFormat.TRANSLUCENT
                 );
 
-        params.gravity = Gravity.TOP | Gravity.START;
+        params.gravity =
+                Gravity.TOP | Gravity.START;
+
         params.x = 20;
         params.y = 150;
 
         try {
+
             windowManager.addView(panel, params);
 
         } catch (Exception e) {
+
             panel = null;
             statusView = null;
             counterView = null;
@@ -281,10 +357,14 @@ public class FloatingService extends Service {
             String color,
             int radius
     ) {
-        GradientDrawable drawable = new GradientDrawable();
+
+        GradientDrawable drawable =
+                new GradientDrawable();
+
         drawable.setColor(Color.parseColor(color));
         drawable.setCornerRadius(radius);
         drawable.setStroke(1, Color.GRAY);
+
         return drawable;
     }
 
@@ -292,6 +372,7 @@ public class FloatingService extends Service {
             String text,
             String color
     ) {
+
         TextView button = new TextView(this);
 
         button.setText(text);
@@ -299,7 +380,9 @@ public class FloatingService extends Service {
         button.setTextSize(13);
         button.setGravity(Gravity.CENTER);
         button.setPadding(12, 12, 12, 12);
-        button.setBackground(makeBackground(color, 10));
+        button.setBackground(
+                makeBackground(color, 10)
+        );
 
         LinearLayout.LayoutParams params =
                 new LinearLayout.LayoutParams(
@@ -313,6 +396,9 @@ public class FloatingService extends Service {
         return button;
     }
 
+    /*
+     * شروع زمان‌بندی اصلی
+     */
     private void startLoop(Intent config) {
 
         stopLoop();
@@ -322,37 +408,45 @@ public class FloatingService extends Service {
             return;
         }
 
-        startTimeEpochMs = config.getLongExtra(
-                "start_time_epoch_ms",
-                0
-        );
+        startTimeEpochMs =
+                config.getLongExtra(
+                        "start_time_epoch_ms",
+                        0
+                );
 
-        cycleDurationMs = config.getLongExtra(
-                "cycle_duration",
-                0
-        );
+        cycleDurationMs =
+                config.getLongExtra(
+                        "cycle_duration",
+                        0
+                );
 
-        pauseDurationMs = config.getLongExtra(
-                "pause_duration",
-                0
-        );
+        pauseDurationMs =
+                config.getLongExtra(
+                        "pause_duration",
+                        0
+                );
 
-        clickIntervalMs = config.getLongExtra(
-                "click_interval_ms",
-                0
-        );
+        clickIntervalMs =
+                config.getLongExtra(
+                        "click_interval_ms",
+                        0
+                );
 
-        touchDurationMs = config.getLongExtra(
-                "touch_duration",
-                5
-        );
+        touchDurationMs =
+                config.getLongExtra(
+                        "touch_duration",
+                        5
+                );
 
-        clickCount = config.getIntExtra(
-                "click_count",
-                1
-        );
+        clickCount =
+                config.getIntExtra(
+                        "click_count",
+                        1
+                );
 
-        if (startTimeEpochMs <= System.currentTimeMillis()) {
+        long wallNow = System.currentTimeMillis();
+
+        if (startTimeEpochMs <= wallNow) {
             setStatus("زمان شروع باید در آینده باشد");
             return;
         }
@@ -367,8 +461,18 @@ public class FloatingService extends Service {
             return;
         }
 
-        if (cycleDurationMs > Long.MAX_VALUE - pauseDurationMs) {
+        if (cycleDurationMs >
+                Long.MAX_VALUE - pauseDurationMs) {
+
             setStatus("مدت چرخه و مکث بیش از حد بزرگ است");
+            return;
+        }
+
+        long remaining = startTimeEpochMs - wallNow;
+        long elapsedNow = SystemClock.elapsedRealtime();
+
+        if (remaining > Long.MAX_VALUE - elapsedNow) {
+            setStatus("زمان شروع بیش از حد بزرگ است");
             return;
         }
 
@@ -383,11 +487,7 @@ public class FloatingService extends Service {
         cycleActive = false;
         cycleIndex = 0;
 
-        long remaining =
-                startTimeEpochMs - System.currentTimeMillis();
-
-        anchorElapsedMs =
-                SystemClock.elapsedRealtime() + remaining;
+        anchorElapsedMs = elapsedNow + remaining;
 
         long generation = runGeneration;
 
@@ -399,10 +499,28 @@ public class FloatingService extends Service {
         );
     }
 
+    /*
+     * تبدیل زمان هدف elapsedRealtime به تأخیر Handler
+     */
+    private void postAtElapsedTime(
+            Runnable runnable,
+            long targetElapsed
+    ) {
+
+        long now = SystemClock.elapsedRealtime();
+
+        long delay = targetElapsed <= now
+                ? 0
+                : targetElapsed - now;
+
+        handler.postDelayed(runnable, delay);
+    }
+
     private void scheduleCycleStart(
             long generation,
             long targetElapsed
     ) {
+
         if (!running || generation != runGeneration) {
             return;
         }
@@ -410,6 +528,7 @@ public class FloatingService extends Service {
         removeRunnable(cycleStartRunnable);
 
         cycleStartRunnable = () -> {
+
             if (!running || generation != runGeneration) {
                 return;
             }
@@ -417,9 +536,9 @@ public class FloatingService extends Service {
             startCycle(generation);
         };
 
-        handler.postAtTime(
+        postAtElapsedTime(
                 cycleStartRunnable,
-                Math.max(SystemClock.elapsedRealtime(), targetElapsed)
+                targetElapsed
         );
     }
 
@@ -432,68 +551,111 @@ public class FloatingService extends Service {
         accessibility = AutoClickService.getInstance();
 
         if (accessibility == null) {
+
             setStatus("سرویس کلیک در دسترس نیست");
             stopLoop();
+
             return;
         }
 
         if (accessibility.isGestureInProgress()) {
+
             handler.postDelayed(
                     () -> startCycle(generation),
                     5
             );
+
             return;
         }
 
         cycleActive = true;
         clickNumber = 0;
 
-        cycleStartElapsedMs = SystemClock.elapsedRealtime();
-        cycleStartWallMs = System.currentTimeMillis();
+        cycleStartElapsedMs =
+                SystemClock.elapsedRealtime();
+
+        cycleStartWallMs =
+                System.currentTimeMillis();
+
+        if (cycleDurationMs >
+                Long.MAX_VALUE - cycleStartElapsedMs) {
+
+            setStatus("مدت چرخه بیش از حد بزرگ است");
+            stopLoop();
+
+            return;
+        }
 
         cycleDeadlineElapsedMs =
                 cycleStartElapsedMs + cycleDurationMs;
 
         accessibility.resetClickCounters();
 
-        successAtStart = accessibility.getSuccessfulClicks();
-        failedAtStart = accessibility.getFailedClicks();
+        successAtStart =
+                accessibility.getSuccessfulClicks();
+
+        failedAtStart =
+                accessibility.getFailedClicks();
 
         accessibility.setTarget(targetX, targetY);
         accessibility.setTouchDuration(touchDurationMs);
 
-        setStatus("چرخه " + (cycleIndex + 1) + " شروع شد");
+        setStatus(
+                "چرخه " + (cycleIndex + 1) + " شروع شد"
+        );
 
         scheduleNextClick(generation);
     }
 
+    /*
+     * زمان‌بندی کلیک بعدی
+     */
     private void scheduleNextClick(long generation) {
 
         if (!running
                 || generation != runGeneration
                 || !cycleActive) {
+
             return;
         }
 
         if (clickNumber >= clickCount) {
+
             waitForCycleEnd(generation);
             return;
         }
 
         long now = SystemClock.elapsedRealtime();
 
-        long target = clickNumber == 0
-                ? now
-                : lastClickDispatchElapsedMs + clickIntervalMs;
+        long target;
+
+        if (clickNumber == 0) {
+
+            target = now;
+
+        } else {
+
+            if (clickIntervalMs >
+                    Long.MAX_VALUE - lastClickDispatchElapsedMs) {
+
+                setStatus("فاصله کلیک بیش از حد بزرگ است");
+                stopLoop();
+
+                return;
+            }
+
+            target =
+                    lastClickDispatchElapsedMs + clickIntervalMs;
+        }
 
         removeRunnable(nextClickRunnable);
 
-        nextClickRunnable = () ->
-                dispatchNextClick(generation);
+        nextClickRunnable =
+                () -> dispatchNextClick(generation);
 
-        handler.postAtTime(
+        postAtElapsedTime(
                 nextClickRunnable,
-                Math.max(now, target)
+                target
         );
     }
 
@@ -502,20 +664,25 @@ public class FloatingService extends Service {
         if (!running
                 || generation != runGeneration
                 || !cycleActive) {
+
             return;
         }
 
         if (accessibility == null) {
+
             setStatus("سرویس کلیک در دسترس نیست");
             stopLoop();
+
             return;
         }
 
         if (accessibility.isGestureInProgress()) {
+
             handler.postDelayed(
                     () -> dispatchNextClick(generation),
                     5
             );
+
             return;
         }
 
@@ -538,18 +705,26 @@ public class FloatingService extends Service {
                 if (!running
                         || generation != runGeneration
                         || !cycleActive) {
+
                     return;
                 }
 
                 if (clickNumber < clickCount) {
+
                     scheduleNextClick(generation);
+
                 } else {
+
                     waitForCycleEnd(generation);
                 }
             });
         });
     }
 
+    /*
+     * اگر کلیک‌ها زودتر تمام شوند،
+     * تا پایان زمان چرخه صبر می‌کنیم.
+     */
     private void waitForCycleEnd(long generation) {
 
         if (!running || generation != runGeneration) {
@@ -559,32 +734,49 @@ public class FloatingService extends Service {
         long now = SystemClock.elapsedRealtime();
 
         if (now >= cycleDeadlineElapsedMs) {
+
             finishCycle(generation);
             return;
         }
 
         removeRunnable(cycleFinishRunnable);
 
-        cycleFinishRunnable = () ->
-                finishCycle(generation);
+        cycleFinishRunnable =
+                () -> finishCycle(generation);
 
-        handler.postAtTime(
+        postAtElapsedTime(
                 cycleFinishRunnable,
                 cycleDeadlineElapsedMs
         );
     }
 
+    /*
+     * ثبت گزارش و زمان‌بندی چرخه بعدی
+     */
     private void finishCycle(long generation) {
 
         if (!running
                 || generation != runGeneration
                 || !cycleActive) {
+
+            return;
+        }
+
+        if (accessibility != null
+                && accessibility.isGestureInProgress()) {
+
+            handler.postDelayed(
+                    () -> finishCycle(generation),
+                    5
+            );
+
             return;
         }
 
         cycleActive = false;
 
-        long actualEnd = SystemClock.elapsedRealtime();
+        long actualEnd =
+                SystemClock.elapsedRealtime();
 
         long actualDuration =
                 actualEnd - cycleStartElapsedMs;
@@ -627,13 +819,19 @@ public class FloatingService extends Service {
                 "چرخه " + cycleIndex + " تکمیل شد"
         );
 
-        long period = cycleDurationMs + pauseDurationMs;
+        long period =
+                cycleDurationMs + pauseDurationMs;
 
         long nextTarget;
 
-        if (cycleIndex > (Long.MAX_VALUE - anchorElapsedMs) / period) {
-            nextTarget = SystemClock.elapsedRealtime();
+        if (cycleIndex >
+                (Long.MAX_VALUE - anchorElapsedMs) / period) {
+
+            nextTarget =
+                    SystemClock.elapsedRealtime();
+
         } else {
+
             nextTarget =
                     anchorElapsedMs + cycleIndex * period;
         }
@@ -650,6 +848,9 @@ public class FloatingService extends Service {
         );
     }
 
+    /*
+     * به‌روزرسانی شمارش معکوس پنل
+     */
     private void updateDisplay() {
 
         if (statusView == null || counterView == null) {
@@ -657,6 +858,7 @@ public class FloatingService extends Service {
         }
 
         if (!running) {
+
             counterView.setText("متوقف");
             return;
         }
@@ -665,13 +867,18 @@ public class FloatingService extends Service {
 
         if (!cycleActive) {
 
-            long period = cycleDurationMs + pauseDurationMs;
+            long period =
+                    cycleDurationMs + pauseDurationMs;
 
             long nextTarget;
 
-            if (cycleIndex > (Long.MAX_VALUE - anchorElapsedMs) / period) {
+            if (cycleIndex >
+                    (Long.MAX_VALUE - anchorElapsedMs) / period) {
+
                 nextTarget = now;
+
             } else {
+
                 nextTarget =
                         anchorElapsedMs + cycleIndex * period;
             }
@@ -680,7 +887,8 @@ public class FloatingService extends Service {
                     Math.max(0, nextTarget - now);
 
             counterView.setText(
-                    "شروع چرخه بعدی: " + formatMillis(remaining)
+                    "شروع چرخه بعدی: "
+                            + formatMillis(remaining)
             );
 
             return;
@@ -692,14 +900,17 @@ public class FloatingService extends Service {
         if (clickNumber >= clickCount) {
 
             counterView.setText(
-                    "پایان چرخه: " + formatMillis(remaining)
+                    "پایان چرخه: "
+                            + formatMillis(remaining)
             );
 
         } else {
 
             counterView.setText(
-                    "کلیک " + clickNumber
-                            + " از " + clickCount
+                    "کلیک "
+                            + clickNumber
+                            + " از "
+                            + clickCount
                             + " | پایان چرخه: "
                             + formatMillis(remaining)
             );
@@ -737,10 +948,14 @@ public class FloatingService extends Service {
         }
     }
 
+    /*
+     * توقف زمان‌بندی و لغو کارهای در صف
+     */
     private void stopLoop() {
 
         running = false;
         cycleActive = false;
+
         runGeneration++;
 
         removeRunnable(cycleStartRunnable);
@@ -779,8 +994,13 @@ public class FloatingService extends Service {
         stopLoop();
 
         removeRunnable(displayRunnable);
+        displayRunnable = null;
 
         removeFloatingViews();
+
+        if (instance == this) {
+            instance = null;
+        }
 
         super.onDestroy();
     }
