@@ -1,4 +1,3 @@
-
 package com.precision.loopclicker;
 
 import android.app.Activity;
