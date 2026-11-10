@@ -1,3 +1,4 @@
+
 <?xml version="1.0" encoding="utf-8"?>
 <ScrollView
     xmlns:android="http://schemas.android.com/apk/res/android"
@@ -12,8 +13,6 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="vertical">
-
-        <!-- عنوان برنامه -->
 
         <TextView
             android:layout_width="match_parent"
@@ -36,7 +35,7 @@
             android:gravity="center"
             android:paddingBottom="16dp"/>
 
-        <!-- ساعت گوشی -->
+        <!-- نمایش ساعت‌ها -->
 
         <TextView
             android:id="@+id/phoneClock"
@@ -48,7 +47,90 @@
             android:textStyle="bold"
             android:gravity="center"
             android:background="#1B303A"
-            android:padding="16dp"/>
+            android:padding="14dp"/>
+
+        <TextView
+            android:id="@+id/internetClock"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="ساعت اینترنتی ایران: در انتظار همگام‌سازی"
+            android:textColor="#FFCA28"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:gravity="center"
+            android:background="#1B303A"
+            android:padding="14dp"
+            android:layout_marginTop="6dp"/>
+
+        <TextView
+            android:id="@+id/clockDifference"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="اختلاف ساعت گوشی با اینترنت: -- ms"
+            android:textColor="#FFFFFF"
+            android:textSize="16sp"
+            android:textStyle="bold"
+            android:gravity="center"
+            android:padding="10dp"/>
+
+        <TextView
+            android:id="@+id/syncStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="وضعیت همگام‌سازی: هنوز انجام نشده"
+            android:textColor="#80CBC4"
+            android:textSize="13sp"
+            android:gravity="center"
+            android:paddingBottom="10dp"/>
+
+        <!-- انتخاب ساعت مبنا -->
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="مبنای محاسبه زمان شروع"
+            android:textColor="#FF9800"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:paddingTop="12dp"
+            android:paddingBottom="6dp"/>
+
+        <RadioGroup
+            android:id="@+id/clockSourceGroup"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="#1B303A"
+            android:padding="10dp">
+
+            <RadioButton
+                android:id="@+id/radioPhoneClock"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="استفاده از ساعت گوشی"
+                android:textColor="#FFFFFF"
+                android:buttonTint="#03DAC5"
+                android:checked="true"
+                android:padding="5dp"/>
+
+            <RadioButton
+                android:id="@+id/radioInternetClock"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="استفاده از ساعت اینترنتی ایران"
+                android:textColor="#FFFFFF"
+                android:buttonTint="#03DAC5"
+                android:padding="5dp"/>
+
+        </RadioGroup>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="اختلاف همیشه به صورت ساعت گوشی منهای ساعت اینترنتی نمایش داده می‌شود."
+            android:textColor="#80CBC4"
+            android:textSize="12sp"
+            android:paddingTop="6dp"/>
 
         <!-- زمان شروع -->
 
@@ -129,7 +211,7 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="زمان شروع باید از ساعت فعلی گوشی جلوتر باشد."
+            android:text="زمان شروع بر اساس ساعتی محاسبه می‌شود که در بالا انتخاب کرده‌ای."
             android:textColor="#80CBC4"
             android:textSize="12sp"
             android:paddingTop="6dp"/>
