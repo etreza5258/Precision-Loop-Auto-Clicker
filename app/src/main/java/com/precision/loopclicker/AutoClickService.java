@@ -1,3 +1,4 @@
+
 package com.precision.loopclicker;
 
 import android.accessibilityservice.AccessibilityService;
@@ -15,12 +16,12 @@ public class AutoClickService extends AccessibilityService {
     private final Handler handler =
             new Handler(Looper.getMainLooper());
 
-    private int targetX = 500;
-    private int targetY = 500;
+    private volatile int targetX = 500;
+    private volatile int targetY = 500;
 
-    private long touchDurationMs = 5;
+    private volatile long touchDurationMs = 5;
 
-    private boolean gestureInProgress = false;
+    private volatile boolean gestureInProgress = false;
 
     private Runnable activeCompletion;
 
@@ -30,6 +31,7 @@ public class AutoClickService extends AccessibilityService {
     private long failedClicks = 0;
 
     private long dispatchStartNanos = 0;
+
     private long lastGestureLatencyNanos = 0;
     private long totalGestureLatencyNanos = 0;
     private long maxGestureLatencyNanos = 0;
@@ -47,20 +49,28 @@ public class AutoClickService extends AccessibilityService {
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-        // رویدادهای صفحه نیازی به پردازش ندارند.
+        // نیازی به پردازش رویدادهای صفحه نیست.
     }
 
     @Override
     public void onInterrupt() {
-        handler.post(() ->
-                finishGesture(activeGestureId, false)
-        );
+        handler.post(() -> {
+            if (gestureInProgress) {
+                finishGesture(activeGestureId, false);
+            }
+        });
     }
 
     @Override
     public void onDestroy() {
 
-        finishGesture(activeGestureId, false);
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            finishGesture(activeGestureId, false);
+        } else {
+            handler.post(() ->
+                    finishGesture(activeGestureId, false)
+            );
+        }
 
         if (instance == this) {
             instance = null;
@@ -124,9 +134,18 @@ public class AutoClickService extends AccessibilityService {
 
     public void performClick(Runnable completion) {
 
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+
+            handler.post(() -> performClick(completion));
+
+            return;
+        }
+
         if (gestureInProgress) {
 
-            failedClicks++;
+            // کلیک هم‌زمان ارسال نمی‌شود.
+            // این درخواست در شمارنده خطا ثبت نمی‌شود؛
+            // سرویس زمان‌بندی باید پس از پایان Gesture دوباره تلاش کند.
 
             if (completion != null) {
                 handler.post(completion);
@@ -135,21 +154,25 @@ public class AutoClickService extends AccessibilityService {
             return;
         }
 
+        final int clickX = targetX;
+        final int clickY = targetY;
+        final long duration = touchDurationMs;
+
         gestureInProgress = true;
+
         activeCompletion = completion;
 
         final long gestureId = ++activeGestureId;
 
-        FloatingService.setOverlaysHidden(true);
-
         Path path = new Path();
-        path.moveTo(targetX, targetY);
+
+        path.moveTo(clickX, clickY);
 
         GestureDescription.StrokeDescription stroke =
                 new GestureDescription.StrokeDescription(
                         path,
                         0,
-                        Math.max(1, touchDurationMs)
+                        Math.max(1, duration)
                 );
 
         GestureDescription gesture =
@@ -192,10 +215,12 @@ public class AutoClickService extends AccessibilityService {
             );
 
         } catch (Exception e) {
+
             accepted = false;
         }
 
         if (!accepted) {
+
             finishGesture(gestureId, false);
         }
     }
@@ -205,9 +230,18 @@ public class AutoClickService extends AccessibilityService {
             boolean success
     ) {
 
-        // جلوگیری از اجرای دوباره یا اجرای callback قدیمی
-        if (!gestureInProgress ||
-                gestureId != activeGestureId) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+
+            handler.post(() ->
+                    finishGesture(gestureId, success)
+            );
+
+            return;
+        }
+
+        // جلوگیری از callback تکراری یا قدیمی
+        if (!gestureInProgress
+                || gestureId != activeGestureId) {
             return;
         }
 
@@ -236,18 +270,26 @@ public class AutoClickService extends AccessibilityService {
                 latencyNanos
         );
 
-        gestureInProgress = false;
-
         if (success) {
-            successfulClicks++;
+
+            if (successfulClicks < Long.MAX_VALUE) {
+                successfulClicks++;
+            }
+
         } else {
-            failedClicks++;
+
+            if (failedClicks < Long.MAX_VALUE) {
+                failedClicks++;
+            }
         }
 
-        FloatingService.setOverlaysHidden(false);
+        gestureInProgress = false;
 
         Runnable callback = activeCompletion;
+
         activeCompletion = null;
+
+        // پنل و نشانگر دیگر مخفی یا دوباره نمایان نمی‌شوند.
 
         if (callback != null) {
             callback.run();
