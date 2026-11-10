@@ -2,6 +2,7 @@
 package com.precision.loopclicker;
 
 import android.app.Activity;
+import android.content.ComponentName;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.Build;
@@ -11,21 +12,21 @@ import android.os.Looper;
 import android.os.SystemClock;
 import android.provider.Settings;
 import android.provider.Settings.Secure;
+import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.RadioGroup;
 import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.IOException;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.text.ParseException;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
 import java.text.SimpleDateFormat;
 import java.time.Instant;
-import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
-import java.time.ZonedDateTime;
 import java.util.Date;
 import java.util.Locale;
 import java.util.TimeZone;
@@ -37,63 +38,101 @@ public class MainActivity extends Activity {
     private static final ZoneId IRAN_ZONE =
             ZoneId.of("Asia/Tehran");
 
-    private EditText startHourInput, startMinuteInput;
-    private EditText startSecondInput, startMillisInput;
+    private static final String ACTION_START = "ACTION_START";
+    private static final String ACTION_STOP = "ACTION_STOP";
+    private static final String ACTION_SHUTDOWN = "ACTION_SHUTDOWN";
+    private static final String ACTION_SHOW_PANEL = "SHOW_PANEL";
 
-    private EditText intervalSecondsInput, intervalMillisInput;
-    private EditText cycleSecondsInput, cycleMillisInput;
-    private EditText clickCountInput, touchMillisInput;
-    private EditText pauseSecondsInput, pauseMillisInput;
+    private static final String[] NTP_SERVERS = {
+            "time.google.com",
+            "time.cloudflare.com",
+            "pool.ntp.org"
+    };
 
-    private TextView phoneClock;
-    private TextView countdownHour, countdownMinute;
-    private TextView countdownSecond, countdownMillis;
-    private TextView countdownText, reportSummary;
-
-    private Button startButton, stopButton;
-    private Button accessibilityButton, overlayButton;
-    private Button showFloatingButton, clearReportsButton;
-    private Button shutdownButton;
+    private static final int NTP_PORT = 123;
+    private static final int NTP_TIMEOUT_MS = 1800;
 
     private final Handler handler =
             new Handler(Looper.getMainLooper());
 
-    private final ExecutorService timeExecutor =
+    private final ExecutorService networkExecutor =
             Executors.newSingleThreadExecutor();
 
-    private volatile long trustedEpochAtSync = 0L;
-    private volatile long elapsedAtSync = 0L;
+    private EditText startHourInput;
+    private EditText startMinuteInput;
+    private EditText startSecondInput;
+    private EditText startMillisInput;
+
+    private EditText intervalSecondsInput;
+    private EditText intervalMillisInput;
+
+    private EditText cycleSecondsInput;
+    private EditText cycleMillisInput;
+    private EditText clickCountInput;
+    private EditText touchMillisInput;
+
+    private EditText pauseSecondsInput;
+    private EditText pauseMillisInput;
+
+    private TextView phoneClock;
+    private TextView internetClock;
+    private TextView clockDifference;
+    private TextView syncStatus;
+
+    private TextView countdownHour;
+    private TextView countdownMinute;
+    private TextView countdownSecond;
+    private TextView countdownMillis;
+    private TextView countdownText;
+
+    private TextView reportSummary;
+
+    private RadioGroup clockSourceGroup;
+
+    private Button startButton;
+    private Button stopButton;
+    private Button accessibilityButton;
+    private Button overlayButton;
+    private Button showFloatingButton;
+    private Button clearReportsButton;
+    private Button shutdownButton;
+
+    /*
+     * زمان مرجع اینترنتی:
+     *
+     * trustedEpochAtSync:
+     * زمان اینترنتی بر حسب میلی‌ثانیه در لحظه همگام‌سازی
+     *
+     * elapsedAtSync:
+     * زمان یکنواخت اندروید در همان لحظه
+     */
+    private volatile long trustedEpochAtSync = 0;
+    private volatile long elapsedAtSync = 0;
+
     private volatile boolean timeSynced = false;
     private volatile boolean syncInProgress = false;
 
-    private long scheduledStartTime = 0L;
+    private volatile long syncUncertaintyMs = 0;
+    private volatile long lastSyncElapsed = 0;
+
     private boolean countdownActive = false;
-
-    private long lastReportRefreshTime = 0L;
-
-    private final Runnable syncRunnable = new Runnable() {
-        @Override
-        public void run() {
-            syncInternetTime();
-            handler.postDelayed(this, 60000L);
-        }
-    };
+    private long scheduledStartElapsed = 0;
 
     private final Runnable clockRunnable = new Runnable() {
         @Override
         public void run() {
-
-            updateIranClock();
+            updateClocks();
             updateCountdown();
 
-            long now = SystemClock.elapsedRealtime();
+            if (!syncInProgress) {
+                long now = SystemClock.elapsedRealtime();
 
-            if (now - lastReportRefreshTime >= 1000L) {
-                refreshReports();
-                lastReportRefreshTime = now;
+                if (!timeSynced || now - lastSyncElapsed >= 60000L) {
+                    syncInternetTime();
+                }
             }
 
-            handler.postDelayed(this, 30L);
+            handler.postDelayed(this, 50);
         }
     };
 
@@ -104,12 +143,15 @@ public class MainActivity extends Activity {
         setContentView(R.layout.activity_main);
 
         bindViews();
-        setDefaultValues();
         setupButtons();
+
         refreshReports();
 
+        updateClocks();
+
+        syncInternetTime();
+
         handler.post(clockRunnable);
-        handler.post(syncRunnable);
     }
 
     private void bindViews() {
@@ -124,7 +166,6 @@ public class MainActivity extends Activity {
 
         cycleSecondsInput = findViewById(R.id.cycleSecondsInput);
         cycleMillisInput = findViewById(R.id.cycleMillisInput);
-
         clickCountInput = findViewById(R.id.clickCountInput);
         touchMillisInput = findViewById(R.id.touchMillisInput);
 
@@ -132,46 +173,27 @@ public class MainActivity extends Activity {
         pauseMillisInput = findViewById(R.id.pauseMillisInput);
 
         phoneClock = findViewById(R.id.phoneClock);
+        internetClock = findViewById(R.id.internetClock);
+        clockDifference = findViewById(R.id.clockDifference);
+        syncStatus = findViewById(R.id.syncStatus);
 
         countdownHour = findViewById(R.id.countdownHour);
         countdownMinute = findViewById(R.id.countdownMinute);
         countdownSecond = findViewById(R.id.countdownSecond);
         countdownMillis = findViewById(R.id.countdownMillis);
-
         countdownText = findViewById(R.id.countdownText);
+
         reportSummary = findViewById(R.id.reportSummary);
+
+        clockSourceGroup = findViewById(R.id.clockSourceGroup);
 
         startButton = findViewById(R.id.startButton);
         stopButton = findViewById(R.id.stopButton);
-
         accessibilityButton = findViewById(R.id.accessibilityButton);
         overlayButton = findViewById(R.id.overlayButton);
-
         showFloatingButton = findViewById(R.id.showFloatingButton);
         clearReportsButton = findViewById(R.id.clearReportsButton);
-
         shutdownButton = findViewById(R.id.shutdownButton);
-    }
-
-    private void setDefaultValues() {
-
-        setIfEmpty(intervalSecondsInput, "0");
-        setIfEmpty(intervalMillisInput, "20");
-
-        setIfEmpty(cycleSecondsInput, "60");
-        setIfEmpty(cycleMillisInput, "0");
-
-        setIfEmpty(clickCountInput, "2");
-        setIfEmpty(touchMillisInput, "5");
-
-        setIfEmpty(pauseSecondsInput, "0");
-        setIfEmpty(pauseMillisInput, "0");
-    }
-
-    private void setIfEmpty(EditText input, String value) {
-        if (input.getText().toString().trim().isEmpty()) {
-            input.setText(value);
-        }
     }
 
     private void setupButtons() {
@@ -187,151 +209,99 @@ public class MainActivity extends Activity {
             startActivity(intent);
         });
 
-        overlayButton.setOnClickListener(v -> {
+        overlayButton.setOnClickListener(v -> openOverlaySettings());
 
-            if (!hasOverlayPermission()) {
-
-                Intent intent = new Intent(
-                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                        Uri.parse("package:" + getPackageName())
-                );
-
-                startActivity(intent);
-
-            } else {
-                showMessage("مجوز پنل شناور فعال است.");
-            }
-        });
-
-        showFloatingButton.setOnClickListener(v -> {
-
-            if (!hasOverlayPermission()) {
-                showMessage("ابتدا مجوز پنل شناور را فعال کنید.");
-                return;
-            }
-
-            Intent intent = new Intent(
-                    this,
-                    FloatingService.class
-            );
-
-            intent.setAction("SHOW_PANEL");
-
-            try {
-
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    startForegroundService(intent);
-                } else {
-                    startService(intent);
-                }
-
-            } catch (Exception e) {
-                showMessage("نمایش پنل شناور ناموفق بود.");
-            }
-        });
+        showFloatingButton.setOnClickListener(v -> showFloatingPanel());
 
         clearReportsButton.setOnClickListener(v -> {
-
             CycleReportStore.clearReports(this);
             refreshReports();
-            showMessage("گزارش‌ها پاک شدند.");
+            Toast.makeText(
+                    this,
+                    "گزارش‌ها پاک شدند",
+                    Toast.LENGTH_SHORT
+            ).show();
         });
 
-        shutdownButton.setOnClickListener(v -> {
-
-            stopClicking();
-
-            Intent serviceIntent =
-                    new Intent(this, FloatingService.class);
-
-            stopService(serviceIntent);
-            finish();
-        });
+        shutdownButton.setOnClickListener(v -> shutdownApplication());
     }
 
-    // دریافت زمان از سرور اینترنتی
-    private void syncInternetTime() {
+    // ---------------------------------------------------------
+    // ساعت گوشی و ساعت اینترنتی
+    // ---------------------------------------------------------
 
-        if (syncInProgress) {
-            return;
-        }
+    private void updateClocks() {
 
-        syncInProgress = true;
+        long phoneEpoch = System.currentTimeMillis();
 
-        timeExecutor.execute(() -> {
+        phoneClock.setText(
+                "ساعت گوشی: " + formatIranTime(phoneEpoch)
+        );
 
-            HttpURLConnection connection = null;
+        if (timeSynced) {
 
-            try {
+            long internetEpoch = getTrustedNow();
 
-                long requestStart = SystemClock.elapsedRealtime();
+            internetClock.setText(
+                    "ساعت اینترنتی ایران: "
+                            + formatIranTime(internetEpoch)
+            );
 
-                URL url = new URL(
-                        "https://www.google.com/generate_204"
+            long difference = phoneEpoch - internetEpoch;
+
+            clockDifference.setText(
+                    "اختلاف ساعت گوشی با اینترنت: "
+                            + String.format(
+                                    Locale.US,
+                                    "%+d ms",
+                                    difference
+                            )
+            );
+
+            syncStatus.setText(
+                    "همگام‌سازی انجام شده | عدم‌قطعیت تقریبی: ±"
+                            + syncUncertaintyMs
+                            + " ms"
+            );
+
+        } else {
+
+            internetClock.setText(
+                    "ساعت اینترنتی ایران: در انتظار همگام‌سازی"
+            );
+
+            clockDifference.setText(
+                    "اختلاف ساعت گوشی با اینترنت: -- ms"
+            );
+
+            if (syncInProgress) {
+                syncStatus.setText("در حال دریافت زمان اینترنتی...");
+            } else {
+                syncStatus.setText(
+                        "زمان اینترنتی هنوز دریافت نشده است"
                 );
-
-                connection = (HttpURLConnection) url.openConnection();
-                connection.setRequestMethod("GET");
-                connection.setConnectTimeout(5000);
-                connection.setReadTimeout(5000);
-                connection.setUseCaches(false);
-                connection.setInstanceFollowRedirects(true);
-
-                connection.connect();
-
-                long serverDate = connection.getHeaderFieldDate(
-                        "Date",
-                        -1L
-                );
-
-                long requestEnd = SystemClock.elapsedRealtime();
-
-                if (serverDate <= 0L) {
-                    throw new IOException("زمان سرور دریافت نشد.");
-                }
-
-                // تاریخ HTTP دقت ثانیه‌ای دارد؛
-                // نصف زمان رفت‌وبرگشت برای تخمین زمان دریافت لحاظ می‌شود.
-                long midpoint =
-                        requestStart + (requestEnd - requestStart) / 2L;
-
-                long estimatedServerTime =
-                        serverDate + (requestEnd - midpoint);
-
-                trustedEpochAtSync = estimatedServerTime;
-                elapsedAtSync = requestEnd;
-                timeSynced = true;
-
-                handler.post(() -> {
-                    updateIranClock();
-                });
-
-            } catch (Exception e) {
-
-                handler.post(() -> {
-                    if (!timeSynced) {
-                        phoneClock.setText(
-                                "ساعت ایران: در انتظار اتصال به اینترنت"
-                        );
-                    }
-                });
-
-            } finally {
-
-                if (connection != null) {
-                    connection.disconnect();
-                }
-
-                syncInProgress = false;
             }
-        });
+        }
     }
 
-    // زمان فعلی بر اساس ساعت همگام‌شده
+    private String formatIranTime(long epochMillis) {
+
+        SimpleDateFormat format = new SimpleDateFormat(
+                "HH:mm:ss.SSS",
+                Locale.US
+        );
+
+        format.setTimeZone(
+                TimeZone.getTimeZone("Asia/Tehran")
+        );
+
+        return format.format(new Date(epochMillis));
+    }
+
     private long getTrustedNow() {
 
         if (!timeSynced) {
-            return 0L;
+            return 0;
         }
 
         long elapsedNow = SystemClock.elapsedRealtime();
@@ -340,337 +310,543 @@ public class MainActivity extends Activity {
                 + (elapsedNow - elapsedAtSync);
     }
 
-    private void updateIranClock() {
+    // ---------------------------------------------------------
+    // همگام‌سازی NTP
+    // ---------------------------------------------------------
 
-        if (!timeSynced) {
+    private void syncInternetTime() {
 
-            phoneClock.setText(
-                    "ساعت ایران: در حال همگام‌سازی..."
-            );
-
+        if (syncInProgress) {
             return;
         }
 
-        long now = getTrustedNow();
+        syncInProgress = true;
 
-        ZonedDateTime iranTime =
-                Instant.ofEpochMilli(now).atZone(IRAN_ZONE);
+        handler.post(this::updateClocks);
 
-        String time = String.format(
-                Locale.US,
-                "ساعت ایران: %02d:%02d:%02d.%03d  |  همگام‌شده",
-                iranTime.getHour(),
-                iranTime.getMinute(),
-                iranTime.getSecond(),
-                iranTime.getNano() / 1000000
-        );
+        networkExecutor.execute(() -> {
 
-        phoneClock.setText(time);
-    }
+            NtpResult bestResult = null;
 
-    private void startClicking() {
+            for (String server : NTP_SERVERS) {
 
-        if (!hasAccessibilityPermission()) {
-            showMessage("ابتدا دسترسی لمس را فعال کنید.");
-            return;
-        }
+                try {
 
-        if (!hasOverlayPermission()) {
-            showMessage("ابتدا مجوز پنل شناور را فعال کنید.");
-            return;
-        }
+                    NtpResult result = queryNtpServer(server);
 
-        if (!timeSynced) {
-            syncInternetTime();
-            showMessage("ابتدا منتظر همگام‌سازی ساعت ایران بمانید.");
-            return;
-        }
+                    if (result != null) {
 
-        Long hourValue = readLong(startHourInput, "ساعت");
-        Long minuteValue = readLong(startMinuteInput, "دقیقه");
-        Long secondValue = readLong(startSecondInput, "ثانیه");
-        Long millisValue = readLong(startMillisInput, "میلی‌ثانیه");
+                        if (bestResult == null
+                                || result.roundTripMs
+                                < bestResult.roundTripMs) {
 
-        Long intervalSecondsValue =
-                readLong(intervalSecondsInput, "ثانیه فاصله کلیک");
+                            bestResult = result;
+                        }
+                    }
 
-        Long intervalMillisValue =
-                readLong(intervalMillisInput, "میلی‌ثانیه فاصله کلیک");
-
-        Long cycleSecondsValue =
-                readLong(cycleSecondsInput, "ثانیه چرخه");
-
-        Long cycleMillisValue =
-                readLong(cycleMillisInput, "میلی‌ثانیه چرخه");
-
-        Long clickCountValue =
-                readLong(clickCountInput, "تعداد کلیک");
-
-        Long touchMillisValue =
-                readLong(touchMillisInput, "مدت لمس");
-
-        Long pauseSecondsValue =
-                readLong(pauseSecondsInput, "ثانیه مکث");
-
-        Long pauseMillisValue =
-                readLong(pauseMillisInput, "میلی‌ثانیه مکث");
-
-        if (hourValue == null || minuteValue == null
-                || secondValue == null || millisValue == null
-                || intervalSecondsValue == null
-                || intervalMillisValue == null
-                || cycleSecondsValue == null
-                || cycleMillisValue == null
-                || clickCountValue == null
-                || touchMillisValue == null
-                || pauseSecondsValue == null
-                || pauseMillisValue == null) {
-            return;
-        }
-
-        long hour = hourValue;
-        long minute = minuteValue;
-        long second = secondValue;
-        long millis = millisValue;
-
-        long intervalSeconds = intervalSecondsValue;
-        long intervalMillis = intervalMillisValue;
-
-        long cycleSeconds = cycleSecondsValue;
-        long cycleMillis = cycleMillisValue;
-
-        long clickCount = clickCountValue;
-        long touchMillis = touchMillisValue;
-
-        long pauseSeconds = pauseSecondsValue;
-        long pauseMillis = pauseMillisValue;
-
-        if (hour > 23 || minute > 59
-                || second > 59 || millis > 999) {
-            showMessage("زمان شروع معتبر نیست.");
-            return;
-        }
-
-        if (intervalMillis > 999) {
-            showMessage("میلی‌ثانیه فاصله باید بین ۰ تا ۹۹۹ باشد.");
-            return;
-        }
-
-        if (cycleMillis > 999
-                || (cycleSeconds == 0 && cycleMillis == 0)) {
-            showMessage("مدت چرخه معتبر نیست.");
-            return;
-        }
-
-        if (clickCount < 1 || clickCount > 100000) {
-            showMessage("تعداد کلیک باید بین ۱ تا ۱۰۰۰۰۰ باشد.");
-            return;
-        }
-
-        if (touchMillis < 1 || touchMillis > 60000) {
-            showMessage("مدت لمس باید بین ۱ تا ۶۰۰۰۰ میلی‌ثانیه باشد.");
-            return;
-        }
-
-        if (pauseMillis > 999) {
-            showMessage("میلی‌ثانیه مکث باید بین ۰ تا ۹۹۹ باشد.");
-            return;
-        }
-
-        if (intervalSeconds >
-                (Long.MAX_VALUE - intervalMillis) / 1000L
-                || cycleSeconds >
-                (Long.MAX_VALUE - cycleMillis) / 1000L
-                || pauseSeconds >
-                (Long.MAX_VALUE - pauseMillis) / 1000L) {
-
-            showMessage("یکی از زمان‌ها بیش از حد بزرگ است.");
-            return;
-        }
-
-        long intervalDuration =
-                intervalSeconds * 1000L + intervalMillis;
-
-        long cycleDuration =
-                cycleSeconds * 1000L + cycleMillis;
-
-        long pauseDuration =
-                pauseSeconds * 1000L + pauseMillis;
-
-        long trustedNow = getTrustedNow();
-
-        ZonedDateTime iranNow =
-                Instant.ofEpochMilli(trustedNow).atZone(IRAN_ZONE);
-
-        LocalDate iranDate = iranNow.toLocalDate();
-
-        LocalDateTime requestedDateTime =
-                iranDate.atTime(
-                        (int) hour,
-                        (int) minute,
-                        (int) second,
-                        (int) millis * 1000000
-                );
-
-        long startTime = requestedDateTime
-                .atZone(IRAN_ZONE)
-                .toInstant()
-                .toEpochMilli();
-
-        if (startTime <= trustedNow) {
-            showMessage("زمان شروع باید از ساعت فعلی ایران جلوتر باشد.");
-            return;
-        }
-
-        long startDelay = startTime - trustedNow;
-
-        // سازگاری با FloatingService فعلی که از ساعت گوشی استفاده می‌کند:
-        // زمان معادل روی ساعت گوشی را می‌فرستیم تا تأخیر شروع درست بماند.
-        long serviceStartTime =
-                System.currentTimeMillis() + startDelay;
-
-        Intent intent = new Intent(
-                this,
-                FloatingService.class
-        );
-
-        intent.setAction("ACTION_START");
-
-        intent.putExtra("start_time_epoch_ms", serviceStartTime);
-        intent.putExtra("start_delay_ms", startDelay);
-
-        intent.putExtra("cycle_duration", cycleDuration);
-        intent.putExtra("click_count", (int) clickCount);
-        intent.putExtra("touch_duration", (int) touchMillis);
-        intent.putExtra("pause_duration", pauseDuration);
-        intent.putExtra("click_interval_ms", intervalDuration);
-
-        try {
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(intent);
-            } else {
-                startService(intent);
+                } catch (Exception ignored) {
+                }
             }
 
-            scheduledStartTime = startTime;
-            countdownActive = true;
+            final NtpResult finalResult = bestResult;
 
-            countdownText.setText("در انتظار زمان شروع");
+            runOnUiThread(() -> {
 
-            updateCountdown();
+                syncInProgress = false;
 
-            showMessage("زمان‌بندی بر اساس ساعت ایران ثبت شد.");
+                if (finalResult != null) {
 
-        } catch (Exception e) {
+                    trustedEpochAtSync =
+                            finalResult.estimatedEpochMs;
 
-            countdownActive = false;
+                    elapsedAtSync =
+                            finalResult.receivedElapsedMs;
 
-            showMessage(
-                    "شروع سرویس ناموفق بود: " + e.getMessage()
-            );
-        }
+                    syncUncertaintyMs =
+                            Math.max(
+                                    1,
+                                    (finalResult.roundTripMs + 1) / 2
+                            );
+
+                    lastSyncElapsed =
+                            finalResult.receivedElapsedMs;
+
+                    timeSynced = true;
+
+                    syncStatus.setText(
+                            "همگام‌سازی موفق از "
+                                    + finalResult.server
+                                    + " | عدم‌قطعیت تقریبی: ±"
+                                    + syncUncertaintyMs
+                                    + " ms"
+                    );
+
+                } else {
+
+                    if (!timeSynced) {
+                        syncStatus.setText(
+                                "دریافت زمان اینترنتی ناموفق بود؛ "
+                                        + "اتصال اینترنت و دسترسی NTP را بررسی کن."
+                        );
+                    } else {
+                        syncStatus.setText(
+                                "اتصال مجدد ناموفق؛ آخرین زمان دریافت‌شده استفاده می‌شود."
+                        );
+                    }
+                }
+
+                updateClocks();
+            });
+        });
     }
 
-    private Long readLong(EditText input, String fieldName) {
+    private NtpResult queryNtpServer(String server)
+            throws IOException {
 
-        String value = input.getText().toString().trim();
-
-        if (value.isEmpty()) {
-            showMessage("مقدار «" + fieldName + "» را وارد کنید.");
-            input.requestFocus();
-            return null;
-        }
+        DatagramSocket socket = new DatagramSocket();
 
         try {
 
-            long number = Long.parseLong(value);
+            socket.setSoTimeout(NTP_TIMEOUT_MS);
 
-            if (number < 0) {
-                showMessage(
-                        "مقدار «" + fieldName
-                                + "» نمی‌تواند منفی باشد."
-                );
-                input.requestFocus();
+            InetAddress address = InetAddress.getByName(server);
+
+            byte[] request = new byte[48];
+
+            // NTP version 4, client mode
+            request[0] = 0x23;
+
+            DatagramPacket requestPacket =
+                    new DatagramPacket(
+                            request,
+                            request.length,
+                            address,
+                            NTP_PORT
+                    );
+
+            long sendElapsed =
+                    SystemClock.elapsedRealtime();
+
+            socket.send(requestPacket);
+
+            byte[] response = new byte[48];
+
+            DatagramPacket responsePacket =
+                    new DatagramPacket(
+                            response,
+                            response.length
+                    );
+
+            socket.receive(responsePacket);
+
+            long receiveElapsed =
+                    SystemClock.elapsedRealtime();
+
+            long roundTripMs = Math.max(
+                    0,
+                    receiveElapsed - sendElapsed
+            );
+
+            if (responsePacket.getLength() < 48) {
                 return null;
             }
 
-            return number;
+            int mode = response[0] & 0x07;
+            int stratum = response[1] & 0xFF;
 
-        } catch (NumberFormatException e) {
+            // پاسخ باید از سرور NTP باشد.
+            if (mode != 4 && mode != 5) {
+                return null;
+            }
 
-            showMessage("مقدار «" + fieldName + "» معتبر نیست.");
-            input.requestFocus();
-            return null;
+            if (stratum < 1 || stratum > 15) {
+                return null;
+            }
+
+            long seconds = readUnsignedInt(response, 40);
+            long fraction = readUnsignedInt(response, 44);
+
+            if (seconds == 0) {
+                return null;
+            }
+
+            // اختلاف مبدأ NTP و Unix برابر 2208988800 ثانیه است.
+            long unixSeconds = seconds - 2208988800L;
+
+            long fractionMillis =
+                    (fraction * 1000L) >>> 32;
+
+            long serverTransmitEpoch =
+                    unixSeconds * 1000L + fractionMillis;
+
+            // تخمین زمان لحظه دریافت با فرض مسیر رفت‌وبرگشت متقارن
+            long estimatedEpoch =
+                    serverTransmitEpoch + roundTripMs / 2L;
+
+            // جلوگیری از پذیرفتن پاسخ‌های نامعتبر یا بسیار قدیمی
+            if (estimatedEpoch < 1577836800000L) {
+                return null;
+            }
+
+            return new NtpResult(
+                    server,
+                    estimatedEpoch,
+                    receiveElapsed,
+                    roundTripMs
+            );
+
+        } finally {
+
+            socket.close();
         }
     }
 
-    private void stopClicking() {
+    private long readUnsignedInt(byte[] data, int offset) {
 
-        countdownActive = false;
-        scheduledStartTime = 0L;
+        return ((long) (data[offset] & 0xFF) << 24)
+                | ((long) (data[offset + 1] & 0xFF) << 16)
+                | ((long) (data[offset + 2] & 0xFF) << 8)
+                | ((long) (data[offset + 3] & 0xFF));
+    }
 
-        setCountdownValues(0, 0, 0, 0);
-        countdownText.setText("متوقف شد");
+    private static class NtpResult {
 
-        Intent intent = new Intent(
-                this,
-                FloatingService.class
-        );
+        final String server;
+        final long estimatedEpochMs;
+        final long receivedElapsedMs;
+        final long roundTripMs;
 
-        intent.setAction("ACTION_STOP");
+        NtpResult(
+                String server,
+                long estimatedEpochMs,
+                long receivedElapsedMs,
+                long roundTripMs
+        ) {
 
-        try {
-            startService(intent);
-        } catch (Exception ignored) {
+            this.server = server;
+            this.estimatedEpochMs = estimatedEpochMs;
+            this.receivedElapsedMs = receivedElapsedMs;
+            this.roundTripMs = roundTripMs;
         }
     }
 
-    private void updateCountdown() {
+    // ---------------------------------------------------------
+    // شروع اجرای لوپی
+    // ---------------------------------------------------------
 
-        if (!countdownActive || scheduledStartTime == 0L) {
+    private void startClicking() {
+
+        if (!isAccessibilityEnabled()) {
+
+            Toast.makeText(
+                    this,
+                    "ابتدا دسترسی لمس را فعال کن.",
+                    Toast.LENGTH_LONG
+            ).show();
+
             return;
         }
 
-        if (!timeSynced) {
-            countdownText.setText("در انتظار همگام‌سازی ساعت ایران");
+        if (!Settings.canDrawOverlays(this)) {
+
+            Toast.makeText(
+                    this,
+                    "ابتدا مجوز پنل شناور را فعال کن.",
+                    Toast.LENGTH_LONG
+            ).show();
+
+            openOverlaySettings();
+
+            return;
+        }
+
+        boolean useInternetClock =
+                clockSourceGroup.getCheckedRadioButtonId()
+                        == R.id.radioInternetClock;
+
+        if (useInternetClock && !timeSynced) {
+
+            Toast.makeText(
+                    this,
+                    "برای استفاده از ساعت اینترنتی، ابتدا همگام‌سازی موفق لازم است.",
+                    Toast.LENGTH_LONG
+            ).show();
+
+            syncInternetTime();
+
+            return;
+        }
+
+        try {
+
+            int hour = (int) readNumber(startHourInput, 0);
+            int minute = (int) readNumber(startMinuteInput, 0);
+            int second = (int) readNumber(startSecondInput, 0);
+            int millis = (int) readNumber(startMillisInput, 0);
+
+            if (hour < 0 || hour > 23
+                    || minute < 0 || minute > 59
+                    || second < 0 || second > 59
+                    || millis < 0 || millis > 999) {
+
+                showError("زمان شروع معتبر نیست.");
+                return;
+            }
+
+            long intervalSeconds =
+                    readNumber(intervalSecondsInput, 0);
+
+            long intervalMillis =
+                    readNumber(intervalMillisInput, 20);
+
+            long cycleSeconds =
+                    readNumber(cycleSecondsInput, 60);
+
+            long cycleMillis =
+                    readNumber(cycleMillisInput, 0);
+
+            long clickCount =
+                    readNumber(clickCountInput, 2);
+
+            long touchMillis =
+                    readNumber(touchMillisInput, 5);
+
+            long pauseSeconds =
+                    readNumber(pauseSecondsInput, 0);
+
+            long pauseMillis =
+                    readNumber(pauseMillisInput, 0);
+
+            if (intervalSeconds < 0
+                    || intervalMillis < 0
+                    || cycleSeconds < 0
+                    || cycleMillis < 0
+                    || clickCount <= 0
+                    || clickCount > Integer.MAX_VALUE
+                    || touchMillis <= 0
+                    || pauseSeconds < 0
+                    || pauseMillis < 0) {
+
+                showError("یکی از مقادیر تنظیمات معتبر نیست.");
+                return;
+            }
+
+            long intervalDuration =
+                    combineDuration(
+                            intervalSeconds,
+                            intervalMillis
+                    );
+
+            long cycleDuration =
+                    combineDuration(
+                            cycleSeconds,
+                            cycleMillis
+                    );
+
+            long pauseDuration =
+                    combineDuration(
+                            pauseSeconds,
+                            pauseMillis
+                    );
+
+            if (cycleDuration <= 0) {
+                showError("مدت چرخه باید بیشتر از صفر باشد.");
+                return;
+            }
+
+            long sourceNow = useInternetClock
+                    ? getTrustedNow()
+                    : System.currentTimeMillis();
+
+            if (sourceNow <= 0) {
+                showError("زمان مبنا معتبر نیست.");
+                return;
+            }
+
+            LocalDateTime currentIranTime =
+                    Instant.ofEpochMilli(sourceNow)
+                            .atZone(IRAN_ZONE)
+                            .toLocalDateTime();
+
+            LocalDateTime requestedIranTime =
+                    currentIranTime
+                            .withHour(hour)
+                            .withMinute(minute)
+                            .withSecond(second)
+                            .withNano(millis * 1000000);
+
+            long scheduledStartEpoch =
+                    requestedIranTime
+                            .atZone(IRAN_ZONE)
+                            .toInstant()
+                            .toEpochMilli();
+
+            long startDelay =
+                    scheduledStartEpoch - sourceNow;
+
+            if (startDelay <= 0) {
+
+                showError(
+                        "زمان شروع باید از زمان فعلی ساعت انتخاب‌شده جلوتر باشد."
+                );
+
+                return;
+            }
+
+            long nowElapsed =
+                    SystemClock.elapsedRealtime();
+
+            if (startDelay > Long.MAX_VALUE - nowElapsed) {
+                showError("فاصله زمانی شروع بیش از حد بزرگ است.");
+                return;
+            }
+
+            scheduledStartElapsed =
+                    nowElapsed + startDelay;
+
+            countdownActive = true;
+
+            Intent serviceIntent =
+                    new Intent(this, FloatingService.class);
+
+            serviceIntent.setAction(ACTION_START);
+
+            serviceIntent.putExtra(
+                    "start_time_epoch_ms",
+                    scheduledStartEpoch
+            );
+
+            serviceIntent.putExtra(
+                    "start_delay_ms",
+                    startDelay
+            );
+
+            serviceIntent.putExtra(
+                    "cycle_duration",
+                    cycleDuration
+            );
+
+            serviceIntent.putExtra(
+                    "click_count",
+                    (int) clickCount
+            );
+
+            serviceIntent.putExtra(
+                    "touch_duration",
+                    touchMillis
+            );
+
+            serviceIntent.putExtra(
+                    "pause_duration",
+                    pauseDuration
+            );
+
+            serviceIntent.putExtra(
+                    "click_interval_ms",
+                    intervalDuration
+            );
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(serviceIntent);
+            } else {
+                startService(serviceIntent);
+            }
+
+            String sourceName = useInternetClock
+                    ? "ساعت اینترنتی ایران"
+                    : "ساعت گوشی";
+
+            countdownText.setText(
+                    "زمان‌بندی ثبت شد بر اساس " + sourceName
+            );
+
+            Toast.makeText(
+                    this,
+                    "زمان شروع ثبت شد.",
+                    Toast.LENGTH_SHORT
+            ).show();
+
+        } catch (NumberFormatException e) {
+
+            showError("لطفاً مقادیر عددی را بررسی کن.");
+
+        } catch (ArithmeticException e) {
+
+            showError("یکی از زمان‌ها بیش از محدوده مجاز است.");
+
+        } catch (Exception e) {
+
+            showError("خطا در ثبت زمان شروع: " + e.getMessage());
+        }
+    }
+
+    private long readNumber(EditText input, long defaultValue) {
+
+        String value = input.getText()
+                .toString()
+                .trim();
+
+        if (value.isEmpty()) {
+            return defaultValue;
+        }
+
+        return Long.parseLong(value);
+    }
+
+    private long combineDuration(long seconds, long millis) {
+
+        if (seconds < 0 || millis < 0) {
+            throw new ArithmeticException();
+        }
+
+        if (seconds > (Long.MAX_VALUE - millis) / 1000L) {
+            throw new ArithmeticException();
+        }
+
+        return seconds * 1000L + millis;
+    }
+
+    private void showError(String message) {
+
+        Toast.makeText(
+                this,
+                message,
+                Toast.LENGTH_LONG
+        ).show();
+    }
+
+    // ---------------------------------------------------------
+    // شمارش معکوس
+    // ---------------------------------------------------------
+
+    private void updateCountdown() {
+
+        if (!countdownActive) {
             return;
         }
 
         long remaining =
-                scheduledStartTime - getTrustedNow();
+                scheduledStartElapsed
+                        - SystemClock.elapsedRealtime();
 
-        if (remaining <= 0L) {
+        if (remaining <= 0) {
 
-            setCountdownValues(0, 0, 0, 0);
+            countdownHour.setText("00");
+            countdownMinute.setText("00");
+            countdownSecond.setText("00");
+            countdownMillis.setText("000");
 
             countdownText.setText("زمان شروع فرا رسیده است.");
 
             countdownActive = false;
+
             return;
         }
 
         long hours = remaining / 3600000L;
         long minutes = (remaining % 3600000L) / 60000L;
         long seconds = (remaining % 60000L) / 1000L;
-        long milliseconds = remaining % 1000L;
-
-        setCountdownValues(
-                hours,
-                minutes,
-                seconds,
-                milliseconds
-        );
-
-        countdownText.setText("زمان باقی‌مانده تا شروع");
-    }
-
-    private void setCountdownValues(
-            long hours,
-            long minutes,
-            long seconds,
-            long milliseconds
-    ) {
+        long millis = remaining % 1000L;
 
         countdownHour.setText(
                 String.format(Locale.US, "%02d", hours)
@@ -685,17 +861,81 @@ public class MainActivity extends Activity {
         );
 
         countdownMillis.setText(
-                String.format(Locale.US, "%03d", milliseconds)
+                String.format(Locale.US, "%03d", millis)
         );
     }
 
-    private boolean hasOverlayPermission() {
+    // ---------------------------------------------------------
+    // توقف و کنترل FloatingService
+    // ---------------------------------------------------------
 
-        return Build.VERSION.SDK_INT < Build.VERSION_CODES.M
-                || Settings.canDrawOverlays(this);
+    private void stopClicking() {
+
+        countdownActive = false;
+
+        Intent intent =
+                new Intent(this, FloatingService.class);
+
+        intent.setAction(ACTION_STOP);
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent);
+        } else {
+            startService(intent);
+        }
+
+        countdownText.setText("اجرای کلیک‌ها متوقف شد.");
+
+        Toast.makeText(
+                this,
+                "درخواست توقف ارسال شد.",
+                Toast.LENGTH_SHORT
+        ).show();
     }
 
-    private boolean hasAccessibilityPermission() {
+    private void showFloatingPanel() {
+
+        if (!Settings.canDrawOverlays(this)) {
+
+            openOverlaySettings();
+            return;
+        }
+
+        Intent intent =
+                new Intent(this, FloatingService.class);
+
+        intent.setAction(ACTION_SHOW_PANEL);
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent);
+        } else {
+            startService(intent);
+        }
+    }
+
+    private void shutdownApplication() {
+
+        countdownActive = false;
+
+        Intent intent =
+                new Intent(this, FloatingService.class);
+
+        intent.setAction(ACTION_SHUTDOWN);
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent);
+        } else {
+            startService(intent);
+        }
+
+        finish();
+    }
+
+    // ---------------------------------------------------------
+    // مجوزها
+    // ---------------------------------------------------------
+
+    private boolean isAccessibilityEnabled() {
 
         String enabledServices = Secure.getString(
                 getContentResolver(),
@@ -706,24 +946,45 @@ public class MainActivity extends Activity {
             return false;
         }
 
+        ComponentName serviceComponent =
+                new ComponentName(
+                        this,
+                        AutoClickService.class
+                );
+
+        String expected =
+                serviceComponent.flattenToString();
+
         return enabledServices.toLowerCase(Locale.ROOT)
-                .contains(getPackageName().toLowerCase(Locale.ROOT));
+                .contains(expected.toLowerCase(Locale.ROOT));
     }
 
+    private void openOverlaySettings() {
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+
+            Intent intent = new Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:" + getPackageName())
+            );
+
+            startActivity(intent);
+        }
+    }
+
+    // ---------------------------------------------------------
+    // گزارش چرخه‌ها
+    // ---------------------------------------------------------
+
     private void refreshReports() {
+
+        if (reportSummary == null) {
+            return;
+        }
 
         reportSummary.setText(
                 CycleReportStore.getReportSummary(this)
         );
-    }
-
-    private void showMessage(String message) {
-
-        Toast.makeText(
-                this,
-                message,
-                Toast.LENGTH_SHORT
-        ).show();
     }
 
     @Override
@@ -731,20 +992,15 @@ public class MainActivity extends Activity {
         super.onResume();
 
         refreshReports();
-        lastReportRefreshTime = SystemClock.elapsedRealtime();
-
-        if (!timeSynced) {
-            syncInternetTime();
-        }
+        updateClocks();
     }
 
     @Override
     protected void onDestroy() {
 
         handler.removeCallbacks(clockRunnable);
-        handler.removeCallbacks(syncRunnable);
 
-        timeExecutor.shutdownNow();
+        networkExecutor.shutdownNow();
 
         super.onDestroy();
     }
