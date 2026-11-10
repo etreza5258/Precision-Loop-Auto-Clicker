@@ -1,4 +1,3 @@
-
 package com.precision.loopclicker;
 
 import android.app.Notification;
@@ -19,6 +18,7 @@ import android.os.Looper;
 import android.os.SystemClock;
 import android.provider.Settings;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
 import android.view.ViewGroup;
@@ -34,7 +34,9 @@ public class FloatingService extends Service {
     private static final String ACTION_SHUTDOWN = "ACTION_SHUTDOWN";
     private static final String ACTION_SHOW_PANEL = "SHOW_PANEL";
 
-    private static final String CHANNEL_ID = "precision_clicker_channel";
+    private static final String CHANNEL_ID =
+            "precision_clicker_channel";
+
     private static final int NOTIFICATION_ID = 1001;
 
     private static FloatingService instance;
@@ -44,12 +46,35 @@ public class FloatingService extends Service {
 
     private WindowManager windowManager;
 
+    // پنل شناور
     private LinearLayout panel;
+    private TextView titleView;
     private TextView statusView;
     private TextView counterView;
 
+    private WindowManager.LayoutParams panelParams;
+
+    // نشانگر هدف
+    private TextView marker;
+    private WindowManager.LayoutParams markerParams;
+
+    private int markerSize;
+    private int targetX = 500;
+    private int targetY = 500;
+
+    private float panelTouchStartX;
+    private float panelTouchStartY;
+    private int panelStartX;
+    private int panelStartY;
+
+    private float markerTouchStartX;
+    private float markerTouchStartY;
+    private int markerStartX;
+    private int markerStartY;
+
     private volatile boolean running = false;
     private boolean cycleActive = false;
+    private boolean overlaysHidden = false;
 
     private long runGeneration = 0;
     private long cycleIndex = 0;
@@ -72,9 +97,6 @@ public class FloatingService extends Service {
     private long successAtStart;
     private long failedAtStart;
 
-    private final int targetX = 500;
-    private final int targetY = 500;
-
     private Runnable cycleStartRunnable;
     private Runnable nextClickRunnable;
     private Runnable cycleFinishRunnable;
@@ -90,6 +112,8 @@ public class FloatingService extends Service {
 
         windowManager =
                 (WindowManager) getSystemService(WINDOW_SERVICE);
+
+        markerSize = dp(56);
 
         createNotificationChannel();
         startForegroundNotification();
@@ -108,10 +132,12 @@ public class FloatingService extends Service {
         handler.post(displayRunnable);
     }
 
-    /*
-     * این متد توسط AutoClickService فراخوانی می‌شود.
-     * پنل هنگام اجرای Gesture مخفی می‌شود.
-     */
+    private int dp(float value) {
+        return (int) (value *
+                getResources().getDisplayMetrics().density + 0.5f);
+    }
+
+    // مخفی و نمایان کردن هم‌زمان پنل و نشانگر
     public static void setOverlaysHidden(boolean hidden) {
 
         FloatingService service = instance;
@@ -121,23 +147,29 @@ public class FloatingService extends Service {
         }
 
         if (Looper.myLooper() == Looper.getMainLooper()) {
-            service.changePanelVisibility(hidden);
+            service.changeOverlayVisibility(hidden);
         } else {
             service.handler.post(
-                    () -> service.changePanelVisibility(hidden)
+                    () -> service.changeOverlayVisibility(hidden)
             );
         }
     }
 
-    private void changePanelVisibility(boolean hidden) {
+    private void changeOverlayVisibility(boolean hidden) {
 
-        if (panel == null) {
-            return;
+        overlaysHidden = hidden;
+
+        int visibility = hidden
+                ? View.INVISIBLE
+                : View.VISIBLE;
+
+        if (panel != null) {
+            panel.setVisibility(visibility);
         }
 
-        panel.setVisibility(
-                hidden ? View.INVISIBLE : View.VISIBLE
-        );
+        if (marker != null) {
+            marker.setVisibility(visibility);
+        }
     }
 
     private void createNotificationChannel() {
@@ -151,9 +183,7 @@ public class FloatingService extends Service {
                             NotificationManager.IMPORTANCE_LOW
                     );
 
-            channel.setDescription(
-                    "وضعیت اجرای اتوکلیکر"
-            );
+            channel.setDescription("وضعیت اجرای اتوکلیکر");
 
             NotificationManager manager =
                     getSystemService(NotificationManager.class);
@@ -204,10 +234,7 @@ public class FloatingService extends Service {
 
         } else {
 
-            startForeground(
-                    NOTIFICATION_ID,
-                    notification
-            );
+            startForeground(NOTIFICATION_ID, notification);
         }
     }
 
@@ -240,6 +267,7 @@ public class FloatingService extends Service {
         } else if (ACTION_SHOW_PANEL.equals(action)) {
 
             createFloatingViews();
+            changeOverlayVisibility(false);
 
         } else {
 
@@ -249,107 +277,307 @@ public class FloatingService extends Service {
         return START_NOT_STICKY;
     }
 
+    // ساخت پنل و نشانگر
     private void createFloatingViews() {
-
-        if (panel != null) {
-            return;
-        }
 
         if (!Settings.canDrawOverlays(this)) {
             return;
         }
 
+        if (panel == null) {
+            createPanel();
+        }
+
+        if (marker == null) {
+            createMarker();
+        }
+
+        changeOverlayVisibility(overlaysHidden);
+    }
+
+    private int getOverlayType() {
+
+        if (Build.VERSION.SDK_INT >= 26) {
+            return WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY;
+        }
+
+        return WindowManager.LayoutParams.TYPE_PHONE;
+    }
+
+    private WindowManager.LayoutParams createOverlayParams(
+            int width,
+            int height
+    ) {
+
+        WindowManager.LayoutParams params =
+                new WindowManager.LayoutParams(
+                        width,
+                        height,
+                        getOverlayType(),
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                                | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                        PixelFormat.TRANSLUCENT
+                );
+
+        params.gravity = Gravity.TOP | Gravity.START;
+
+        return params;
+    }
+
+    private void createPanel() {
+
         LinearLayout root = new LinearLayout(this);
+
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(18, 14, 18, 14);
-        root.setBackground(
-                makeBackground("#202B38", 18)
+        root.setPadding(dp(14), dp(10), dp(14), dp(12));
+        root.setBackground(makeBackground("#202B38", 16));
+
+        // عنوان پنل؛ فقط این قسمت برای جابه‌جایی پنل استفاده می‌شود.
+        titleView = new TextView(this);
+
+        titleView.setText("☰  Precision Loop Auto Clicker");
+        titleView.setTextColor(Color.WHITE);
+        titleView.setTextSize(13);
+        titleView.setTypeface(null, Typeface.BOLD);
+        titleView.setPadding(dp(3), dp(5), dp(3), dp(10));
+
+        titleView.setOnTouchListener(
+                (view, event) -> handlePanelDrag(event)
         );
 
-        TextView title = new TextView(this);
-        title.setText("Precision Loop Auto Clicker");
-        title.setTextColor(Color.WHITE);
-        title.setTextSize(14);
-        title.setTypeface(null, Typeface.BOLD);
-
-        root.addView(title);
+        root.addView(titleView);
 
         statusView = new TextView(this);
         statusView.setText("آماده");
         statusView.setTextColor(Color.WHITE);
         statusView.setTextSize(13);
-        statusView.setPadding(0, 12, 0, 6);
+        statusView.setPadding(0, dp(8), 0, dp(5));
 
         root.addView(statusView);
 
         counterView = new TextView(this);
         counterView.setText("در انتظار شروع");
-        counterView.setTextColor(
-                Color.rgb(255, 193, 7)
-        );
-        counterView.setTextSize(13);
-        counterView.setPadding(0, 5, 0, 10);
+        counterView.setTextColor(Color.rgb(255, 193, 7));
+        counterView.setTextSize(12);
+        counterView.setPadding(0, dp(5), 0, dp(8));
 
         root.addView(counterView);
 
         TextView stopButton =
                 makeButton("توقف کلیک‌ها", "#C62828");
 
-        stopButton.setOnClickListener(
-                v -> stopLoop()
-        );
+        stopButton.setOnClickListener(v -> stopLoop());
 
         root.addView(stopButton);
 
         TextView closeButton =
                 makeButton("بستن پنل", "#455A64");
 
-        closeButton.setOnClickListener(
-                v -> removeFloatingViews()
-        );
+        closeButton.setOnClickListener(v -> removeFloatingViews());
 
         root.addView(closeButton);
 
         panel = root;
 
-        int overlayType;
+        panelParams = createOverlayParams(
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.WRAP_CONTENT
+        );
 
-        if (Build.VERSION.SDK_INT >= 26) {
-
-            overlayType =
-                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY;
-
-        } else {
-
-            overlayType =
-                    WindowManager.LayoutParams.TYPE_PHONE;
-        }
-
-        WindowManager.LayoutParams params =
-                new WindowManager.LayoutParams(
-                        WindowManager.LayoutParams.WRAP_CONTENT,
-                        WindowManager.LayoutParams.WRAP_CONTENT,
-                        overlayType,
-                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                                | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-                        PixelFormat.TRANSLUCENT
-                );
-
-        params.gravity =
-                Gravity.TOP | Gravity.START;
-
-        params.x = 20;
-        params.y = 150;
+        panelParams.x = dp(20);
+        panelParams.y = dp(150);
 
         try {
 
-            windowManager.addView(panel, params);
+            windowManager.addView(panel, panelParams);
 
         } catch (Exception e) {
 
             panel = null;
+            titleView = null;
             statusView = null;
             counterView = null;
+            panelParams = null;
+        }
+    }
+
+    private boolean handlePanelDrag(MotionEvent event) {
+
+        if (panelParams == null || panel == null) {
+            return false;
+        }
+
+        switch (event.getAction()) {
+
+            case MotionEvent.ACTION_DOWN:
+
+                panelTouchStartX = event.getRawX();
+                panelTouchStartY = event.getRawY();
+
+                panelStartX = panelParams.x;
+                panelStartY = panelParams.y;
+
+                return true;
+
+            case MotionEvent.ACTION_MOVE:
+
+                int newX = panelStartX
+                        + (int) (event.getRawX() - panelTouchStartX);
+
+                int newY = panelStartY
+                        + (int) (event.getRawY() - panelTouchStartY);
+
+                panelParams.x = newX;
+                panelParams.y = newY;
+
+                try {
+                    windowManager.updateViewLayout(panel, panelParams);
+                } catch (Exception ignored) {
+                }
+
+                return true;
+
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_CANCEL:
+
+                return true;
+        }
+
+        return true;
+    }
+
+    // ساخت نشانگر قرمز مستقل
+    private void createMarker() {
+
+        TextView target = new TextView(this);
+
+        target.setText("⊕");
+        target.setTextColor(Color.WHITE);
+        target.setTextSize(38);
+        target.setGravity(Gravity.CENTER);
+        target.setTypeface(null, Typeface.BOLD);
+
+        GradientDrawable background =
+                new GradientDrawable();
+
+        background.setShape(GradientDrawable.OVAL);
+        background.setColor(Color.argb(220, 220, 30, 30));
+        background.setStroke(dp(2), Color.WHITE);
+
+        target.setBackground(background);
+
+        target.setElevation(dp(8));
+
+        target.setOnTouchListener(
+                (view, event) -> handleMarkerDrag(event)
+        );
+
+        marker = target;
+
+        markerParams = createOverlayParams(
+                markerSize,
+                markerSize
+        );
+
+        markerParams.x = dp(500);
+        markerParams.y = dp(500);
+
+        try {
+
+            windowManager.addView(marker, markerParams);
+
+            updateTargetFromMarker();
+
+        } catch (Exception e) {
+
+            marker = null;
+            markerParams = null;
+        }
+    }
+
+    private boolean handleMarkerDrag(MotionEvent event) {
+
+        if (markerParams == null || marker == null) {
+            return false;
+        }
+
+        switch (event.getAction()) {
+
+            case MotionEvent.ACTION_DOWN:
+
+                markerTouchStartX = event.getRawX();
+                markerTouchStartY = event.getRawY();
+
+                markerStartX = markerParams.x;
+                markerStartY = markerParams.y;
+
+                return true;
+
+            case MotionEvent.ACTION_MOVE:
+
+                int screenWidth =
+                        getResources().getDisplayMetrics().widthPixels;
+
+                int screenHeight =
+                        getResources().getDisplayMetrics().heightPixels;
+
+                int newX = markerStartX
+                        + (int) (event.getRawX() - markerTouchStartX);
+
+                int newY = markerStartY
+                        + (int) (event.getRawY() - markerTouchStartY);
+
+                newX = Math.max(
+                        0,
+                        Math.min(newX, screenWidth - markerSize)
+                );
+
+                newY = Math.max(
+                        0,
+                        Math.min(newY, screenHeight - markerSize)
+                );
+
+                markerParams.x = newX;
+                markerParams.y = newY;
+
+                try {
+                    windowManager.updateViewLayout(marker, markerParams);
+                } catch (Exception ignored) {
+                }
+
+                updateTargetFromMarker();
+
+                return true;
+
+            case MotionEvent.ACTION_UP:
+
+                updateTargetFromMarker();
+                return true;
+
+            case MotionEvent.ACTION_CANCEL:
+
+                return true;
+        }
+
+        return true;
+    }
+
+    // مختصات مرکز نشانگر، محل واقعی لمس خواهد بود.
+    private void updateTargetFromMarker() {
+
+        if (markerParams == null) {
+            return;
+        }
+
+        targetX = markerParams.x + markerSize / 2;
+        targetY = markerParams.y + markerSize / 2;
+
+        if (accessibility == null) {
+            accessibility = AutoClickService.getInstance();
+        }
+
+        if (accessibility != null) {
+            accessibility.setTarget(targetX, targetY);
         }
     }
 
@@ -362,8 +590,8 @@ public class FloatingService extends Service {
                 new GradientDrawable();
 
         drawable.setColor(Color.parseColor(color));
-        drawable.setCornerRadius(radius);
-        drawable.setStroke(1, Color.GRAY);
+        drawable.setCornerRadius(dp(radius));
+        drawable.setStroke(dp(1), Color.GRAY);
 
         return drawable;
     }
@@ -379,10 +607,8 @@ public class FloatingService extends Service {
         button.setTextColor(Color.WHITE);
         button.setTextSize(13);
         button.setGravity(Gravity.CENTER);
-        button.setPadding(12, 12, 12, 12);
-        button.setBackground(
-                makeBackground(color, 10)
-        );
+        button.setPadding(dp(12), dp(10), dp(12), dp(10));
+        button.setBackground(makeBackground(color, 10));
 
         LinearLayout.LayoutParams params =
                 new LinearLayout.LayoutParams(
@@ -390,15 +616,13 @@ public class FloatingService extends Service {
                         ViewGroup.LayoutParams.WRAP_CONTENT
                 );
 
-        params.topMargin = 6;
+        params.topMargin = dp(6);
         button.setLayoutParams(params);
 
         return button;
     }
 
-    /*
-     * شروع زمان‌بندی اصلی
-     */
+    // شروع زمان‌بندی اصلی
     private void startLoop(Intent config) {
 
         stopLoop();
@@ -409,40 +633,22 @@ public class FloatingService extends Service {
         }
 
         startTimeEpochMs =
-                config.getLongExtra(
-                        "start_time_epoch_ms",
-                        0
-                );
+                config.getLongExtra("start_time_epoch_ms", 0);
 
         cycleDurationMs =
-                config.getLongExtra(
-                        "cycle_duration",
-                        0
-                );
+                config.getLongExtra("cycle_duration", 0);
 
         pauseDurationMs =
-                config.getLongExtra(
-                        "pause_duration",
-                        0
-                );
+                config.getLongExtra("pause_duration", 0);
 
         clickIntervalMs =
-                config.getLongExtra(
-                        "click_interval_ms",
-                        0
-                );
+                config.getLongExtra("click_interval_ms", 0);
 
         touchDurationMs =
-                config.getLongExtra(
-                        "touch_duration",
-                        5
-                );
+                config.getLongExtra("touch_duration", 5);
 
         clickCount =
-                config.getIntExtra(
-                        "click_count",
-                        1
-                );
+                config.getIntExtra("click_count", 1);
 
         long wallNow = System.currentTimeMillis();
 
@@ -461,9 +667,7 @@ public class FloatingService extends Service {
             return;
         }
 
-        if (cycleDurationMs >
-                Long.MAX_VALUE - pauseDurationMs) {
-
+        if (cycleDurationMs > Long.MAX_VALUE - pauseDurationMs) {
             setStatus("مدت چرخه و مکث بیش از حد بزرگ است");
             return;
         }
@@ -483,6 +687,8 @@ public class FloatingService extends Service {
             return;
         }
 
+        updateTargetFromMarker();
+
         running = true;
         cycleActive = false;
         cycleIndex = 0;
@@ -493,15 +699,9 @@ public class FloatingService extends Service {
 
         setStatus("زمان‌بندی فعال شد");
 
-        scheduleCycleStart(
-                generation,
-                anchorElapsedMs
-        );
+        scheduleCycleStart(generation, anchorElapsedMs);
     }
 
-    /*
-     * تبدیل زمان هدف elapsedRealtime به تأخیر Handler
-     */
     private void postAtElapsedTime(
             Runnable runnable,
             long targetElapsed
@@ -536,10 +736,7 @@ public class FloatingService extends Service {
             startCycle(generation);
         };
 
-        postAtElapsedTime(
-                cycleStartRunnable,
-                targetElapsed
-        );
+        postAtElapsedTime(cycleStartRunnable, targetElapsed);
     }
 
     private void startCycle(long generation) {
@@ -551,10 +748,8 @@ public class FloatingService extends Service {
         accessibility = AutoClickService.getInstance();
 
         if (accessibility == null) {
-
             setStatus("سرویس کلیک در دسترس نیست");
             stopLoop();
-
             return;
         }
 
@@ -582,7 +777,6 @@ public class FloatingService extends Service {
 
             setStatus("مدت چرخه بیش از حد بزرگ است");
             stopLoop();
-
             return;
         }
 
@@ -591,36 +785,27 @@ public class FloatingService extends Service {
 
         accessibility.resetClickCounters();
 
-        successAtStart =
-                accessibility.getSuccessfulClicks();
+        successAtStart = accessibility.getSuccessfulClicks();
+        failedAtStart = accessibility.getFailedClicks();
 
-        failedAtStart =
-                accessibility.getFailedClicks();
+        updateTargetFromMarker();
 
-        accessibility.setTarget(targetX, targetY);
         accessibility.setTouchDuration(touchDurationMs);
 
-        setStatus(
-                "چرخه " + (cycleIndex + 1) + " شروع شد"
-        );
+        setStatus("چرخه " + (cycleIndex + 1) + " شروع شد");
 
         scheduleNextClick(generation);
     }
 
-    /*
-     * زمان‌بندی کلیک بعدی
-     */
     private void scheduleNextClick(long generation) {
 
         if (!running
                 || generation != runGeneration
                 || !cycleActive) {
-
             return;
         }
 
         if (clickNumber >= clickCount) {
-
             waitForCycleEnd(generation);
             return;
         }
@@ -630,9 +815,7 @@ public class FloatingService extends Service {
         long target;
 
         if (clickNumber == 0) {
-
             target = now;
-
         } else {
 
             if (clickIntervalMs >
@@ -640,12 +823,10 @@ public class FloatingService extends Service {
 
                 setStatus("فاصله کلیک بیش از حد بزرگ است");
                 stopLoop();
-
                 return;
             }
 
-            target =
-                    lastClickDispatchElapsedMs + clickIntervalMs;
+            target = lastClickDispatchElapsedMs + clickIntervalMs;
         }
 
         removeRunnable(nextClickRunnable);
@@ -653,10 +834,7 @@ public class FloatingService extends Service {
         nextClickRunnable =
                 () -> dispatchNextClick(generation);
 
-        postAtElapsedTime(
-                nextClickRunnable,
-                target
-        );
+        postAtElapsedTime(nextClickRunnable, target);
     }
 
     private void dispatchNextClick(long generation) {
@@ -664,15 +842,12 @@ public class FloatingService extends Service {
         if (!running
                 || generation != runGeneration
                 || !cycleActive) {
-
             return;
         }
 
         if (accessibility == null) {
-
             setStatus("سرویس کلیک در دسترس نیست");
             stopLoop();
-
             return;
         }
 
@@ -705,26 +880,18 @@ public class FloatingService extends Service {
                 if (!running
                         || generation != runGeneration
                         || !cycleActive) {
-
                     return;
                 }
 
                 if (clickNumber < clickCount) {
-
                     scheduleNextClick(generation);
-
                 } else {
-
                     waitForCycleEnd(generation);
                 }
             });
         });
     }
 
-    /*
-     * اگر کلیک‌ها زودتر تمام شوند،
-     * تا پایان زمان چرخه صبر می‌کنیم.
-     */
     private void waitForCycleEnd(long generation) {
 
         if (!running || generation != runGeneration) {
@@ -734,7 +901,6 @@ public class FloatingService extends Service {
         long now = SystemClock.elapsedRealtime();
 
         if (now >= cycleDeadlineElapsedMs) {
-
             finishCycle(generation);
             return;
         }
@@ -750,15 +916,11 @@ public class FloatingService extends Service {
         );
     }
 
-    /*
-     * ثبت گزارش و زمان‌بندی چرخه بعدی
-     */
     private void finishCycle(long generation) {
 
         if (!running
                 || generation != runGeneration
                 || !cycleActive) {
-
             return;
         }
 
@@ -782,24 +944,19 @@ public class FloatingService extends Service {
                 actualEnd - cycleStartElapsedMs;
 
         long success = accessibility == null
-                ? 0
-                : accessibility.getSuccessfulClicks();
+                ? 0 : accessibility.getSuccessfulClicks();
 
         long failed = accessibility == null
-                ? 0
-                : accessibility.getFailedClicks();
+                ? 0 : accessibility.getFailedClicks();
 
         long avgLatency = accessibility == null
-                ? 0
-                : accessibility.getAverageGestureLatencyNanos();
+                ? 0 : accessibility.getAverageGestureLatencyNanos();
 
         long maxLatency = accessibility == null
-                ? 0
-                : accessibility.getMaxGestureLatencyNanos();
+                ? 0 : accessibility.getMaxGestureLatencyNanos();
 
         long measured = accessibility == null
-                ? 0
-                : accessibility.getMeasuredGestures();
+                ? 0 : accessibility.getMeasuredGestures();
 
         CycleReportStore.addReport(
                 this,
@@ -815,20 +972,16 @@ public class FloatingService extends Service {
 
         cycleIndex++;
 
-        setStatus(
-                "چرخه " + cycleIndex + " تکمیل شد"
-        );
+        setStatus("چرخه " + cycleIndex + " تکمیل شد");
 
-        long period =
-                cycleDurationMs + pauseDurationMs;
+        long period = cycleDurationMs + pauseDurationMs;
 
         long nextTarget;
 
         if (cycleIndex >
                 (Long.MAX_VALUE - anchorElapsedMs) / period) {
 
-            nextTarget =
-                    SystemClock.elapsedRealtime();
+            nextTarget = SystemClock.elapsedRealtime();
 
         } else {
 
@@ -842,15 +995,9 @@ public class FloatingService extends Service {
             nextTarget = now;
         }
 
-        scheduleCycleStart(
-                generation,
-                nextTarget
-        );
+        scheduleCycleStart(generation, nextTarget);
     }
 
-    /*
-     * به‌روزرسانی شمارش معکوس پنل
-     */
     private void updateDisplay() {
 
         if (statusView == null || counterView == null) {
@@ -858,7 +1005,6 @@ public class FloatingService extends Service {
         }
 
         if (!running) {
-
             counterView.setText("متوقف");
             return;
         }
@@ -867,8 +1013,7 @@ public class FloatingService extends Service {
 
         if (!cycleActive) {
 
-            long period =
-                    cycleDurationMs + pauseDurationMs;
+            long period = cycleDurationMs + pauseDurationMs;
 
             long nextTarget;
 
@@ -883,12 +1028,10 @@ public class FloatingService extends Service {
                         anchorElapsedMs + cycleIndex * period;
             }
 
-            long remaining =
-                    Math.max(0, nextTarget - now);
+            long remaining = Math.max(0, nextTarget - now);
 
             counterView.setText(
-                    "شروع چرخه بعدی: "
-                            + formatMillis(remaining)
+                    "شروع چرخه بعدی: " + formatMillis(remaining)
             );
 
             return;
@@ -900,8 +1043,7 @@ public class FloatingService extends Service {
         if (clickNumber >= clickCount) {
 
             counterView.setText(
-                    "پایان چرخه: "
-                            + formatMillis(remaining)
+                    "پایان چرخه: " + formatMillis(remaining)
             );
 
         } else {
@@ -948,9 +1090,6 @@ public class FloatingService extends Service {
         }
     }
 
-    /*
-     * توقف زمان‌بندی و لغو کارهای در صف
-     */
     private void stopLoop() {
 
         running = false;
@@ -983,8 +1122,21 @@ public class FloatingService extends Service {
             }
 
             panel = null;
+            titleView = null;
             statusView = null;
             counterView = null;
+            panelParams = null;
+        }
+
+        if (marker != null) {
+
+            try {
+                windowManager.removeView(marker);
+            } catch (Exception ignored) {
+            }
+
+            marker = null;
+            markerParams = null;
         }
     }
 
