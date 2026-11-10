@@ -49,7 +49,6 @@ public class FloatingService extends Service {
     private WindowManager windowManager;
 
     private LinearLayout panel;
-    private LinearLayout panelContent;
     private TextView titleView;
     private TextView statusView;
     private TextView counterView;
@@ -73,6 +72,7 @@ public class FloatingService extends Service {
     private long pauseDurationMs;
     private long clickIntervalMs;
     private long touchDurationMs;
+
     private long cycleStartElapsedMs;
     private long cycleDeadlineElapsedMs;
     private long lastClickDispatchElapsedMs;
@@ -81,8 +81,9 @@ public class FloatingService extends Service {
     private long clickCount;
     private long clickNumber;
 
-    private int successAtStart;
-    private int failedAtStart;
+    // شمارنده‌ها باید long باشند؛ خروجی سرویس دسترس‌پذیری long است.
+    private long successAtStart;
+    private long failedAtStart;
 
     private Runnable cycleStartRunnable;
     private Runnable nextClickRunnable;
@@ -111,7 +112,6 @@ public class FloatingService extends Service {
 
         instance = this;
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
-
         markerSize = dp(56);
 
         createNotificationChannel();
@@ -195,6 +195,7 @@ public class FloatingService extends Service {
         Intent openIntent = new Intent(this, MainActivity.class);
 
         int pendingFlags = PendingIntent.FLAG_UPDATE_CURRENT;
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             pendingFlags |= PendingIntent.FLAG_IMMUTABLE;
         }
@@ -243,7 +244,8 @@ public class FloatingService extends Service {
         }
 
         if (windowManager == null) {
-            windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
+            windowManager =
+                    (WindowManager) getSystemService(WINDOW_SERVICE);
         }
 
         if (panel == null) {
@@ -276,7 +278,7 @@ public class FloatingService extends Service {
         ));
 
         titleView = new TextView(this);
-        titleView.setText("Precision Loop  |  جابه‌جایی پنل");
+        titleView.setText("Precision Loop | جابه‌جایی پنل");
         titleView.setTextColor(Color.WHITE);
         titleView.setTextSize(14);
         titleView.setTypeface(null, Typeface.BOLD);
@@ -432,7 +434,10 @@ public class FloatingService extends Service {
         return drawable;
     }
 
-    private void updateViewLayout(View view, WindowManager.LayoutParams params) {
+    private void updateViewLayout(
+            View view,
+            WindowManager.LayoutParams params
+    ) {
         try {
             if (view != null && view.getParent() != null) {
                 windowManager.updateViewLayout(view, params);
@@ -492,6 +497,7 @@ public class FloatingService extends Service {
 
     public static void setOverlaysHidden(boolean hidden) {
         FloatingService service = instance;
+
         if (service == null) {
             return;
         }
@@ -523,11 +529,20 @@ public class FloatingService extends Service {
             return;
         }
 
-        cycleDurationMs = config.getLongExtra("cycle_duration_ms", 1000);
-        pauseDurationMs = config.getLongExtra("pause_duration_ms", 0);
-        clickIntervalMs = config.getLongExtra("click_interval_ms", 50);
-        touchDurationMs = config.getLongExtra("touch_duration_ms", 5);
-        clickCount = config.getLongExtra("click_count", 1);
+        cycleDurationMs =
+                config.getLongExtra("cycle_duration_ms", 1000);
+
+        pauseDurationMs =
+                config.getLongExtra("pause_duration_ms", 0);
+
+        clickIntervalMs =
+                config.getLongExtra("click_interval_ms", 50);
+
+        touchDurationMs =
+                config.getLongExtra("touch_duration_ms", 5);
+
+        clickCount =
+                config.getLongExtra("click_count", 1);
 
         if (cycleDurationMs <= 0
                 || pauseDurationMs < 0
@@ -590,14 +605,22 @@ public class FloatingService extends Service {
         };
 
         postAtElapsedTime(cycleStartRunnable, anchorElapsedMs);
-        updateStatus(delayMs == 0 ? "در حال شروع" : "در انتظار زمان شروع");
+
+        updateStatus(
+                delayMs == 0
+                        ? "در حال شروع"
+                        : "در انتظار زمان شروع"
+        );
     }
 
     private boolean isCurrentRun(long generation) {
         return running && generation == runGeneration;
     }
 
-    private void postAtElapsedTime(Runnable runnable, long targetElapsedMs) {
+    private void postAtElapsedTime(
+            Runnable runnable,
+            long targetElapsedMs
+    ) {
         long delay = Math.max(
                 0,
                 targetElapsedMs - SystemClock.elapsedRealtime()
@@ -618,7 +641,8 @@ public class FloatingService extends Service {
         long period = getCyclePeriodMs();
 
         if (period == Long.MAX_VALUE
-                || index > 0 && period > (Long.MAX_VALUE - anchorElapsedMs) / index) {
+                || (index > 0
+                && period > (Long.MAX_VALUE - anchorElapsedMs) / index)) {
             return Long.MAX_VALUE;
         }
 
@@ -655,10 +679,13 @@ public class FloatingService extends Service {
         clickNumber = 0;
 
         cycleStartElapsedMs = SystemClock.elapsedRealtime();
-        cycleDeadlineElapsedMs = cycleStartElapsedMs + cycleDurationMs;
+        cycleDeadlineElapsedMs =
+                cycleStartElapsedMs + cycleDurationMs;
+
         cycleStartWallMs = System.currentTimeMillis();
 
         accessibility.resetClickCounters();
+
         successAtStart = accessibility.getSuccessfulClicks();
         failedAtStart = accessibility.getFailedClicks();
 
@@ -683,7 +710,14 @@ public class FloatingService extends Service {
         if (clickNumber == 0) {
             targetElapsed = SystemClock.elapsedRealtime();
         } else {
-            targetElapsed = lastClickDispatchElapsedMs + clickIntervalMs;
+            if (lastClickDispatchElapsedMs
+                    > Long.MAX_VALUE - clickIntervalMs) {
+                waitForCycleEnd(generation);
+                return;
+            }
+
+            targetElapsed =
+                    lastClickDispatchElapsedMs + clickIntervalMs;
         }
 
         if (targetElapsed >= cycleDeadlineElapsedMs) {
@@ -765,7 +799,10 @@ public class FloatingService extends Service {
             }
         };
 
-        postAtElapsedTime(cycleFinishRunnable, cycleDeadlineElapsedMs);
+        postAtElapsedTime(
+                cycleFinishRunnable,
+                cycleDeadlineElapsedMs
+        );
     }
 
     private void finishCycle(long generation) {
@@ -773,7 +810,8 @@ public class FloatingService extends Service {
             return;
         }
 
-        if (accessibility != null && accessibility.isGestureInProgress()) {
+        if (accessibility != null
+                && accessibility.isGestureInProgress()) {
             cycleFinishRunnable = () -> {
                 if (isCurrentRun(generation)) {
                     finishCycle(generation);
@@ -787,13 +825,14 @@ public class FloatingService extends Service {
         cycleActive = false;
 
         if (accessibility != null) {
-            int successes = Math.max(
-                    0,
+
+            long successes = Math.max(
+                    0L,
                     accessibility.getSuccessfulClicks() - successAtStart
             );
 
-            int failures = Math.max(
-                    0,
+            long failures = Math.max(
+                    0L,
                     accessibility.getFailedClicks() - failedAtStart
             );
 
@@ -888,8 +927,10 @@ public class FloatingService extends Service {
         }
 
         if (!running) {
-            counterView.setText("چرخه: " + cycleIndex
-                    + " | کلیک: " + clickNumber);
+            counterView.setText(
+                    "چرخه: " + cycleIndex
+                            + " | کلیک: " + clickNumber
+            );
             return;
         }
 
@@ -904,7 +945,10 @@ public class FloatingService extends Service {
                     remaining / 1000.0
             ));
         } else {
-            long remaining = Math.max(0, cycleDeadlineElapsedMs - now);
+            long remaining = Math.max(
+                    0,
+                    cycleDeadlineElapsedMs - now
+            );
 
             statusView.setText(String.format(
                     Locale.US,
