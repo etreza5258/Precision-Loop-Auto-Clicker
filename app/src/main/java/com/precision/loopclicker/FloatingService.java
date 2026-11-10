@@ -1,3 +1,4 @@
+
 package com.precision.loopclicker;
 
 import android.app.Notification;
@@ -21,7 +22,7 @@ import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
-import android.view.ViewGroup;
+import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
@@ -29,73 +30,59 @@ import java.util.Locale;
 
 public class FloatingService extends Service {
 
-    private static final String ACTION_START = "ACTION_START";
-    private static final String ACTION_STOP = "ACTION_STOP";
-    private static final String ACTION_SHUTDOWN = "ACTION_SHUTDOWN";
-    private static final String ACTION_SHOW_PANEL = "SHOW_PANEL";
+    public static final String ACTION_START =
+            "com.precision.loopclicker.ACTION_START";
+    public static final String ACTION_STOP =
+            "com.precision.loopclicker.ACTION_STOP";
+    public static final String ACTION_SHUTDOWN =
+            "com.precision.loopclicker.ACTION_SHUTDOWN";
+    public static final String SHOW_PANEL =
+            "com.precision.loopclicker.SHOW_PANEL";
 
-    private static final String CHANNEL_ID =
-            "precision_clicker_channel";
+    private static final String CHANNEL_ID = "precision_loop_channel";
+    private static final int NOTIFICATION_ID = 4101;
 
-    private static final int NOTIFICATION_ID = 1001;
+    private static volatile FloatingService instance;
 
-    private static FloatingService instance;
-
-    private final Handler handler =
-            new Handler(Looper.getMainLooper());
+    private final Handler handler = new Handler(Looper.getMainLooper());
 
     private WindowManager windowManager;
 
-    // پنل شناور
     private LinearLayout panel;
+    private LinearLayout panelContent;
     private TextView titleView;
     private TextView statusView;
     private TextView counterView;
+    private TextView markerView;
 
     private WindowManager.LayoutParams panelParams;
-
-    // نشانگر هدف
-    private TextView marker;
     private WindowManager.LayoutParams markerParams;
 
     private int markerSize;
     private int targetX = 500;
     private int targetY = 500;
 
-    private float panelTouchStartX;
-    private float panelTouchStartY;
-    private int panelStartX;
-    private int panelStartY;
+    private volatile boolean running;
+    private boolean cycleActive;
 
-    private float markerTouchStartX;
-    private float markerTouchStartY;
-    private int markerStartX;
-    private int markerStartY;
+    private long runGeneration;
+    private long cycleIndex;
 
-    private volatile boolean running = false;
-    private boolean cycleActive = false;
-    private boolean overlaysHidden = false;
-
-    private long runGeneration = 0;
-    private long cycleIndex = 0;
-
-    private long startTimeEpochMs;
+    private long anchorElapsedMs;
     private long cycleDurationMs;
     private long pauseDurationMs;
     private long clickIntervalMs;
     private long touchDurationMs;
-
-    private int clickCount;
-    private int clickNumber;
-
-    private long anchorElapsedMs;
     private long cycleStartElapsedMs;
     private long cycleDeadlineElapsedMs;
     private long lastClickDispatchElapsedMs;
     private long cycleStartWallMs;
 
-    private long successAtStart;
-    private long failedAtStart;
+    private long clickCount;
+    private long clickNumber;
+
+    private int successAtStart;
+    private int failedAtStart;
 
     private Runnable cycleStartRunnable;
     private Runnable nextClickRunnable;
@@ -104,84 +91,94 @@ public class FloatingService extends Service {
 
     private AutoClickService accessibility;
 
+    private float panelTouchRawX;
+    private float panelTouchRawY;
+    private int panelStartX;
+    private int panelStartY;
+
+    private float markerTouchRawX;
+    private float markerTouchRawY;
+    private int markerStartX;
+    private int markerStartY;
+
+    public static FloatingService getInstance() {
+        return instance;
+    }
+
     @Override
     public void onCreate() {
         super.onCreate();
 
         instance = this;
-
-        windowManager =
-                (WindowManager) getSystemService(WINDOW_SERVICE);
+        windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
 
         markerSize = dp(56);
 
         createNotificationChannel();
-        startForegroundNotification();
+        startForegroundCompat();
 
         displayRunnable = new Runnable() {
             @Override
             public void run() {
                 updateDisplay();
-
-                if (displayRunnable != null) {
-                    handler.postDelayed(this, 50);
-                }
+                handler.postDelayed(this, 100);
             }
         };
 
         handler.post(displayRunnable);
     }
 
-    private int dp(float value) {
-        return (int) (value *
-                getResources().getDisplayMetrics().density + 0.5f);
-    }
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
 
-    // مخفی و نمایان کردن هم‌زمان پنل و نشانگر
-    public static void setOverlaysHidden(boolean hidden) {
-
-        FloatingService service = instance;
-
-        if (service == null) {
-            return;
+        if (intent == null) {
+            createFloatingViews();
+            return START_STICKY;
         }
 
-        if (Looper.myLooper() == Looper.getMainLooper()) {
-            service.changeOverlayVisibility(hidden);
+        String action = intent.getAction();
+
+        if (ACTION_START.equals(action)) {
+            createFloatingViews();
+            startLoop(intent);
+
+        } else if (ACTION_STOP.equals(action)) {
+            stopLoop();
+
+        } else if (ACTION_SHUTDOWN.equals(action)) {
+            stopLoop();
+            removeFloatingViews();
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                stopForeground(STOP_FOREGROUND_REMOVE);
+            } else {
+                stopForeground(true);
+            }
+
+            stopSelf();
+
+        } else if (SHOW_PANEL.equals(action)) {
+            createFloatingViews();
+            showFloatingViews();
+
         } else {
-            service.handler.post(
-                    () -> service.changeOverlayVisibility(hidden)
-            );
+            createFloatingViews();
         }
+
+        return START_STICKY;
     }
 
-    private void changeOverlayVisibility(boolean hidden) {
-
-        overlaysHidden = hidden;
-
-        int visibility = hidden
-                ? View.INVISIBLE
-                : View.VISIBLE;
-
-        if (panel != null) {
-            panel.setVisibility(visibility);
-        }
-
-        if (marker != null) {
-            marker.setVisibility(visibility);
-        }
-    }
+    // ---------------------------------------------------------
+    // Notification
+    // ---------------------------------------------------------
 
     private void createNotificationChannel() {
-
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-
-            NotificationChannel channel =
-                    new NotificationChannel(
-                            CHANNEL_ID,
-                            "Precision Loop Auto Clicker",
-                            NotificationManager.IMPORTANCE_LOW
-                    );
+            NotificationChannel channel = new NotificationChannel(
+                    CHANNEL_ID,
+                    "Precision Loop Auto Clicker",
+                    NotificationManager.IMPORTANCE_LOW
+            );
 
             channel.setDescription("وضعیت اجرای اتوکلیکر");
 
@@ -194,19 +191,20 @@ public class FloatingService extends Service {
         }
     }
 
-    private void startForegroundNotification() {
+    private void startForegroundCompat() {
+        Intent openIntent = new Intent(this, MainActivity.class);
 
-        Intent openIntent =
-                new Intent(this, MainActivity.class);
+        int pendingFlags = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            pendingFlags |= PendingIntent.FLAG_IMMUTABLE;
+        }
 
-        PendingIntent pendingIntent =
-                PendingIntent.getActivity(
-                        this,
-                        0,
-                        openIntent,
-                        PendingIntent.FLAG_UPDATE_CURRENT
-                                | PendingIntent.FLAG_IMMUTABLE
-                );
+        PendingIntent pendingIntent = PendingIntent.getActivity(
+                this,
+                100,
+                openIntent,
+                pendingFlags
+        );
 
         Notification.Builder builder;
 
@@ -217,354 +215,233 @@ public class FloatingService extends Service {
         }
 
         Notification notification = builder
-                .setSmallIcon(android.R.drawable.ic_media_play)
                 .setContentTitle("Precision Loop Auto Clicker")
-                .setContentText("سرویس اتوکلیکر فعال است")
+                .setContentText("سرویس آماده است")
+                .setSmallIcon(android.R.drawable.ic_media_play)
                 .setContentIntent(pendingIntent)
                 .setOngoing(true)
                 .build();
 
         if (Build.VERSION.SDK_INT >= 34) {
-
             startForeground(
                     NOTIFICATION_ID,
                     notification,
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
             );
-
         } else {
-
             startForeground(NOTIFICATION_ID, notification);
         }
     }
 
-    @Override
-    public int onStartCommand(
-            Intent intent,
-            int flags,
-            int startId
-    ) {
+    // ---------------------------------------------------------
+    // Floating views
+    // ---------------------------------------------------------
 
-        String action =
-                intent == null ? null : intent.getAction();
-
-        if (ACTION_START.equals(action)) {
-
-            createFloatingViews();
-            startLoop(intent);
-
-        } else if (ACTION_STOP.equals(action)) {
-
-            stopLoop();
-
-        } else if (ACTION_SHUTDOWN.equals(action)) {
-
-            stopLoop();
-            removeFloatingViews();
-            stopForeground(true);
-            stopSelf();
-
-        } else if (ACTION_SHOW_PANEL.equals(action)) {
-
-            createFloatingViews();
-            changeOverlayVisibility(false);
-
-        } else {
-
-            createFloatingViews();
-        }
-
-        return START_NOT_STICKY;
-    }
-
-    // ساخت پنل و نشانگر
     private void createFloatingViews() {
-
         if (!Settings.canDrawOverlays(this)) {
             return;
+        }
+
+        if (windowManager == null) {
+            windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
         }
 
         if (panel == null) {
             createPanel();
         }
 
-        if (marker == null) {
+        if (markerView == null) {
             createMarker();
         }
 
-        changeOverlayVisibility(overlaysHidden);
+        showFloatingViews();
+        updateTarget();
     }
 
     private int getOverlayType() {
-
-        if (Build.VERSION.SDK_INT >= 26) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             return WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY;
         }
 
         return WindowManager.LayoutParams.TYPE_PHONE;
     }
 
-    private WindowManager.LayoutParams createOverlayParams(
-            int width,
-            int height
-    ) {
-
-        WindowManager.LayoutParams params =
-                new WindowManager.LayoutParams(
-                        width,
-                        height,
-                        getOverlayType(),
-                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                                | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-                        PixelFormat.TRANSLUCENT
-                );
-
-        params.gravity = Gravity.TOP | Gravity.START;
-
-        return params;
-    }
-
     private void createPanel() {
+        panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setPadding(dp(12), dp(10), dp(12), dp(10));
+        panel.setBackground(makeBackground(
+                Color.rgb(20, 30, 42),
+                dp(14)
+        ));
 
-        LinearLayout root = new LinearLayout(this);
-
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(14), dp(10), dp(14), dp(12));
-        root.setBackground(makeBackground("#202B38", 16));
-
-        // عنوان پنل؛ فقط این قسمت برای جابه‌جایی پنل استفاده می‌شود.
         titleView = new TextView(this);
-
-        titleView.setText("☰  Precision Loop Auto Clicker");
+        titleView.setText("Precision Loop  |  جابه‌جایی پنل");
         titleView.setTextColor(Color.WHITE);
-        titleView.setTextSize(13);
+        titleView.setTextSize(14);
         titleView.setTypeface(null, Typeface.BOLD);
-        titleView.setPadding(dp(3), dp(5), dp(3), dp(10));
-
-        titleView.setOnTouchListener(
-                (view, event) -> handlePanelDrag(event)
-        );
-
-        root.addView(titleView);
+        titleView.setPadding(dp(4), dp(5), dp(4), dp(10));
 
         statusView = new TextView(this);
         statusView.setText("آماده");
-        statusView.setTextColor(Color.WHITE);
-        statusView.setTextSize(13);
-        statusView.setPadding(0, dp(8), 0, dp(5));
-
-        root.addView(statusView);
+        statusView.setTextColor(Color.rgb(120, 220, 160));
+        statusView.setTextSize(12);
+        statusView.setPadding(dp(4), dp(4), dp(4), dp(4));
 
         counterView = new TextView(this);
-        counterView.setText("در انتظار شروع");
-        counterView.setTextColor(Color.rgb(255, 193, 7));
+        counterView.setText("چرخه: 0 | کلیک: 0");
+        counterView.setTextColor(Color.WHITE);
         counterView.setTextSize(12);
-        counterView.setPadding(0, dp(5), 0, dp(8));
+        counterView.setPadding(dp(4), dp(4), dp(4), dp(8));
 
-        root.addView(counterView);
-
-        TextView stopButton =
-                makeButton("توقف کلیک‌ها", "#C62828");
-
+        Button stopButton = new Button(this);
+        stopButton.setText("توقف کلیک‌ها");
         stopButton.setOnClickListener(v -> stopLoop());
 
-        root.addView(stopButton);
-
-        TextView closeButton =
-                makeButton("بستن پنل", "#455A64");
-
+        Button closeButton = new Button(this);
+        closeButton.setText("بستن پنل و نشانگر");
         closeButton.setOnClickListener(v -> removeFloatingViews());
 
-        root.addView(closeButton);
+        panel.addView(titleView);
+        panel.addView(statusView);
+        panel.addView(counterView);
+        panel.addView(stopButton);
+        panel.addView(closeButton);
 
-        panel = root;
+        titleView.setOnTouchListener((v, event) -> {
+            if (panelParams == null) {
+                return false;
+            }
 
-        panelParams = createOverlayParams(
+            switch (event.getAction()) {
+                case MotionEvent.ACTION_DOWN:
+                    panelTouchRawX = event.getRawX();
+                    panelTouchRawY = event.getRawY();
+                    panelStartX = panelParams.x;
+                    panelStartY = panelParams.y;
+                    return true;
+
+                case MotionEvent.ACTION_MOVE:
+                    panelParams.x = panelStartX
+                            + (int) (event.getRawX() - panelTouchRawX);
+
+                    panelParams.y = panelStartY
+                            + (int) (event.getRawY() - panelTouchRawY);
+
+                    updateViewLayout(panel, panelParams);
+                    return true;
+
+                case MotionEvent.ACTION_UP:
+                    return true;
+            }
+
+            return false;
+        });
+
+        panelParams = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
-                WindowManager.LayoutParams.WRAP_CONTENT
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                getOverlayType(),
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                        | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                PixelFormat.TRANSLUCENT
         );
 
-        panelParams.x = dp(20);
-        panelParams.y = dp(150);
+        panelParams.gravity = Gravity.TOP | Gravity.START;
+        panelParams.x = dp(12);
+        panelParams.y = dp(120);
 
         try {
-
             windowManager.addView(panel, panelParams);
-
         } catch (Exception e) {
-
             panel = null;
-            titleView = null;
-            statusView = null;
-            counterView = null;
             panelParams = null;
         }
     }
 
-    private boolean handlePanelDrag(MotionEvent event) {
-
-        if (panelParams == null || panel == null) {
-            return false;
-        }
-
-        switch (event.getAction()) {
-
-            case MotionEvent.ACTION_DOWN:
-
-                panelTouchStartX = event.getRawX();
-                panelTouchStartY = event.getRawY();
-
-                panelStartX = panelParams.x;
-                panelStartY = panelParams.y;
-
-                return true;
-
-            case MotionEvent.ACTION_MOVE:
-
-                int newX = panelStartX
-                        + (int) (event.getRawX() - panelTouchStartX);
-
-                int newY = panelStartY
-                        + (int) (event.getRawY() - panelTouchStartY);
-
-                panelParams.x = newX;
-                panelParams.y = newY;
-
-                try {
-                    windowManager.updateViewLayout(panel, panelParams);
-                } catch (Exception ignored) {
-                }
-
-                return true;
-
-            case MotionEvent.ACTION_UP:
-            case MotionEvent.ACTION_CANCEL:
-
-                return true;
-        }
-
-        return true;
-    }
-
-    // ساخت نشانگر قرمز مستقل
     private void createMarker() {
-
-        TextView target = new TextView(this);
-
-        target.setText("⊕");
-        target.setTextColor(Color.WHITE);
-        target.setTextSize(38);
-        target.setGravity(Gravity.CENTER);
-        target.setTypeface(null, Typeface.BOLD);
-
-        GradientDrawable background =
-                new GradientDrawable();
-
-        background.setShape(GradientDrawable.OVAL);
-        background.setColor(Color.argb(220, 220, 30, 30));
-        background.setStroke(dp(2), Color.WHITE);
-
-        target.setBackground(background);
-
-        target.setElevation(dp(8));
-
-        target.setOnTouchListener(
-                (view, event) -> handleMarkerDrag(event)
-        );
-
-        marker = target;
-
-        markerParams = createOverlayParams(
-                markerSize,
+        markerView = new TextView(this);
+        markerView.setText("⊕");
+        markerView.setTextSize(42);
+        markerView.setGravity(Gravity.CENTER);
+        markerView.setTextColor(Color.WHITE);
+        markerView.setBackground(makeBackground(
+                Color.argb(210, 220, 35, 35),
                 markerSize
+        ));
+
+        markerView.setOnTouchListener((v, event) -> {
+            if (markerParams == null) {
+                return false;
+            }
+
+            switch (event.getAction()) {
+                case MotionEvent.ACTION_DOWN:
+                    markerTouchRawX = event.getRawX();
+                    markerTouchRawY = event.getRawY();
+                    markerStartX = markerParams.x;
+                    markerStartY = markerParams.y;
+                    return true;
+
+                case MotionEvent.ACTION_MOVE:
+                    markerParams.x = markerStartX
+                            + (int) (event.getRawX() - markerTouchRawX);
+
+                    markerParams.y = markerStartY
+                            + (int) (event.getRawY() - markerTouchRawY);
+
+                    updateViewLayout(markerView, markerParams);
+                    updateTarget();
+                    return true;
+
+                case MotionEvent.ACTION_UP:
+                    updateTarget();
+                    return true;
+            }
+
+            return false;
+        });
+
+        markerParams = new WindowManager.LayoutParams(
+                markerSize,
+                markerSize,
+                getOverlayType(),
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                PixelFormat.TRANSLUCENT
         );
 
-        markerParams.x = dp(500);
-        markerParams.y = dp(500);
+        markerParams.gravity = Gravity.TOP | Gravity.START;
+        markerParams.x = dp(120);
+        markerParams.y = dp(350);
 
         try {
-
-            windowManager.addView(marker, markerParams);
-
-            updateTargetFromMarker();
-
+            windowManager.addView(markerView, markerParams);
         } catch (Exception e) {
-
-            marker = null;
+            markerView = null;
             markerParams = null;
         }
     }
 
-    private boolean handleMarkerDrag(MotionEvent event) {
-
-        if (markerParams == null || marker == null) {
-            return false;
-        }
-
-        switch (event.getAction()) {
-
-            case MotionEvent.ACTION_DOWN:
-
-                markerTouchStartX = event.getRawX();
-                markerTouchStartY = event.getRawY();
-
-                markerStartX = markerParams.x;
-                markerStartY = markerParams.y;
-
-                return true;
-
-            case MotionEvent.ACTION_MOVE:
-
-                int screenWidth =
-                        getResources().getDisplayMetrics().widthPixels;
-
-                int screenHeight =
-                        getResources().getDisplayMetrics().heightPixels;
-
-                int newX = markerStartX
-                        + (int) (event.getRawX() - markerTouchStartX);
-
-                int newY = markerStartY
-                        + (int) (event.getRawY() - markerTouchStartY);
-
-                newX = Math.max(
-                        0,
-                        Math.min(newX, screenWidth - markerSize)
-                );
-
-                newY = Math.max(
-                        0,
-                        Math.min(newY, screenHeight - markerSize)
-                );
-
-                markerParams.x = newX;
-                markerParams.y = newY;
-
-                try {
-                    windowManager.updateViewLayout(marker, markerParams);
-                } catch (Exception ignored) {
-                }
-
-                updateTargetFromMarker();
-
-                return true;
-
-            case MotionEvent.ACTION_UP:
-
-                updateTargetFromMarker();
-                return true;
-
-            case MotionEvent.ACTION_CANCEL:
-
-                return true;
-        }
-
-        return true;
+    private GradientDrawable makeBackground(int color, int radius) {
+        GradientDrawable drawable = new GradientDrawable();
+        drawable.setColor(color);
+        drawable.setCornerRadius(radius);
+        drawable.setStroke(dp(1), Color.argb(100, 255, 255, 255));
+        return drawable;
     }
 
-    // مختصات مرکز نشانگر، محل واقعی لمس خواهد بود.
-    private void updateTargetFromMarker() {
+    private void updateViewLayout(View view, WindowManager.LayoutParams params) {
+        try {
+            if (view != null && view.getParent() != null) {
+                windowManager.updateViewLayout(view, params);
+            }
+        } catch (Exception ignored) {
+        }
+    }
 
+    private void updateTarget() {
         if (markerParams == null) {
             return;
         }
@@ -572,236 +449,227 @@ public class FloatingService extends Service {
         targetX = markerParams.x + markerSize / 2;
         targetY = markerParams.y + markerSize / 2;
 
-        if (accessibility == null) {
-            accessibility = AutoClickService.getInstance();
-        }
+        AutoClickService service = AutoClickService.getInstance();
 
-        if (accessibility != null) {
-            accessibility.setTarget(targetX, targetY);
+        if (service != null) {
+            service.setTarget(targetX, targetY);
         }
     }
 
-    private GradientDrawable makeBackground(
-            String color,
-            int radius
-    ) {
+    private void showFloatingViews() {
+        try {
+            if (panel != null) {
+                panel.setVisibility(View.VISIBLE);
+            }
 
-        GradientDrawable drawable =
-                new GradientDrawable();
-
-        drawable.setColor(Color.parseColor(color));
-        drawable.setCornerRadius(dp(radius));
-        drawable.setStroke(dp(1), Color.GRAY);
-
-        return drawable;
+            if (markerView != null) {
+                markerView.setVisibility(View.VISIBLE);
+            }
+        } catch (Exception ignored) {
+        }
     }
 
-    private TextView makeButton(
-            String text,
-            String color
-    ) {
+    private void removeFloatingViews() {
+        try {
+            if (panel != null) {
+                windowManager.removeView(panel);
+            }
+        } catch (Exception ignored) {
+        }
 
-        TextView button = new TextView(this);
+        try {
+            if (markerView != null) {
+                windowManager.removeView(markerView);
+            }
+        } catch (Exception ignored) {
+        }
 
-        button.setText(text);
-        button.setTextColor(Color.WHITE);
-        button.setTextSize(13);
-        button.setGravity(Gravity.CENTER);
-        button.setPadding(dp(12), dp(10), dp(12), dp(10));
-        button.setBackground(makeBackground(color, 10));
+        panel = null;
+        markerView = null;
+        panelParams = null;
+        markerParams = null;
+    }
 
-        LinearLayout.LayoutParams params =
-                new LinearLayout.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT,
-                        ViewGroup.LayoutParams.WRAP_CONTENT
+    public static void setOverlaysHidden(boolean hidden) {
+        FloatingService service = instance;
+        if (service == null) {
+            return;
+        }
+
+        service.handler.post(() -> {
+            if (service.panel != null) {
+                service.panel.setVisibility(
+                        hidden ? View.INVISIBLE : View.VISIBLE
                 );
+            }
 
-        params.topMargin = dp(6);
-        button.setLayoutParams(params);
-
-        return button;
+            if (service.markerView != null) {
+                service.markerView.setVisibility(
+                        hidden ? View.INVISIBLE : View.VISIBLE
+                );
+            }
+        });
     }
 
-    // شروع زمان‌بندی اصلی
-    private void startLoop(Intent config) {
+    // ---------------------------------------------------------
+    // Loop scheduling
+    // ---------------------------------------------------------
 
+    private void startLoop(Intent config) {
         stopLoop();
 
         if (config == null) {
-            setStatus("اطلاعات شروع دریافت نشد");
+            updateStatus("تنظیمات شروع دریافت نشد");
             return;
         }
 
-        startTimeEpochMs =
-                config.getLongExtra("start_time_epoch_ms", 0);
-
-        cycleDurationMs =
-                config.getLongExtra("cycle_duration", 0);
-
-        pauseDurationMs =
-                config.getLongExtra("pause_duration", 0);
-
-        clickIntervalMs =
-                config.getLongExtra("click_interval_ms", 0);
-
-        touchDurationMs =
-                config.getLongExtra("touch_duration", 5);
-
-        clickCount =
-                config.getIntExtra("click_count", 1);
-
-        long wallNow = System.currentTimeMillis();
-
-        if (startTimeEpochMs <= wallNow) {
-            setStatus("زمان شروع باید در آینده باشد");
-            return;
-        }
+        cycleDurationMs = config.getLongExtra("cycle_duration_ms", 1000);
+        pauseDurationMs = config.getLongExtra("pause_duration_ms", 0);
+        clickIntervalMs = config.getLongExtra("click_interval_ms", 50);
+        touchDurationMs = config.getLongExtra("touch_duration_ms", 5);
+        clickCount = config.getLongExtra("click_count", 1);
 
         if (cycleDurationMs <= 0
-                || clickCount <= 0
-                || clickIntervalMs < 0
                 || pauseDurationMs < 0
-                || touchDurationMs < 1) {
-
-            setStatus("تنظیمات زمان یا تعداد کلیک نامعتبر است");
+                || clickIntervalMs < 0
+                || touchDurationMs < 0
+                || clickCount <= 0) {
+            updateStatus("مقادیر تنظیمات معتبر نیستند");
             return;
         }
 
-        if (cycleDurationMs > Long.MAX_VALUE - pauseDurationMs) {
-            setStatus("مدت چرخه و مکث بیش از حد بزرگ است");
+        long delayMs;
+
+        if (config.hasExtra("start_delay_ms")) {
+            delayMs = config.getLongExtra("start_delay_ms", -1);
+        } else {
+            long startTime = config.getLongExtra(
+                    "start_time_epoch_ms",
+                    System.currentTimeMillis()
+            );
+
+            delayMs = startTime - System.currentTimeMillis();
+        }
+
+        if (delayMs < 0) {
+            updateStatus("زمان شروع گذشته است");
             return;
         }
 
-        long remaining = startTimeEpochMs - wallNow;
-        long elapsedNow = SystemClock.elapsedRealtime();
+        long nowElapsed = SystemClock.elapsedRealtime();
 
-        if (remaining > Long.MAX_VALUE - elapsedNow) {
-            setStatus("زمان شروع بیش از حد بزرگ است");
+        if (delayMs > Long.MAX_VALUE - nowElapsed) {
+            updateStatus("زمان شروع بیش از حد بزرگ است");
             return;
         }
+
+        anchorElapsedMs = nowElapsed + delayMs;
 
         accessibility = AutoClickService.getInstance();
 
         if (accessibility == null) {
-            setStatus("سرویس دسترسی‌پذیری فعال نیست");
+            updateStatus("ابتدا سرویس دسترس‌پذیری را فعال کنید");
             return;
         }
-
-        updateTargetFromMarker();
 
         running = true;
         cycleActive = false;
         cycleIndex = 0;
+        clickNumber = 0;
 
-        anchorElapsedMs = elapsedNow + remaining;
+        showFloatingViews();
+        updateTarget();
 
+        runGeneration++;
         long generation = runGeneration;
 
-        setStatus("زمان‌بندی فعال شد");
+        cycleStartRunnable = () -> {
+            if (isCurrentRun(generation)) {
+                startCycle(generation);
+            }
+        };
 
-        scheduleCycleStart(generation, anchorElapsedMs);
+        postAtElapsedTime(cycleStartRunnable, anchorElapsedMs);
+        updateStatus(delayMs == 0 ? "در حال شروع" : "در انتظار زمان شروع");
     }
 
-    private void postAtElapsedTime(
-            Runnable runnable,
-            long targetElapsed
-    ) {
+    private boolean isCurrentRun(long generation) {
+        return running && generation == runGeneration;
+    }
 
-        long now = SystemClock.elapsedRealtime();
-
-        long delay = targetElapsed <= now
-                ? 0
-                : targetElapsed - now;
+    private void postAtElapsedTime(Runnable runnable, long targetElapsedMs) {
+        long delay = Math.max(
+                0,
+                targetElapsedMs - SystemClock.elapsedRealtime()
+        );
 
         handler.postDelayed(runnable, delay);
     }
 
-    private void scheduleCycleStart(
-            long generation,
-            long targetElapsed
-    ) {
-
-        if (!running || generation != runGeneration) {
-            return;
+    private long getCyclePeriodMs() {
+        if (pauseDurationMs > Long.MAX_VALUE - cycleDurationMs) {
+            return Long.MAX_VALUE;
         }
 
-        removeRunnable(cycleStartRunnable);
+        return cycleDurationMs + pauseDurationMs;
+    }
 
-        cycleStartRunnable = () -> {
+    private long getCycleTargetElapsed(long index) {
+        long period = getCyclePeriodMs();
 
-            if (!running || generation != runGeneration) {
-                return;
-            }
+        if (period == Long.MAX_VALUE
+                || index > 0 && period > (Long.MAX_VALUE - anchorElapsedMs) / index) {
+            return Long.MAX_VALUE;
+        }
 
-            startCycle(generation);
-        };
-
-        postAtElapsedTime(cycleStartRunnable, targetElapsed);
+        return anchorElapsedMs + index * period;
     }
 
     private void startCycle(long generation) {
-
-        if (!running || generation != runGeneration) {
+        if (!isCurrentRun(generation)) {
             return;
         }
 
-        accessibility = AutoClickService.getInstance();
+        if (accessibility == null) {
+            accessibility = AutoClickService.getInstance();
+        }
 
         if (accessibility == null) {
-            setStatus("سرویس کلیک در دسترس نیست");
             stopLoop();
+            updateStatus("سرویس دسترس‌پذیری قطع شده است");
             return;
         }
 
         if (accessibility.isGestureInProgress()) {
+            cycleStartRunnable = () -> {
+                if (isCurrentRun(generation)) {
+                    startCycle(generation);
+                }
+            };
 
-            handler.postDelayed(
-                    () -> startCycle(generation),
-                    5
-            );
-
+            handler.postDelayed(cycleStartRunnable, 2);
             return;
         }
 
         cycleActive = true;
         clickNumber = 0;
 
-        cycleStartElapsedMs =
-                SystemClock.elapsedRealtime();
-
-        cycleStartWallMs =
-                System.currentTimeMillis();
-
-        if (cycleDurationMs >
-                Long.MAX_VALUE - cycleStartElapsedMs) {
-
-            setStatus("مدت چرخه بیش از حد بزرگ است");
-            stopLoop();
-            return;
-        }
-
-        cycleDeadlineElapsedMs =
-                cycleStartElapsedMs + cycleDurationMs;
+        cycleStartElapsedMs = SystemClock.elapsedRealtime();
+        cycleDeadlineElapsedMs = cycleStartElapsedMs + cycleDurationMs;
+        cycleStartWallMs = System.currentTimeMillis();
 
         accessibility.resetClickCounters();
-
         successAtStart = accessibility.getSuccessfulClicks();
         failedAtStart = accessibility.getFailedClicks();
 
-        updateTargetFromMarker();
-
         accessibility.setTouchDuration(touchDurationMs);
 
-        setStatus("چرخه " + (cycleIndex + 1) + " شروع شد");
-
         scheduleNextClick(generation);
+        updateDisplay();
     }
 
     private void scheduleNextClick(long generation) {
-
-        if (!running
-                || generation != runGeneration
-                || !cycleActive) {
+        if (!isCurrentRun(generation) || !cycleActive) {
             return;
         }
 
@@ -810,343 +678,260 @@ public class FloatingService extends Service {
             return;
         }
 
-        long now = SystemClock.elapsedRealtime();
-
-        long target;
+        long targetElapsed;
 
         if (clickNumber == 0) {
-            target = now;
+            targetElapsed = SystemClock.elapsedRealtime();
         } else {
-
-            if (clickIntervalMs >
-                    Long.MAX_VALUE - lastClickDispatchElapsedMs) {
-
-                setStatus("فاصله کلیک بیش از حد بزرگ است");
-                stopLoop();
-                return;
-            }
-
-            target = lastClickDispatchElapsedMs + clickIntervalMs;
+            targetElapsed = lastClickDispatchElapsedMs + clickIntervalMs;
         }
 
-        removeRunnable(nextClickRunnable);
+        if (targetElapsed >= cycleDeadlineElapsedMs) {
+            waitForCycleEnd(generation);
+            return;
+        }
 
-        nextClickRunnable =
-                () -> dispatchNextClick(generation);
+        nextClickRunnable = () -> {
+            if (isCurrentRun(generation) && cycleActive) {
+                dispatchNextClick(generation);
+            }
+        };
 
-        postAtElapsedTime(nextClickRunnable, target);
+        postAtElapsedTime(nextClickRunnable, targetElapsed);
     }
 
     private void dispatchNextClick(long generation) {
-
-        if (!running
-                || generation != runGeneration
-                || !cycleActive) {
+        if (!isCurrentRun(generation) || !cycleActive) {
             return;
         }
 
         if (accessibility == null) {
-            setStatus("سرویس کلیک در دسترس نیست");
             stopLoop();
+            updateStatus("سرویس دسترس‌پذیری در دسترس نیست");
             return;
         }
 
         if (accessibility.isGestureInProgress()) {
-
-            handler.postDelayed(
-                    () -> dispatchNextClick(generation),
-                    5
-            );
-
-            return;
-        }
-
-        clickNumber++;
-
-        lastClickDispatchElapsedMs =
-                SystemClock.elapsedRealtime();
-
-        setStatus(
-                "در حال اجرای کلیک "
-                        + clickNumber
-                        + " از "
-                        + clickCount
-        );
-
-        accessibility.performClick(() -> {
-
-            handler.post(() -> {
-
-                if (!running
-                        || generation != runGeneration
-                        || !cycleActive) {
-                    return;
+            nextClickRunnable = () -> {
+                if (isCurrentRun(generation) && cycleActive) {
+                    dispatchNextClick(generation);
                 }
+            };
 
-                if (clickNumber < clickCount) {
-                    scheduleNextClick(generation);
-                } else {
-                    waitForCycleEnd(generation);
-                }
-            });
-        });
-    }
-
-    private void waitForCycleEnd(long generation) {
-
-        if (!running || generation != runGeneration) {
+            handler.postDelayed(nextClickRunnable, 2);
             return;
         }
 
         long now = SystemClock.elapsedRealtime();
 
         if (now >= cycleDeadlineElapsedMs) {
-            finishCycle(generation);
+            waitForCycleEnd(generation);
             return;
         }
 
-        removeRunnable(cycleFinishRunnable);
+        clickNumber++;
+        lastClickDispatchElapsedMs = now;
 
-        cycleFinishRunnable =
-                () -> finishCycle(generation);
+        final long callbackGeneration = generation;
 
-        postAtElapsedTime(
-                cycleFinishRunnable,
-                cycleDeadlineElapsedMs
-        );
+        accessibility.performClick(() -> handler.post(() -> {
+            if (!isCurrentRun(callbackGeneration) || !cycleActive) {
+                return;
+            }
+
+            if (SystemClock.elapsedRealtime() >= cycleDeadlineElapsedMs) {
+                waitForCycleEnd(callbackGeneration);
+            } else {
+                scheduleNextClick(callbackGeneration);
+            }
+        }));
+
+        updateDisplay();
+    }
+
+    private void waitForCycleEnd(long generation) {
+        if (!isCurrentRun(generation)) {
+            return;
+        }
+
+        if (nextClickRunnable != null) {
+            handler.removeCallbacks(nextClickRunnable);
+            nextClickRunnable = null;
+        }
+
+        cycleFinishRunnable = () -> {
+            if (isCurrentRun(generation)) {
+                finishCycle(generation);
+            }
+        };
+
+        postAtElapsedTime(cycleFinishRunnable, cycleDeadlineElapsedMs);
     }
 
     private void finishCycle(long generation) {
-
-        if (!running
-                || generation != runGeneration
-                || !cycleActive) {
+        if (!isCurrentRun(generation)) {
             return;
         }
 
-        if (accessibility != null
-                && accessibility.isGestureInProgress()) {
+        if (accessibility != null && accessibility.isGestureInProgress()) {
+            cycleFinishRunnable = () -> {
+                if (isCurrentRun(generation)) {
+                    finishCycle(generation);
+                }
+            };
 
-            handler.postDelayed(
-                    () -> finishCycle(generation),
-                    5
-            );
-
+            handler.postDelayed(cycleFinishRunnable, 2);
             return;
         }
 
         cycleActive = false;
 
-        long actualEnd =
-                SystemClock.elapsedRealtime();
+        if (accessibility != null) {
+            int successes = Math.max(
+                    0,
+                    accessibility.getSuccessfulClicks() - successAtStart
+            );
 
-        long actualDuration =
-                actualEnd - cycleStartElapsedMs;
+            int failures = Math.max(
+                    0,
+                    accessibility.getFailedClicks() - failedAtStart
+            );
 
-        long success = accessibility == null
-                ? 0 : accessibility.getSuccessfulClicks();
+            long averageLatency =
+                    accessibility.getAverageGestureLatencyNanos();
 
-        long failed = accessibility == null
-                ? 0 : accessibility.getFailedClicks();
+            long maxLatency =
+                    accessibility.getMaxGestureLatencyNanos();
 
-        long avgLatency = accessibility == null
-                ? 0 : accessibility.getAverageGestureLatencyNanos();
+            long measured =
+                    accessibility.getMeasuredGestures();
 
-        long maxLatency = accessibility == null
-                ? 0 : accessibility.getMaxGestureLatencyNanos();
+            long actualDuration = Math.max(
+                    0,
+                    SystemClock.elapsedRealtime() - cycleStartElapsedMs
+            );
 
-        long measured = accessibility == null
-                ? 0 : accessibility.getMeasuredGestures();
-
-        CycleReportStore.addReport(
-                this,
-                cycleIndex + 1,
-                cycleStartWallMs,
-                actualDuration,
-                success - successAtStart,
-                failed - failedAtStart,
-                avgLatency,
-                maxLatency,
-                measured
-        );
+            CycleReportStore.addReport(
+                    this,
+                    cycleIndex + 1,
+                    cycleStartWallMs,
+                    actualDuration,
+                    successes,
+                    failures,
+                    averageLatency,
+                    maxLatency,
+                    measured
+            );
+        }
 
         cycleIndex++;
 
-        setStatus("چرخه " + cycleIndex + " تکمیل شد");
+        long nextTarget = getCycleTargetElapsed(cycleIndex);
 
-        long period = cycleDurationMs + pauseDurationMs;
-
-        long nextTarget;
-
-        if (cycleIndex >
-                (Long.MAX_VALUE - anchorElapsedMs) / period) {
-
-            nextTarget = SystemClock.elapsedRealtime();
-
-        } else {
-
-            nextTarget =
-                    anchorElapsedMs + cycleIndex * period;
+        if (nextTarget == Long.MAX_VALUE) {
+            stopLoop();
+            updateStatus("محدودیت زمان‌بندی چرخه");
+            return;
         }
 
-        long now = SystemClock.elapsedRealtime();
+        cycleStartRunnable = () -> {
+            if (isCurrentRun(generation)) {
+                startCycle(generation);
+            }
+        };
 
-        if (nextTarget < now) {
-            nextTarget = now;
+        postAtElapsedTime(cycleStartRunnable, nextTarget);
+        updateDisplay();
+    }
+
+    // ---------------------------------------------------------
+    // Stop and status
+    // ---------------------------------------------------------
+
+    private void stopLoop() {
+        running = false;
+        cycleActive = false;
+        runGeneration++;
+
+        removeScheduledCallbacks();
+
+        updateStatus("متوقف شد");
+        updateDisplay();
+    }
+
+    private void removeScheduledCallbacks() {
+        if (cycleStartRunnable != null) {
+            handler.removeCallbacks(cycleStartRunnable);
+            cycleStartRunnable = null;
         }
 
-        scheduleCycleStart(generation, nextTarget);
+        if (nextClickRunnable != null) {
+            handler.removeCallbacks(nextClickRunnable);
+            nextClickRunnable = null;
+        }
+
+        if (cycleFinishRunnable != null) {
+            handler.removeCallbacks(cycleFinishRunnable);
+            cycleFinishRunnable = null;
+        }
+    }
+
+    private void updateStatus(String message) {
+        if (statusView != null) {
+            statusView.setText(message);
+        }
     }
 
     private void updateDisplay() {
-
         if (statusView == null || counterView == null) {
             return;
         }
 
         if (!running) {
-            counterView.setText("متوقف");
+            counterView.setText("چرخه: " + cycleIndex
+                    + " | کلیک: " + clickNumber);
             return;
         }
 
         long now = SystemClock.elapsedRealtime();
 
         if (!cycleActive) {
+            long remaining = Math.max(0, anchorElapsedMs - now);
 
-            long period = cycleDurationMs + pauseDurationMs;
-
-            long nextTarget;
-
-            if (cycleIndex >
-                    (Long.MAX_VALUE - anchorElapsedMs) / period) {
-
-                nextTarget = now;
-
-            } else {
-
-                nextTarget =
-                        anchorElapsedMs + cycleIndex * period;
-            }
-
-            long remaining = Math.max(0, nextTarget - now);
-
-            counterView.setText(
-                    "شروع چرخه بعدی: " + formatMillis(remaining)
-            );
-
-            return;
-        }
-
-        long remaining =
-                Math.max(0, cycleDeadlineElapsedMs - now);
-
-        if (clickNumber >= clickCount) {
-
-            counterView.setText(
-                    "پایان چرخه: " + formatMillis(remaining)
-            );
-
+            statusView.setText(String.format(
+                    Locale.US,
+                    "در انتظار شروع: %.3f ثانیه",
+                    remaining / 1000.0
+            ));
         } else {
+            long remaining = Math.max(0, cycleDeadlineElapsedMs - now);
 
-            counterView.setText(
-                    "کلیک "
-                            + clickNumber
-                            + " از "
-                            + clickCount
-                            + " | پایان چرخه: "
-                            + formatMillis(remaining)
-            );
+            statusView.setText(String.format(
+                    Locale.US,
+                    "چرخه فعال | باقی‌مانده: %.3f ثانیه",
+                    remaining / 1000.0
+            ));
         }
-    }
 
-    private String formatMillis(long millis) {
-
-        long hours = millis / 3600000;
-        long minutes = (millis % 3600000) / 60000;
-        long seconds = (millis % 60000) / 1000;
-        long ms = millis % 1000;
-
-        return String.format(
-                Locale.US,
-                "%02d:%02d:%02d.%03d",
-                hours,
-                minutes,
-                seconds,
-                ms
+        counterView.setText(
+                "چرخه: " + (cycleIndex + 1)
+                        + " | کلیک: " + clickNumber
+                        + "/" + clickCount
         );
     }
 
-    private void setStatus(String text) {
-
-        if (statusView != null) {
-            statusView.setText(text);
-        }
-    }
-
-    private void removeRunnable(Runnable runnable) {
-
-        if (runnable != null) {
-            handler.removeCallbacks(runnable);
-        }
-    }
-
-    private void stopLoop() {
-
-        running = false;
-        cycleActive = false;
-
-        runGeneration++;
-
-        removeRunnable(cycleStartRunnable);
-        removeRunnable(nextClickRunnable);
-        removeRunnable(cycleFinishRunnable);
-
-        cycleStartRunnable = null;
-        nextClickRunnable = null;
-        cycleFinishRunnable = null;
-
-        setStatus("متوقف شد");
-
-        if (counterView != null) {
-            counterView.setText("متوقف");
-        }
-    }
-
-    private void removeFloatingViews() {
-
-        if (panel != null) {
-
-            try {
-                windowManager.removeView(panel);
-            } catch (Exception ignored) {
-            }
-
-            panel = null;
-            titleView = null;
-            statusView = null;
-            counterView = null;
-            panelParams = null;
-        }
-
-        if (marker != null) {
-
-            try {
-                windowManager.removeView(marker);
-            } catch (Exception ignored) {
-            }
-
-            marker = null;
-            markerParams = null;
-        }
+    private int dp(float value) {
+        return (int) (value * getResources()
+                .getDisplayMetrics().density + 0.5f);
     }
 
     @Override
     public void onDestroy() {
-
         stopLoop();
 
-        removeRunnable(displayRunnable);
-        displayRunnable = null;
+        if (displayRunnable != null) {
+            handler.removeCallbacks(displayRunnable);
+        }
 
         removeFloatingViews();
 
