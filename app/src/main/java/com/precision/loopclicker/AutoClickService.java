@@ -14,6 +14,9 @@ public class AutoClickService extends AccessibilityService {
 
     private static final String TAG = "PrecisionAutoClick";
 
+    // کوتاه‌ترین مدت درخواستی برای لمس
+    private static final long TAP_DURATION_MS = 1L;
+
     private static volatile AutoClickService instance;
 
     private final Handler handler =
@@ -21,8 +24,6 @@ public class AutoClickService extends AccessibilityService {
 
     private volatile int targetX = 500;
     private volatile int targetY = 500;
-
-    private volatile long touchDurationMs = 20;
 
     private volatile boolean gestureInProgress = false;
     private volatile boolean serviceReady = false;
@@ -40,7 +41,8 @@ public class AutoClickService extends AccessibilityService {
     private volatile long maxGestureLatencyNanos = 0;
     private volatile long measuredGestures = 0;
 
-    private volatile String lastError = "هنوز کلیکی ارسال نشده";
+    private volatile String lastError =
+            "هنوز کلیکی ارسال نشده";
 
     public static AutoClickService getInstance() {
         AutoClickService service = instance;
@@ -56,26 +58,30 @@ public class AutoClickService extends AccessibilityService {
     protected void onServiceConnected() {
         super.onServiceConnected();
 
-        serviceReady = true;
         instance = this;
+        serviceReady = true;
 
         Log.i(TAG, "Accessibility service connected");
     }
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-        // رویدادهای صفحه نیاز نیستند.
+        // رویدادهای صفحه موردنیاز نیستند.
     }
 
     @Override
     public void onInterrupt() {
         handler.post(() -> {
-            serviceReady = false;
-
             if (gestureInProgress) {
-                finishGesture(activeGestureId, false,
-                        "سرویس دسترسی‌پذیری قطع شد");
+                finishGesture(
+                        activeGestureId,
+                        false,
+                        "Gesture توسط اندروید متوقف شد"
+                );
             }
+
+            // سرویس ممکن است همچنان متصل باشد.
+            // بنابراین serviceReady را false نمی‌کنیم.
         });
     }
 
@@ -85,14 +91,20 @@ public class AutoClickService extends AccessibilityService {
 
         if (Looper.myLooper() == Looper.getMainLooper()) {
             if (gestureInProgress) {
-                finishGesture(activeGestureId, false,
-                        "سرویس بسته شد");
+                finishGesture(
+                        activeGestureId,
+                        false,
+                        "سرویس بسته شد"
+                );
             }
         } else {
             handler.post(() -> {
                 if (gestureInProgress) {
-                    finishGesture(activeGestureId, false,
-                            "سرویس بسته شد");
+                    finishGesture(
+                            activeGestureId,
+                            false,
+                            "سرویس بسته شد"
+                    );
                 }
             });
         }
@@ -121,10 +133,6 @@ public class AutoClickService extends AccessibilityService {
 
     public int getTargetY() {
         return targetY;
-    }
-
-    public void setTouchDuration(long durationMs) {
-        touchDurationMs = Math.max(10, Math.min(durationMs, 10000));
     }
 
     public boolean isGestureInProgress() {
@@ -189,6 +197,7 @@ public class AutoClickService extends AccessibilityService {
             if (completion != null) {
                 completion.run();
             }
+
             return;
         }
 
@@ -196,15 +205,13 @@ public class AutoClickService extends AccessibilityService {
             lastError = "لمس قبلی هنوز تمام نشده است";
             Log.w(TAG, lastError);
 
-            if (completion != null) {
-                handler.postDelayed(completion, 10);
-            }
+            // کلیک جدید ارسال نمی‌شود و callback هم اجرا نمی‌شود.
+            // FloatingService باید منتظر پایان Gesture قبلی بماند.
             return;
         }
 
         final int clickX = targetX;
         final int clickY = targetY;
-        final long duration = Math.max(10, touchDurationMs);
 
         gestureInProgress = true;
         activeCompletion = completion;
@@ -218,7 +225,7 @@ public class AutoClickService extends AccessibilityService {
                 new GestureDescription.StrokeDescription(
                         path,
                         0,
-                        duration
+                        TAP_DURATION_MS
                 );
 
         GestureDescription gesture =
@@ -229,11 +236,14 @@ public class AutoClickService extends AccessibilityService {
         dispatchStartNanos =
                 SystemClock.elapsedRealtimeNanos();
 
-        Log.d(TAG, "Dispatch click: x=" + clickX
-                + " y=" + clickY
-                + " duration=" + duration);
+        Log.d(
+                TAG,
+                "Dispatch click: x=" + clickX
+                        + " y=" + clickY
+                        + " duration=" + TAP_DURATION_MS
+        );
 
-        boolean accepted;
+        boolean accepted = false;
 
         try {
             accepted = dispatchGesture(
@@ -243,6 +253,7 @@ public class AutoClickService extends AccessibilityService {
                         @Override
                         public void onCompleted(
                                 GestureDescription description) {
+
                             super.onCompleted(description);
 
                             finishGesture(
@@ -255,6 +266,7 @@ public class AutoClickService extends AccessibilityService {
                         @Override
                         public void onCancelled(
                                 GestureDescription description) {
+
                             super.onCancelled(description);
 
                             finishGesture(
@@ -268,7 +280,6 @@ public class AutoClickService extends AccessibilityService {
             );
 
         } catch (Exception e) {
-            accepted = false;
             lastError = "خطای ارسال لمس: " + e.getMessage();
 
             Log.e(TAG, lastError, e);
@@ -301,13 +312,13 @@ public class AutoClickService extends AccessibilityService {
             return;
         }
 
-        long latency =
-                Math.max(0,
-                        SystemClock.elapsedRealtimeNanos()
-                                - dispatchStartNanos);
+        long latency = Math.max(
+                0,
+                SystemClock.elapsedRealtimeNanos()
+                        - dispatchStartNanos
+        );
 
         lastGestureLatencyNanos = latency;
-
         measuredGestures++;
 
         if (totalGestureLatencyNanos
@@ -322,8 +333,11 @@ public class AutoClickService extends AccessibilityService {
             successfulClicks++;
             lastError = message;
 
-            Log.d(TAG, message
-                    + " | latency=" + latency);
+            Log.d(
+                    TAG,
+                    message + " | latency=" + latency
+            );
+
         } else {
             failedClicks++;
             lastError = message;
