@@ -1,3 +1,4 @@
+
 package com.precision.loopclicker;
 
 import android.app.Notification;
@@ -80,7 +81,6 @@ public class FloatingService extends Service {
     private long cycleDurationMs;
     private long pauseDurationMs;
     private long clickIntervalMs;
-    private long touchDurationMs;
 
     private long cycleStartElapsedMs;
     private long cycleDeadlineElapsedMs;
@@ -682,16 +682,12 @@ public class FloatingService extends Service {
         clickIntervalMs =
                 config.getLongExtra("click_interval_ms", 50);
 
-        touchDurationMs =
-                config.getLongExtra("touch_duration_ms", 20);
-
         clickCount =
                 config.getLongExtra("click_count", 1);
 
         if (cycleDurationMs <= 0
                 || pauseDurationMs < 0
                 || clickIntervalMs < 0
-                || touchDurationMs < 1
                 || clickCount <= 0) {
 
             updateStatus("مقادیر تنظیمات معتبر نیستند");
@@ -833,7 +829,6 @@ public class FloatingService extends Service {
         if (accessibility != null) {
 
             accessibility.setTarget(targetX, targetY);
-            accessibility.setTouchDuration(touchDurationMs);
 
             updateStatus("سرویس کلیک متصل شد");
 
@@ -917,7 +912,6 @@ public class FloatingService extends Service {
                 accessibility.getFailedClicks();
 
         accessibility.setTarget(targetX, targetY);
-        accessibility.setTouchDuration(touchDurationMs);
 
         scheduleNextClick(generation);
 
@@ -1024,7 +1018,6 @@ public class FloatingService extends Service {
         }
 
         accessibility.setTarget(targetX, targetY);
-        accessibility.setTouchDuration(touchDurationMs);
 
         final AutoClickService clickService = accessibility;
 
