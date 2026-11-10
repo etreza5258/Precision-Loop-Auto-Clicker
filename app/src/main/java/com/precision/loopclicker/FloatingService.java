@@ -1,4 +1,3 @@
-
 package com.precision.loopclicker;
 
 import android.app.Notification;
@@ -69,6 +68,9 @@ public class FloatingService extends Service {
     private long pauseDurationMs = 0;
     private long touchDurationMs = 5;
 
+    // فاصله مستقل بین شروع دو کلیک
+    private long clickIntervalMs = 20;
+
     private long cyclePeriodMs = 1000;
 
     private int clickCount = 20;
@@ -85,7 +87,11 @@ public class FloatingService extends Service {
 
     private long cycleStartElapsed = 0;
     private long cycleStartWall = 0;
+
     private long phaseDeadline = 0;
+
+    // زمان شروع آخرین کلیک
+    private long lastClickDispatchElapsed = 0;
 
     private long successAtStart = 0;
     private long failedAtStart = 0;
@@ -125,6 +131,7 @@ public class FloatingService extends Service {
     }
 
     public static void setOverlaysHidden(boolean hidden) {
+
         if (instance != null) {
             instance.changeOverlayVisibility(hidden);
         }
@@ -139,14 +146,18 @@ public class FloatingService extends Service {
         overlaysHidden = hidden;
 
         if (panelView != null && panelAdded && panelParams != null) {
+
             try {
+
                 if (hidden) {
+
                     panelParams.flags |=
                             WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
 
                     panelView.setVisibility(View.INVISIBLE);
 
                 } else {
+
                     panelParams.flags &=
                             ~WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
 
@@ -163,14 +174,18 @@ public class FloatingService extends Service {
         }
 
         if (markerView != null && markerAdded && markerParams != null) {
+
             try {
+
                 if (hidden) {
+
                     markerParams.flags |=
                             WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
 
                     markerView.setVisibility(View.INVISIBLE);
 
                 } else {
+
                     markerParams.flags &=
                             ~WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
 
@@ -219,6 +234,12 @@ public class FloatingService extends Service {
                 pauseDurationMs = intent.getLongExtra(
                         "pause_duration",
                         0
+                );
+
+                // دریافت فاصله مستقل کلیک‌ها
+                clickIntervalMs = intent.getLongExtra(
+                        "click_interval_ms",
+                        20
                 );
 
                 createFloatingViews();
@@ -690,14 +711,17 @@ public class FloatingService extends Service {
         stopLoop();
 
         if (startTimeEpochMs <= System.currentTimeMillis()) {
+
             updateStatus("زمان شروع گذشته یا نامعتبر است");
             countdownViewSafe("زمان شروع معتبر نیست");
+
             return;
         }
 
         if (cycleDurationMs <= 0
                 || clickCount <= 0
                 || touchDurationMs <= 0
+                || clickIntervalMs <= 0
                 || pauseDurationMs < 0) {
 
             updateStatus("تنظیمات نامعتبر است");
@@ -705,12 +729,8 @@ public class FloatingService extends Service {
         }
 
         if (pauseDurationMs > Long.MAX_VALUE - cycleDurationMs) {
-            updateStatus("مجموع زمان چرخه و مکث بیش از حد بزرگ است");
-            return;
-        }
 
-        if (touchDurationMs > cycleDurationMs / clickCount) {
-            updateStatus("زمان لمس‌ها برای این چرخه زیاد است");
+            updateStatus("مجموع زمان چرخه و مکث بیش از حد بزرگ است");
             return;
         }
 
@@ -718,6 +738,7 @@ public class FloatingService extends Service {
                 AutoClickService.getInstance();
 
         if (accessibility == null) {
+
             updateStatus("ابتدا دسترس‌پذیری را فعال کنید");
             return;
         }
@@ -728,8 +749,10 @@ public class FloatingService extends Service {
         long remaining = startTimeEpochMs - wallNow;
 
         if (remaining <= 0) {
+
             updateStatus("زمان شروع گذشته است");
             countdownViewSafe("زمان شروع گذشته است");
+
             return;
         }
 
@@ -743,6 +766,9 @@ public class FloatingService extends Service {
 
         cycleNumber = 0;
         cycleIndex = 0;
+
+        currentClick = 0;
+        lastClickDispatchElapsed = 0;
 
         runGeneration++;
 
@@ -759,16 +785,20 @@ public class FloatingService extends Service {
         if (!running || generation != runGeneration) return;
 
         if (index < 0) {
+
             stopLoop();
             updateStatus("خطا در شماره چرخه");
+
             return;
         }
 
         long offset = safeMultiply(index, cyclePeriodMs);
 
         if (offset == Long.MAX_VALUE) {
+
             stopLoop();
             updateStatus("زمان‌بندی بیش از حد بزرگ است");
+
             return;
         }
 
@@ -817,8 +847,10 @@ public class FloatingService extends Service {
                 AutoClickService.getInstance();
 
         if (accessibility == null) {
+
             stopLoop();
             updateStatus("سرویس دسترس‌پذیری قطع شده است");
+
             return;
         }
 
@@ -835,6 +867,8 @@ public class FloatingService extends Service {
         cycleNumber++;
 
         currentClick = 0;
+        lastClickDispatchElapsed = 0;
+
         cycleActive = true;
 
         cycleStartElapsed = SystemClock.elapsedRealtime();
@@ -852,7 +886,6 @@ public class FloatingService extends Service {
                 Math.round(targetY)
         );
 
-        // شروع آمارگیری مستقل برای این چرخه
         accessibility.resetClickCounters();
 
         successAtStart = accessibility.getSuccessfulClicks();
@@ -862,17 +895,25 @@ public class FloatingService extends Service {
                 cycleStartElapsed - scheduledCycleElapsedMs;
 
         if (startError > 0) {
+
             updateStatus(
                     "اجرای چرخه " + cycleNumber
                             + " با " + startError + " ms تأخیر"
             );
+
         } else {
+
             updateStatus("اجرای چرخه " + cycleNumber);
         }
 
         scheduleNextClick(generation);
     }
 
+    /*
+     * زمان‌بندی مستقل کلیک‌ها:
+     * فاصله کلیک‌ها از clickIntervalMs گرفته می‌شود،
+     * نه از تقسیم زمان چرخه بر تعداد کلیک‌ها.
+     */
     private void scheduleNextClick(int generation) {
 
         if (!running || generation != runGeneration) return;
@@ -880,24 +921,37 @@ public class FloatingService extends Service {
 
         long now = SystemClock.elapsedRealtime();
 
-        if (now >= phaseDeadline) {
-            finishCycle(generation);
-            return;
-        }
-
+        // اگر تعداد کلیک‌ها کامل شده باشد،
+        // تا پایان زمان چرخه منتظر می‌مانیم.
         if (currentClick >= clickCount) {
 
-            scheduleFinishAtDeadline(generation);
+            if (now >= phaseDeadline) {
+
+                finishCycle(generation);
+
+            } else {
+
+                scheduleFinishAtDeadline(generation);
+            }
+
             return;
         }
 
-        long targetOffset =
-                (cycleDurationMs / clickCount) * currentClick
-                        + ((cycleDurationMs % clickCount)
-                        * currentClick) / clickCount;
+        long targetTime;
 
-        long targetTime =
-                safeAdd(cycleStartElapsed, targetOffset);
+        if (currentClick == 0) {
+
+            // اولین کلیک در ابتدای چرخه
+            targetTime = cycleStartElapsed;
+
+        } else {
+
+            // کلیک بعدی بر اساس زمان شروع کلیک قبلی
+            targetTime = safeAdd(
+                    lastClickDispatchElapsed,
+                    clickIntervalMs
+            );
+        }
 
         long delay = Math.max(0, targetTime - now);
 
@@ -906,7 +960,16 @@ public class FloatingService extends Service {
             if (!running || generation != runGeneration) return;
             if (!cycleActive) return;
 
-            executeCurrentClick(generation);
+            // اگر تأخیر Handler بیش از ۶۰ ثانیه بود،
+            // زمان‌بندی دوباره بررسی می‌شود.
+            if (SystemClock.elapsedRealtime() < targetTime) {
+
+                scheduleNextClick(generation);
+
+            } else {
+
+                executeCurrentClick(generation);
+            }
 
         }, Math.min(delay, MAX_HANDLER_DELAY));
     }
@@ -937,7 +1000,20 @@ public class FloatingService extends Service {
 
             } else {
 
-                finishCycle(generation);
+                // حتی اگر زمان چرخه تمام شده باشد،
+                // تا کامل‌شدن تمام کلیک‌ها صبر می‌کنیم.
+                if (currentClick >= clickCount) {
+
+                    finishCycle(generation);
+
+                } else {
+
+                    updateStatus(
+                            "تکمیل کلیک‌های چرخه "
+                                    + cycleNumber
+                                    + " با اضافه‌زمان"
+                    );
+                }
             }
 
         }, delay);
@@ -948,17 +1024,14 @@ public class FloatingService extends Service {
         if (!running || generation != runGeneration) return;
         if (!cycleActive) return;
 
-        if (SystemClock.elapsedRealtime() >= phaseDeadline) {
-            finishCycle(generation);
-            return;
-        }
-
         AutoClickService accessibility =
                 AutoClickService.getInstance();
 
         if (accessibility == null) {
+
             stopLoop();
             updateStatus("سرویس دسترس‌پذیری قطع شده است");
+
             return;
         }
 
@@ -971,6 +1044,10 @@ public class FloatingService extends Service {
 
             return;
         }
+
+        // ثبت زمان شروع واقعی کلیک
+        lastClickDispatchElapsed =
+                SystemClock.elapsedRealtime();
 
         currentClick++;
 
@@ -986,6 +1063,7 @@ public class FloatingService extends Service {
             if (!running || generation != runGeneration) return;
             if (!cycleActive) return;
 
+            // پس از پایان Gesture، زمان کلیک بعدی بررسی می‌شود.
             scheduleNextClick(generation);
         });
     }
@@ -1009,6 +1087,13 @@ public class FloatingService extends Service {
             return;
         }
 
+        // جلوگیری از ثبت چرخه ناقص
+        if (currentClick < clickCount) {
+
+            scheduleNextClick(generation);
+            return;
+        }
+
         cycleActive = false;
 
         long actualDuration =
@@ -1019,7 +1104,6 @@ public class FloatingService extends Service {
         long successful = 0;
         long failed = 0;
 
-        // آمار تأخیر Gesture برای همین چرخه
         long averageGestureLatencyNanos = 0;
         long maxGestureLatencyNanos = 0;
         long measuredGestures = 0;
@@ -1076,6 +1160,8 @@ public class FloatingService extends Service {
 
         updateStatus("پایان چرخه " + cycleNumber);
 
+        // چرخه بعدی طبق زمان‌بندی اصلی بررسی می‌شود.
+        // اگر چرخه قبلی طولانی شده باشد، هم‌پوشانی رخ نمی‌دهد.
         scheduleCycleStart(generation, cycleIndex + 1);
     }
 
@@ -1116,17 +1202,57 @@ public class FloatingService extends Service {
 
         if (!running || countdownView == null) return;
 
+        long now = SystemClock.elapsedRealtime();
+
+        if (!cycleActive) {
+
+            long remaining = Math.max(
+                    0,
+                    scheduledCycleElapsedMs - now
+            );
+
+            countdownView.setText(
+                    "شروع چرخه بعدی: " + remaining + " ms"
+            );
+
+            return;
+        }
+
+        if (currentClick < clickCount && now >= phaseDeadline) {
+
+            long overtime = now - phaseDeadline;
+
+            countdownView.setText(
+                    "تکمیل کلیک‌ها: اضافه‌زمان "
+                            + overtime + " ms"
+            );
+
+            return;
+        }
+
+        if (currentClick >= clickCount) {
+
+            long remaining = Math.max(
+                    0,
+                    phaseDeadline - now
+            );
+
+            countdownView.setText(
+                    "پایان چرخه: " + remaining + " ms"
+            );
+
+            return;
+        }
+
         long remaining = Math.max(
                 0,
-                phaseDeadline - SystemClock.elapsedRealtime()
+                phaseDeadline - now
         );
 
-        String phase = cycleActive
-                ? "پایان چرخه"
-                : "شروع چرخه بعدی";
-
         countdownView.setText(
-                phase + ": " + remaining + " ms"
+                "کلیک " + currentClick
+                        + " از " + clickCount
+                        + " | پایان چرخه: " + remaining + " ms"
         );
     }
 
