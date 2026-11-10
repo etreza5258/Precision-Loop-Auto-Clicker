@@ -8,6 +8,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.provider.Settings;
 import android.provider.Settings.Secure;
 import android.widget.Button;
@@ -15,10 +16,26 @@ import android.widget.EditText;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import java.util.Calendar;
+import java.io.IOException;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.util.Date;
 import java.util.Locale;
+import java.util.TimeZone;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class MainActivity extends Activity {
+
+    private static final ZoneId IRAN_ZONE =
+            ZoneId.of("Asia/Tehran");
 
     private EditText startHourInput, startMinuteInput;
     private EditText startSecondInput, startMillisInput;
@@ -41,26 +58,42 @@ public class MainActivity extends Activity {
     private final Handler handler =
             new Handler(Looper.getMainLooper());
 
+    private final ExecutorService timeExecutor =
+            Executors.newSingleThreadExecutor();
+
+    private volatile long trustedEpochAtSync = 0L;
+    private volatile long elapsedAtSync = 0L;
+    private volatile boolean timeSynced = false;
+    private volatile boolean syncInProgress = false;
+
     private long scheduledStartTime = 0L;
     private boolean countdownActive = false;
 
     private long lastReportRefreshTime = 0L;
 
+    private final Runnable syncRunnable = new Runnable() {
+        @Override
+        public void run() {
+            syncInternetTime();
+            handler.postDelayed(this, 60000L);
+        }
+    };
+
     private final Runnable clockRunnable = new Runnable() {
         @Override
         public void run() {
 
-            updatePhoneClock();
+            updateIranClock();
             updateCountdown();
 
-            long now = System.currentTimeMillis();
+            long now = SystemClock.elapsedRealtime();
 
             if (now - lastReportRefreshTime >= 1000L) {
                 refreshReports();
                 lastReportRefreshTime = now;
             }
 
-            handler.postDelayed(this, 50);
+            handler.postDelayed(this, 30L);
         }
     };
 
@@ -76,6 +109,7 @@ public class MainActivity extends Activity {
         refreshReports();
 
         handler.post(clockRunnable);
+        handler.post(syncRunnable);
     }
 
     private void bindViews() {
@@ -135,7 +169,6 @@ public class MainActivity extends Activity {
     }
 
     private void setIfEmpty(EditText input, String value) {
-
         if (input.getText().toString().trim().isEmpty()) {
             input.setText(value);
         }
@@ -148,11 +181,9 @@ public class MainActivity extends Activity {
         stopButton.setOnClickListener(v -> stopClicking());
 
         accessibilityButton.setOnClickListener(v -> {
-
             Intent intent = new Intent(
                     Settings.ACTION_ACCESSIBILITY_SETTINGS
             );
-
             startActivity(intent);
         });
 
@@ -168,7 +199,6 @@ public class MainActivity extends Activity {
                 startActivity(intent);
 
             } else {
-
                 showMessage("مجوز پنل شناور فعال است.");
             }
         });
@@ -196,7 +226,6 @@ public class MainActivity extends Activity {
                 }
 
             } catch (Exception e) {
-
                 showMessage("نمایش پنل شناور ناموفق بود.");
             }
         });
@@ -204,9 +233,7 @@ public class MainActivity extends Activity {
         clearReportsButton.setOnClickListener(v -> {
 
             CycleReportStore.clearReports(this);
-
             refreshReports();
-
             showMessage("گزارش‌ها پاک شدند.");
         });
 
@@ -218,9 +245,127 @@ public class MainActivity extends Activity {
                     new Intent(this, FloatingService.class);
 
             stopService(serviceIntent);
-
             finish();
         });
+    }
+
+    // دریافت زمان از سرور اینترنتی
+    private void syncInternetTime() {
+
+        if (syncInProgress) {
+            return;
+        }
+
+        syncInProgress = true;
+
+        timeExecutor.execute(() -> {
+
+            HttpURLConnection connection = null;
+
+            try {
+
+                long requestStart = SystemClock.elapsedRealtime();
+
+                URL url = new URL(
+                        "https://www.google.com/generate_204"
+                );
+
+                connection = (HttpURLConnection) url.openConnection();
+                connection.setRequestMethod("GET");
+                connection.setConnectTimeout(5000);
+                connection.setReadTimeout(5000);
+                connection.setUseCaches(false);
+                connection.setInstanceFollowRedirects(true);
+
+                connection.connect();
+
+                long serverDate = connection.getHeaderFieldDate(
+                        "Date",
+                        -1L
+                );
+
+                long requestEnd = SystemClock.elapsedRealtime();
+
+                if (serverDate <= 0L) {
+                    throw new IOException("زمان سرور دریافت نشد.");
+                }
+
+                // تاریخ HTTP دقت ثانیه‌ای دارد؛
+                // نصف زمان رفت‌وبرگشت برای تخمین زمان دریافت لحاظ می‌شود.
+                long midpoint =
+                        requestStart + (requestEnd - requestStart) / 2L;
+
+                long estimatedServerTime =
+                        serverDate + (requestEnd - midpoint);
+
+                trustedEpochAtSync = estimatedServerTime;
+                elapsedAtSync = requestEnd;
+                timeSynced = true;
+
+                handler.post(() -> {
+                    updateIranClock();
+                });
+
+            } catch (Exception e) {
+
+                handler.post(() -> {
+                    if (!timeSynced) {
+                        phoneClock.setText(
+                                "ساعت ایران: در انتظار اتصال به اینترنت"
+                        );
+                    }
+                });
+
+            } finally {
+
+                if (connection != null) {
+                    connection.disconnect();
+                }
+
+                syncInProgress = false;
+            }
+        });
+    }
+
+    // زمان فعلی بر اساس ساعت همگام‌شده
+    private long getTrustedNow() {
+
+        if (!timeSynced) {
+            return 0L;
+        }
+
+        long elapsedNow = SystemClock.elapsedRealtime();
+
+        return trustedEpochAtSync
+                + (elapsedNow - elapsedAtSync);
+    }
+
+    private void updateIranClock() {
+
+        if (!timeSynced) {
+
+            phoneClock.setText(
+                    "ساعت ایران: در حال همگام‌سازی..."
+            );
+
+            return;
+        }
+
+        long now = getTrustedNow();
+
+        ZonedDateTime iranTime =
+                Instant.ofEpochMilli(now).atZone(IRAN_ZONE);
+
+        String time = String.format(
+                Locale.US,
+                "ساعت ایران: %02d:%02d:%02d.%03d  |  همگام‌شده",
+                iranTime.getHour(),
+                iranTime.getMinute(),
+                iranTime.getSecond(),
+                iranTime.getNano() / 1000000
+        );
+
+        phoneClock.setText(time);
     }
 
     private void startClicking() {
@@ -232,6 +377,12 @@ public class MainActivity extends Activity {
 
         if (!hasOverlayPermission()) {
             showMessage("ابتدا مجوز پنل شناور را فعال کنید.");
+            return;
+        }
+
+        if (!timeSynced) {
+            syncInternetTime();
+            showMessage("ابتدا منتظر همگام‌سازی ساعت ایران بمانید.");
             return;
         }
 
@@ -274,7 +425,6 @@ public class MainActivity extends Activity {
                 || touchMillisValue == null
                 || pauseSecondsValue == null
                 || pauseMillisValue == null) {
-
             return;
         }
 
@@ -297,7 +447,6 @@ public class MainActivity extends Activity {
 
         if (hour > 23 || minute > 59
                 || second > 59 || millis > 999) {
-
             showMessage("زمان شروع معتبر نیست.");
             return;
         }
@@ -309,7 +458,6 @@ public class MainActivity extends Activity {
 
         if (cycleMillis > 999
                 || (cycleSeconds == 0 && cycleMillis == 0)) {
-
             showMessage("مدت چرخه معتبر نیست.");
             return;
         }
@@ -349,19 +497,37 @@ public class MainActivity extends Activity {
         long pauseDuration =
                 pauseSeconds * 1000L + pauseMillis;
 
-        Calendar startCalendar = Calendar.getInstance();
+        long trustedNow = getTrustedNow();
 
-        startCalendar.set(Calendar.HOUR_OF_DAY, (int) hour);
-        startCalendar.set(Calendar.MINUTE, (int) minute);
-        startCalendar.set(Calendar.SECOND, (int) second);
-        startCalendar.set(Calendar.MILLISECOND, (int) millis);
+        ZonedDateTime iranNow =
+                Instant.ofEpochMilli(trustedNow).atZone(IRAN_ZONE);
 
-        long startTime = startCalendar.getTimeInMillis();
+        LocalDate iranDate = iranNow.toLocalDate();
 
-        if (startTime <= System.currentTimeMillis()) {
-            showMessage("زمان شروع باید از ساعت فعلی جلوتر باشد.");
+        LocalDateTime requestedDateTime =
+                iranDate.atTime(
+                        (int) hour,
+                        (int) minute,
+                        (int) second,
+                        (int) millis * 1000000
+                );
+
+        long startTime = requestedDateTime
+                .atZone(IRAN_ZONE)
+                .toInstant()
+                .toEpochMilli();
+
+        if (startTime <= trustedNow) {
+            showMessage("زمان شروع باید از ساعت فعلی ایران جلوتر باشد.");
             return;
         }
+
+        long startDelay = startTime - trustedNow;
+
+        // سازگاری با FloatingService فعلی که از ساعت گوشی استفاده می‌کند:
+        // زمان معادل روی ساعت گوشی را می‌فرستیم تا تأخیر شروع درست بماند.
+        long serviceStartTime =
+                System.currentTimeMillis() + startDelay;
 
         Intent intent = new Intent(
                 this,
@@ -370,7 +536,9 @@ public class MainActivity extends Activity {
 
         intent.setAction("ACTION_START");
 
-        intent.putExtra("start_time_epoch_ms", startTime);
+        intent.putExtra("start_time_epoch_ms", serviceStartTime);
+        intent.putExtra("start_delay_ms", startDelay);
+
         intent.putExtra("cycle_duration", cycleDuration);
         intent.putExtra("click_count", (int) clickCount);
         intent.putExtra("touch_duration", (int) touchMillis);
@@ -392,7 +560,7 @@ public class MainActivity extends Activity {
 
             updateCountdown();
 
-            showMessage("زمان‌بندی اجرا ثبت شد.");
+            showMessage("زمان‌بندی بر اساس ساعت ایران ثبت شد.");
 
         } catch (Exception e) {
 
@@ -404,21 +572,13 @@ public class MainActivity extends Activity {
         }
     }
 
-    private Long readLong(
-            EditText input,
-            String fieldName
-    ) {
+    private Long readLong(EditText input, String fieldName) {
 
         String value = input.getText().toString().trim();
 
         if (value.isEmpty()) {
-
-            showMessage(
-                    "مقدار «" + fieldName + "» را وارد کنید."
-            );
-
+            showMessage("مقدار «" + fieldName + "» را وارد کنید.");
             input.requestFocus();
-
             return null;
         }
 
@@ -427,14 +587,11 @@ public class MainActivity extends Activity {
             long number = Long.parseLong(value);
 
             if (number < 0) {
-
                 showMessage(
                         "مقدار «" + fieldName
                                 + "» نمی‌تواند منفی باشد."
                 );
-
                 input.requestFocus();
-
                 return null;
             }
 
@@ -442,12 +599,8 @@ public class MainActivity extends Activity {
 
         } catch (NumberFormatException e) {
 
-            showMessage(
-                    "مقدار «" + fieldName + "» معتبر نیست."
-            );
-
+            showMessage("مقدار «" + fieldName + "» معتبر نیست.");
             input.requestFocus();
-
             return null;
         }
     }
@@ -458,7 +611,6 @@ public class MainActivity extends Activity {
         scheduledStartTime = 0L;
 
         setCountdownValues(0, 0, 0, 0);
-
         countdownText.setText("متوقف شد");
 
         Intent intent = new Intent(
@@ -474,41 +626,27 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void updatePhoneClock() {
-
-        Calendar calendar = Calendar.getInstance();
-
-        String time = String.format(
-                Locale.US,
-                "ساعت گوشی: %02d:%02d:%02d.%03d",
-                calendar.get(Calendar.HOUR_OF_DAY),
-                calendar.get(Calendar.MINUTE),
-                calendar.get(Calendar.SECOND),
-                calendar.get(Calendar.MILLISECOND)
-        );
-
-        phoneClock.setText(time);
-    }
-
     private void updateCountdown() {
 
         if (!countdownActive || scheduledStartTime == 0L) {
             return;
         }
 
-        long remaining =
-                scheduledStartTime - System.currentTimeMillis();
+        if (!timeSynced) {
+            countdownText.setText("در انتظار همگام‌سازی ساعت ایران");
+            return;
+        }
 
-        if (remaining <= 0) {
+        long remaining =
+                scheduledStartTime - getTrustedNow();
+
+        if (remaining <= 0L) {
 
             setCountdownValues(0, 0, 0, 0);
 
-            countdownText.setText(
-                    "زمان شروع فرا رسیده است."
-            );
+            countdownText.setText("زمان شروع فرا رسیده است.");
 
             countdownActive = false;
-
             return;
         }
 
@@ -524,9 +662,7 @@ public class MainActivity extends Activity {
                 milliseconds
         );
 
-        countdownText.setText(
-                "زمان باقی‌مانده تا شروع"
-        );
+        countdownText.setText("زمان باقی‌مانده تا شروع");
     }
 
     private void setCountdownValues(
@@ -595,13 +731,20 @@ public class MainActivity extends Activity {
         super.onResume();
 
         refreshReports();
-        lastReportRefreshTime = System.currentTimeMillis();
+        lastReportRefreshTime = SystemClock.elapsedRealtime();
+
+        if (!timeSynced) {
+            syncInternetTime();
+        }
     }
 
     @Override
     protected void onDestroy() {
 
         handler.removeCallbacks(clockRunnable);
+        handler.removeCallbacks(syncRunnable);
+
+        timeExecutor.shutdownNow();
 
         super.onDestroy();
     }
