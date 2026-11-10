@@ -85,6 +85,7 @@ public class FloatingService extends Service {
     private long cycleStartElapsedMs;
     private long cycleDeadlineElapsedMs;
     private long lastClickDispatchElapsedMs;
+    private long lastBatchCount;
     private long cycleStartWallMs;
 
     private long clickCount;
@@ -734,6 +735,7 @@ public class FloatingService extends Service {
 
         cycleIndex = 0;
         clickNumber = 0;
+        lastBatchCount = 0;
 
         showFloatingViews();
         updateTarget();
@@ -893,6 +895,7 @@ public class FloatingService extends Service {
         cycleActive = true;
 
         clickNumber = 0;
+        lastBatchCount = 0;
 
         cycleStartElapsedMs =
                 SystemClock.elapsedRealtime();
@@ -918,6 +921,10 @@ public class FloatingService extends Service {
         updateDisplay();
     }
 
+    /*
+     * زمان شروع دسته بعدی بر اساس تعداد کلیک‌های دسته قبلی
+     * محاسبه می‌شود، نه صرفاً یک فاصله کلیک.
+     */
     private void scheduleNextClick(long generation) {
 
         if (!isCurrentRun(generation) || !cycleActive) {
@@ -929,23 +936,49 @@ public class FloatingService extends Service {
             return;
         }
 
+        accessibility = getReadyAccessibility();
+
+        if (accessibility == null) {
+            waitForAccessibility(generation);
+            return;
+        }
+
+        long effectiveInterval =
+                Math.max(
+                        1L,
+                        accessibility.getEffectiveClickIntervalMs(
+                                clickIntervalMs
+                        )
+                );
+
         long targetElapsed;
 
-        if (clickNumber == 0) {
+        if (clickNumber == 0 || lastBatchCount <= 0) {
 
             targetElapsed = SystemClock.elapsedRealtime();
 
         } else {
 
-            if (lastClickDispatchElapsedMs
-                    > Long.MAX_VALUE - clickIntervalMs) {
+            long offset;
+
+            if (lastBatchCount >
+                    Long.MAX_VALUE / effectiveInterval) {
+
+                waitForCycleEnd(generation);
+                return;
+            }
+
+            offset = lastBatchCount * effectiveInterval;
+
+            if (lastClickDispatchElapsedMs >
+                    Long.MAX_VALUE - offset) {
 
                 waitForCycleEnd(generation);
                 return;
             }
 
             targetElapsed =
-                    lastClickDispatchElapsedMs + clickIntervalMs;
+                    lastClickDispatchElapsedMs + offset;
         }
 
         if (targetElapsed >= cycleDeadlineElapsedMs) {
@@ -966,6 +999,10 @@ public class FloatingService extends Service {
         );
     }
 
+    /*
+     * به‌جای ارسال یک کلیک در هر فراخوانی،
+     * چند کلیک در یک GestureDescription زمان‌بندی می‌شوند.
+     */
     private void dispatchNextClick(long generation) {
 
         if (!isCurrentRun(generation) || !cycleActive) {
@@ -1021,34 +1058,141 @@ public class FloatingService extends Service {
 
         final AutoClickService clickService = accessibility;
 
-        clickNumber++;
+        long remainingClicks = clickCount - clickNumber;
 
-        lastClickDispatchElapsedMs = now;
+        int maxBatchCount =
+                clickService.getMaxBatchClickCount(clickIntervalMs);
+
+        if (maxBatchCount <= 0) {
+
+            nextClickRunnable = () -> {
+
+                if (isCurrentRun(generation) && cycleActive) {
+                    dispatchNextClick(generation);
+                }
+            };
+
+            handler.postDelayed(
+                    nextClickRunnable,
+                    GESTURE_RETRY_MS
+            );
+
+            return;
+        }
+
+        long effectiveInterval =
+                Math.max(
+                        1L,
+                        clickService.getEffectiveClickIntervalMs(
+                                clickIntervalMs
+                        )
+                );
+
+        long remainingTime =
+                cycleDeadlineElapsedMs - now;
+
+        if (remainingTime <= 0) {
+            waitForCycleEnd(generation);
+            return;
+        }
+
+        /*
+         * تعداد شروع‌هایی که تا قبل از پایان چرخه
+         * فرصت اجرا دارند.
+         */
+        long clicksFittingInCycle =
+                ((remainingTime - 1L) / effectiveInterval) + 1L;
+
+        long requestedBatchCount = Math.min(
+                remainingClicks,
+                Math.min(
+                        (long) maxBatchCount,
+                        clicksFittingInCycle
+                )
+        );
+
+        if (requestedBatchCount <= 0) {
+            waitForCycleEnd(generation);
+            return;
+        }
+
+        final int batchCount = (int) requestedBatchCount;
 
         final long callbackGeneration = generation;
 
-        clickService.performClick(() -> {
+        /*
+         * شمارنده قبل از فراخوانی تغییر می‌کند تا
+         * در صورت callback هم‌زمان، وضعیت دوباره‌کاری نشود.
+         */
+        clickNumber += batchCount;
 
-            handler.post(() -> {
+        lastClickDispatchElapsedMs = now;
+        lastBatchCount = batchCount;
 
-                if (!isCurrentRun(callbackGeneration)
-                        || !cycleActive) {
-                    return;
+        int acceptedCount = clickService.performClickBatch(
+                batchCount,
+                clickIntervalMs,
+                () -> {
+
+                    handler.post(() -> {
+
+                        if (!isCurrentRun(callbackGeneration)
+                                || !cycleActive) {
+                            return;
+                        }
+
+                        if (SystemClock.elapsedRealtime()
+                                >= cycleDeadlineElapsedMs
+                                || clickNumber >= clickCount) {
+
+                            waitForCycleEnd(callbackGeneration);
+
+                        } else {
+
+                            scheduleNextClick(callbackGeneration);
+                        }
+
+                        updateDisplay();
+                    });
                 }
+        );
 
-                if (SystemClock.elapsedRealtime()
-                        >= cycleDeadlineElapsedMs) {
+        /*
+         * مقدار صفر یعنی دسته‌ای ارسال نشده است.
+         * در این حالت شمارنده را برمی‌گردانیم و دوباره تلاش می‌کنیم.
+         */
+        if (acceptedCount <= 0) {
 
-                    waitForCycleEnd(callbackGeneration);
+            clickNumber -= batchCount;
+            lastBatchCount = 0;
 
-                } else {
+            nextClickRunnable = () -> {
 
-                    scheduleNextClick(callbackGeneration);
+                if (isCurrentRun(generation) && cycleActive) {
+                    dispatchNextClick(generation);
                 }
+            };
 
-                updateDisplay();
-            });
-        });
+            handler.postDelayed(
+                    nextClickRunnable,
+                    GESTURE_RETRY_MS
+            );
+
+            updateDisplay();
+            return;
+        }
+
+        /*
+         * اگر سرویس تعداد کمتری از مقدار درخواستی را پذیرفته باشد،
+         * اختلاف به شمارنده کلیک‌های باقی‌مانده برمی‌گردد.
+         */
+        if (acceptedCount < batchCount) {
+
+            long difference = batchCount - acceptedCount;
+
+            clickNumber -= difference;
+            lastBatchCount = acceptedCount;
+        }
 
         updateDisplay();
     }
