@@ -165,12 +165,46 @@ public class MainActivity extends Activity {
             return;
         }
 
-        // جلوگیری از اجرای دوباره همین فرمان در صورت
-        // بازسازی یا بررسی مجدد Intent.
+        // ابتدا اطلاعات زمان انتخاب‌شده در پنل شناور را می‌خوانیم.
+        boolean floatingTimeConfigured =
+                intent.getBooleanExtra(
+                        "floating_start_time_configured",
+                        false
+                );
+
+        int floatingHour =
+                intent.getIntExtra(
+                        "floating_start_hour",
+                        0
+                );
+
+        int floatingMinute =
+                intent.getIntExtra(
+                        "floating_start_minute",
+                        0
+                );
+
+        int floatingSecond =
+                intent.getIntExtra(
+                        "floating_start_second",
+                        0
+                );
+
+        int floatingMillis =
+                intent.getIntExtra(
+                        "floating_start_millis",
+                        0
+                );
+
+        // جلوگیری از اجرای دوباره همین فرمان.
         intent.setAction(null);
 
         if (startButton == null
-                || clockSourceGroup == null) {
+                || clockSourceGroup == null
+                || startHourInput == null
+                || startMinuteInput == null
+                || startSecondInput == null
+                || startMillisInput == null) {
 
             Toast.makeText(
                     this,
@@ -181,6 +215,28 @@ public class MainActivity extends Activity {
             return;
         }
 
+        // اگر زمان از پنل شناور انتخاب شده باشد،
+        // آن را در ورودی‌های زمان صفحه اصلی قرار می‌دهیم.
+        if (floatingTimeConfigured) {
+
+            startHourInput.setText(
+                    String.valueOf(floatingHour)
+            );
+
+            startMinuteInput.setText(
+                    String.valueOf(floatingMinute)
+            );
+
+            startSecondInput.setText(
+                    String.valueOf(floatingSecond)
+            );
+
+            startMillisInput.setText(
+                    String.valueOf(floatingMillis)
+            );
+        }
+
+        // ادامه اجرا با همان تنظیمات و منطق قبلی.
         startClicking();
     }
 
@@ -964,84 +1020,4 @@ public class MainActivity extends Activity {
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(intent);
-        } else {
-            startService(intent);
         }
-
-        finish();
-    }
-
-    // ---------------------------------------------------------
-    // مجوزها
-    // ---------------------------------------------------------
-
-    private boolean isAccessibilityEnabled() {
-
-        String enabledServices = Secure.getString(
-                getContentResolver(),
-                Secure.ENABLED_ACCESSIBILITY_SERVICES
-        );
-
-        if (enabledServices == null) {
-            return false;
-        }
-
-        ComponentName serviceComponent =
-                new ComponentName(
-                        this,
-                        AutoClickService.class
-                );
-
-        String expected =
-                serviceComponent.flattenToString();
-
-        return enabledServices.toLowerCase(Locale.ROOT)
-                .contains(expected.toLowerCase(Locale.ROOT));
-    }
-
-    private void openOverlaySettings() {
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-
-            Intent intent = new Intent(
-                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                    Uri.parse("package:" + getPackageName())
-            );
-
-            startActivity(intent);
-        }
-    }
-
-    // ---------------------------------------------------------
-    // گزارش چرخه‌ها
-    // ---------------------------------------------------------
-
-    private void refreshReports() {
-
-        if (reportSummary == null) {
-            return;
-        }
-
-        reportSummary.setText(
-                CycleReportStore.getReportSummary(this)
-        );
-    }
-
-    @Override
-    protected void onResume() {
-        super.onResume();
-
-        refreshReports();
-        updateClocks();
-    }
-
-    @Override
-    protected void onDestroy() {
-
-        handler.removeCallbacks(clockRunnable);
-
-        networkExecutor.shutdownNow();
-
-        super.onDestroy();
-    }
-}
