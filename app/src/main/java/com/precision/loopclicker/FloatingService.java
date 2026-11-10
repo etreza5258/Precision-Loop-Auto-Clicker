@@ -1,6 +1,7 @@
 
 package com.precision.loopclicker;
 
+import android.app.Dialog;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -21,11 +22,15 @@ import android.provider.Settings;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewGroup;
+import android.view.Window;
 import android.view.WindowManager;
 import android.widget.LinearLayout;
+import android.widget.NumberPicker;
 import android.widget.TextView;
 
 import java.text.SimpleDateFormat;
+import java.util.Calendar;
 import java.util.Date;
 import java.util.Locale;
 import java.util.TimeZone;
@@ -44,7 +49,6 @@ public class FloatingService extends Service {
     public static final String SHOW_PANEL =
             "com.precision.loopclicker.SHOW_PANEL";
 
-    // فرمان شروع از پنل شناور؛ در MainActivity مدیریت می‌شود.
     public static final String ACTION_START_FROM_FLOATING =
             "com.precision.loopclicker.ACTION_START_FROM_FLOATING";
 
@@ -136,6 +140,17 @@ public class FloatingService extends Service {
 
     private int markerStartX;
     private int markerStartY;
+
+    // ---------------------------------------------------------
+    // Floating start-time settings
+    // ---------------------------------------------------------
+
+    private boolean floatingTimeConfigured;
+
+    private int floatingStartHour;
+    private int floatingStartMinute;
+    private int floatingStartSecond;
+    private int floatingStartMillis;
 
     public static FloatingService getInstance() {
         return instance;
@@ -343,8 +358,6 @@ public class FloatingService extends Service {
                 )
         );
 
-        // بخش خالی پنل برای جابه‌جایی استفاده می‌شود.
-        // لمس دکمه‌ها و بخش شمارش معکوس به عملکرد خودشان می‌رسد.
         panel.setClickable(true);
 
         createCountdownSection();
@@ -374,15 +387,21 @@ public class FloatingService extends Service {
                         Color.rgb(75, 75, 85)
                 );
 
+        TextView timeButton =
+                createTimePickerButton();
+
         startButton.setOnClickListener(v -> openMainForStart());
 
         stopButton.setOnClickListener(v -> stopLoop());
 
         shutdownButton.setOnClickListener(v -> shutdownService());
 
+        timeButton.setOnClickListener(v -> showStartTimePicker());
+
         buttonsRow.addView(startButton);
         buttonsRow.addView(stopButton);
         buttonsRow.addView(shutdownButton);
+        buttonsRow.addView(timeButton);
 
         panel.addView(buttonsRow);
 
@@ -469,9 +488,9 @@ public class FloatingService extends Service {
         button.setGravity(Gravity.CENTER);
 
         button.setPadding(
-                dp(7),
                 dp(5),
-                dp(7),
+                dp(5),
+                dp(5),
                 dp(5)
         );
 
@@ -502,12 +521,371 @@ public class FloatingService extends Service {
         return button;
     }
 
+    private TextView createTimePickerButton() {
+
+        TextView button = new TextView(this);
+
+        button.setText("⚙");
+        button.setTextColor(Color.WHITE);
+        button.setTextSize(17);
+        button.setTypeface(null, Typeface.BOLD);
+        button.setGravity(Gravity.CENTER);
+
+        button.setBackground(
+                makeBackground(
+                        Color.rgb(55, 85, 110),
+                        dp(7)
+                )
+        );
+
+        LinearLayout.LayoutParams params =
+                new LinearLayout.LayoutParams(
+                        dp(34),
+                        dp(32)
+                );
+
+        params.setMargins(
+                dp(2),
+                0,
+                dp(2),
+                0
+        );
+
+        button.setLayoutParams(params);
+        button.setClickable(true);
+
+        return button;
+    }
+
+    // ---------------------------------------------------------
+    // Floating time picker
+    // ---------------------------------------------------------
+
+    private void showStartTimePicker() {
+
+        if (!Settings.canDrawOverlays(this)) {
+            updateCountdownStatus("مجوز نمایش روی برنامه‌ها فعال نیست");
+            return;
+        }
+
+        if (!floatingTimeConfigured) {
+
+            Calendar calendar = Calendar.getInstance(
+                    TimeZone.getTimeZone("Asia/Tehran")
+            );
+
+            floatingStartHour =
+                    calendar.get(Calendar.HOUR_OF_DAY);
+
+            floatingStartMinute =
+                    calendar.get(Calendar.MINUTE);
+
+            floatingStartSecond =
+                    calendar.get(Calendar.SECOND);
+
+            floatingStartMillis =
+                    calendar.get(Calendar.MILLISECOND);
+
+        }
+
+        Dialog dialog = new Dialog(
+                this,
+                android.R.style.Theme_Material_Light_Dialog_Alert
+        );
+
+        LinearLayout root = new LinearLayout(this);
+
+        root.setOrientation(LinearLayout.VERTICAL);
+
+        root.setPadding(
+                dp(12),
+                dp(12),
+                dp(12),
+                dp(10)
+        );
+
+        root.setBackground(
+                makeBackground(
+                        Color.rgb(24, 36, 49),
+                        dp(12)
+                )
+        );
+
+        TextView title = new TextView(this);
+
+        title.setText("تنظیم زمان شروع");
+        title.setTextColor(TITLE_COLOR);
+        title.setTextSize(16);
+        title.setTypeface(null, Typeface.BOLD);
+        title.setGravity(Gravity.CENTER);
+
+        title.setPadding(0, 0, 0, dp(8));
+
+        root.addView(title);
+
+        LinearLayout pickersRow =
+                new LinearLayout(this);
+
+        pickersRow.setOrientation(LinearLayout.HORIZONTAL);
+        pickersRow.setGravity(Gravity.CENTER);
+
+        NumberPicker hourPicker =
+                createNumberPicker(0, 23, floatingStartHour);
+
+        NumberPicker minutePicker =
+                createNumberPicker(0, 59, floatingStartMinute);
+
+        NumberPicker secondPicker =
+                createNumberPicker(0, 59, floatingStartSecond);
+
+        NumberPicker millisPicker =
+                createNumberPicker(0, 999, floatingStartMillis);
+
+        millisPicker.setFormatter(value ->
+                String.format(Locale.US, "%03d", value)
+        );
+
+        addPickerColumn(pickersRow, "ساعت", hourPicker);
+        addPickerColumn(pickersRow, "دقیقه", minutePicker);
+        addPickerColumn(pickersRow, "ثانیه", secondPicker);
+        addPickerColumn(pickersRow, "میلی‌ثانیه", millisPicker);
+
+        root.addView(pickersRow);
+
+        LinearLayout buttons =
+                new LinearLayout(this);
+
+        buttons.setOrientation(LinearLayout.HORIZONTAL);
+        buttons.setGravity(Gravity.CENTER);
+        buttons.setPadding(0, dp(8), 0, 0);
+
+        TextView cancelButton =
+                createDialogButton(
+                        "انصراف",
+                        Color.rgb(90, 90, 100)
+                );
+
+        TextView confirmButton =
+                createDialogButton(
+                        "تأیید",
+                        Color.rgb(20, 125, 75)
+                );
+
+        buttons.addView(cancelButton);
+        buttons.addView(confirmButton);
+
+        root.addView(buttons);
+
+        dialog.setContentView(root);
+        dialog.setCancelable(true);
+
+        Window window = dialog.getWindow();
+
+        if (window != null) {
+
+            window.setType(getOverlayType());
+
+            window.setBackgroundDrawableResource(
+                    android.R.color.transparent
+            );
+
+            window.addFlags(
+                    WindowManager.LayoutParams.FLAG_DIM_BEHIND
+            );
+
+            WindowManager.LayoutParams params =
+                    window.getAttributes();
+
+            params.width = dp(340);
+            params.height =
+                    WindowManager.LayoutParams.WRAP_CONTENT;
+
+            params.gravity = Gravity.CENTER;
+            params.dimAmount = 0.35f;
+
+            window.setAttributes(params);
+        }
+
+        cancelButton.setOnClickListener(v -> dialog.dismiss());
+
+        confirmButton.setOnClickListener(v -> {
+
+            floatingStartHour = hourPicker.getValue();
+            floatingStartMinute = minutePicker.getValue();
+            floatingStartSecond = secondPicker.getValue();
+            floatingStartMillis = millisPicker.getValue();
+
+            floatingTimeConfigured = true;
+
+            updateCountdownDisplay();
+
+            updateCountdownStatus("زمان شروع انتخاب شد");
+
+            dialog.dismiss();
+        });
+
+        try {
+
+            dialog.show();
+
+            if (window != null) {
+
+                window.setLayout(
+                        dp(340),
+                        WindowManager.LayoutParams.WRAP_CONTENT
+                );
+            }
+
+        } catch (Exception e) {
+
+            updateCountdownStatus("باز کردن انتخاب‌گر زمان ناموفق بود");
+        }
+    }
+
+    private NumberPicker createNumberPicker(
+            int min,
+            int max,
+            int value
+    ) {
+
+        NumberPicker picker = new NumberPicker(this);
+
+        picker.setMinValue(min);
+        picker.setMaxValue(max);
+        picker.setValue(Math.max(min, Math.min(max, value)));
+        picker.setWrapSelectorWheel(true);
+
+        picker.setDescendantFocusability(
+                NumberPicker.FOCUS_AFTER_DESCENDANTS
+        );
+
+        picker.setLayoutParams(
+                new LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        dp(105)
+                )
+        );
+
+        return picker;
+    }
+
+    private void addPickerColumn(
+            LinearLayout parent,
+            String label,
+            NumberPicker picker
+    ) {
+
+        LinearLayout column = new LinearLayout(this);
+
+        column.setOrientation(LinearLayout.VERTICAL);
+        column.setGravity(Gravity.CENTER);
+
+        TextView title = new TextView(this);
+
+        title.setText(label);
+        title.setTextColor(Color.WHITE);
+        title.setTextSize(10);
+        title.setGravity(Gravity.CENTER);
+
+        column.addView(title);
+        column.addView(picker);
+
+        LinearLayout.LayoutParams params =
+                new LinearLayout.LayoutParams(
+                        0,
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        1f
+                );
+
+        column.setLayoutParams(params);
+
+        parent.addView(column);
+    }
+
+    private TextView createDialogButton(
+            String text,
+            int color
+    ) {
+
+        TextView button = new TextView(this);
+
+        button.setText(text);
+        button.setTextColor(Color.WHITE);
+        button.setTextSize(12);
+        button.setTypeface(null, Typeface.BOLD);
+        button.setGravity(Gravity.CENTER);
+
+        button.setPadding(
+                dp(18),
+                dp(8),
+                dp(18),
+                dp(8)
+        );
+
+        button.setBackground(
+                makeBackground(color, dp(7))
+        );
+
+        LinearLayout.LayoutParams params =
+                new LinearLayout.LayoutParams(
+                        0,
+                        dp(38),
+                        1f
+                );
+
+        params.setMargins(dp(4), 0, dp(4), 0);
+
+        button.setLayoutParams(params);
+
+        return button;
+    }
+
+    private String formatFloatingStartTime() {
+
+        return String.format(
+                Locale.US,
+                "%02d:%02d:%02d.%03d",
+                floatingStartHour,
+                floatingStartMinute,
+                floatingStartSecond,
+                floatingStartMillis
+        );
+    }
+
     private void openMainForStart() {
 
         Intent intent =
                 new Intent(this, MainActivity.class);
 
         intent.setAction(ACTION_START_FROM_FLOATING);
+
+        if (floatingTimeConfigured) {
+
+            intent.putExtra(
+                    "floating_start_time_configured",
+                    true
+            );
+
+            intent.putExtra(
+                    "floating_start_hour",
+                    floatingStartHour
+            );
+
+            intent.putExtra(
+                    "floating_start_minute",
+                    floatingStartMinute
+            );
+
+            intent.putExtra(
+                    "floating_start_second",
+                    floatingStartSecond
+            );
+
+            intent.putExtra(
+                    "floating_start_millis",
+                    floatingStartMillis
+            );
+        }
 
         intent.addFlags(
                 Intent.FLAG_ACTIVITY_NEW_TASK
@@ -591,12 +969,13 @@ public class FloatingService extends Service {
         selectedTimeView = new TextView(this);
 
         selectedTimeView.setText(
-                "شروع: --:--:--.---"
+                "ساعت: --:--:--.---"
         );
 
         selectedTimeView.setTextColor(Color.WHITE);
-        selectedTimeView.setTextSize(10);
+        selectedTimeView.setTextSize(9);
         selectedTimeView.setGravity(Gravity.CENTER);
+        selectedTimeView.setSingleLine(true);
         selectedTimeView.setPadding(
                 0,
                 dp(3),
@@ -734,21 +1113,26 @@ public class FloatingService extends Service {
 
         if (selectedTimeView != null) {
 
+            String currentTime = format.format(
+                    new Date(System.currentTimeMillis())
+            );
+
+            String displayText = "ساعت: " + currentTime;
+
             if (selectedStartEpochMs > 0) {
 
-                selectedTimeView.setText(
-                        "شروع: "
-                                + format.format(
-                                new Date(selectedStartEpochMs)
-                        )
+                displayText += " | شروع: "
+                        + format.format(
+                        new Date(selectedStartEpochMs)
                 );
 
-            } else {
+            } else if (floatingTimeConfigured) {
 
-                selectedTimeView.setText(
-                        "شروع: --:--:--.---"
-                );
+                displayText += " | شروع: "
+                        + formatFloatingStartTime();
             }
+
+            selectedTimeView.setText(displayText);
         }
 
         long remaining = 0;
@@ -1146,7 +1530,6 @@ public class FloatingService extends Service {
         running = true;
         cycleActive = false;
 
-        // هنگام اجرای برنامه‌ریزی‌شده، نشانگر قابل لمس نیست.
         setMarkerTouchable(false);
 
         cycleIndex = 0;
@@ -1730,7 +2113,6 @@ public class FloatingService extends Service {
 
         removeScheduledCallbacks();
 
-        // پس از توقف، نشانگر دوباره قابل جابه‌جایی می‌شود.
         setMarkerTouchable(true);
 
         updateCountdownStatus("متوقف شد");
