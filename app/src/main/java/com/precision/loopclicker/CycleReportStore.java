@@ -29,7 +29,6 @@ public final class CycleReportStore {
     private CycleReportStore() {
     }
 
-    // سازگار با فراخوانی فعلی FloatingService
     public static synchronized void addReport(
             Context context,
             long cycleNumber,
@@ -85,7 +84,6 @@ public final class CycleReportStore {
 
         JSONArray updatedReports = new JSONArray();
 
-        // جدیدترین گزارش در ابتدای فهرست
         updatedReports.put(report);
 
         int oldCount = Math.min(
@@ -94,6 +92,7 @@ public final class CycleReportStore {
         );
 
         for (int i = 0; i < oldCount; i++) {
+
             JSONObject oldReport =
                     reports.optJSONObject(i);
 
@@ -110,7 +109,6 @@ public final class CycleReportStore {
                 .commit();
     }
 
-    // خلاصه گزارش‌ها برای صفحه اصلی
     public static synchronized String getReportSummary(
             Context context
     ) {
@@ -140,6 +138,23 @@ public final class CycleReportStore {
         long failed = latest.optLong("failed", 0L);
         long duration = latest.optLong("duration", 0L);
 
+        long startEpoch =
+                latest.optLong("start_epoch", 0L);
+
+        long endEpoch =
+                latest.optLong("end_epoch", 0L);
+
+        String start = latest.optString("start", "-");
+        String end = latest.optString("end", "-");
+
+        if (startEpoch > 0) {
+            start = formatTime(startEpoch);
+        }
+
+        if (endEpoch > 0) {
+            end = formatTime(endEpoch);
+        }
+
         StringBuilder summary = new StringBuilder();
 
         summary.append("تعداد گزارش‌های ذخیره‌شده: ")
@@ -150,6 +165,14 @@ public final class CycleReportStore {
 
         summary.append("آخرین چرخه تکمیل‌شده: ")
                 .append(cycle)
+                .append("\n");
+
+        summary.append("زمان شروع: ")
+                .append(start)
+                .append("\n");
+
+        summary.append("زمان پایان: ")
+                .append(end)
                 .append("\n");
 
         summary.append("کلیک موفق: ")
@@ -167,7 +190,6 @@ public final class CycleReportStore {
         return summary.toString();
     }
 
-    // دریافت فهرست گزارش‌ها
     public static synchronized List<String> getReports(
             Context context
     ) {
@@ -278,7 +300,6 @@ public final class CycleReportStore {
         return result;
     }
 
-    // پاک‌کردن تمام گزارش‌ها
     public static synchronized void clearReports(
             Context context
     ) {
