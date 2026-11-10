@@ -136,6 +136,52 @@ public class MainActivity extends Activity {
         syncInternetTime();
 
         handler.post(clockRunnable);
+
+        // اگر صفحه از طریق دکمه شروع پنل شناور باز شده باشد،
+        // پس از آماده‌شدن تمام Viewها فرمان اجرا می‌شود.
+        handleFloatingStartIntent(getIntent());
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+
+        setIntent(intent);
+
+        // وقتی Activity از قبل باز است،
+        // فرمان جدید از این مسیر دریافت می‌شود.
+        handleFloatingStartIntent(intent);
+    }
+
+    private void handleFloatingStartIntent(Intent intent) {
+
+        if (intent == null) {
+            return;
+        }
+
+        if (!FloatingService.ACTION_START_FROM_FLOATING.equals(
+                intent.getAction()
+        )) {
+            return;
+        }
+
+        // جلوگیری از اجرای دوباره همین فرمان در صورت
+        // بازسازی یا بررسی مجدد Intent.
+        intent.setAction(null);
+
+        if (startButton == null
+                || clockSourceGroup == null) {
+
+            Toast.makeText(
+                    this,
+                    "صفحه اصلی هنوز آماده نیست.",
+                    Toast.LENGTH_SHORT
+            ).show();
+
+            return;
+        }
+
+        startClicking();
     }
 
     private void bindViews() {
@@ -703,7 +749,6 @@ public class MainActivity extends Activity {
             Intent serviceIntent =
                     new Intent(this, FloatingService.class);
 
-            // استفاده از actionهای دقیق تعریف‌شده در سرویس
             serviceIntent.setAction(FloatingService.ACTION_START);
 
             serviceIntent.putExtra(
@@ -716,7 +761,6 @@ public class MainActivity extends Activity {
                     startDelay
             );
 
-            // نام کلیدها باید دقیقاً با FloatingService هماهنگ باشند.
             serviceIntent.putExtra(
                     "cycle_duration_ms",
                     cycleDuration
