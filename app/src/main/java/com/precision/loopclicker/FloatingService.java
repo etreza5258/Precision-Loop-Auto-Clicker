@@ -22,7 +22,6 @@ import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
-import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
@@ -44,6 +43,10 @@ public class FloatingService extends Service {
 
     public static final String SHOW_PANEL =
             "com.precision.loopclicker.SHOW_PANEL";
+
+    // فرمان شروع از پنل شناور؛ در MainActivity مدیریت می‌شود.
+    public static final String ACTION_START_FROM_FLOATING =
+            "com.precision.loopclicker.ACTION_START_FROM_FLOATING";
 
     private static final String CHANNEL_ID =
             "precision_loop_channel";
@@ -72,9 +75,6 @@ public class FloatingService extends Service {
 
     private LinearLayout panel;
 
-    private TextView titleView;
-    private TextView statusView;
-    private TextView counterView;
     private TextView markerView;
 
     private TextView selectedTimeView;
@@ -191,16 +191,7 @@ public class FloatingService extends Service {
 
         } else if (ACTION_SHUTDOWN.equals(action)) {
 
-            stopLoop();
-            removeFloatingViews();
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                stopForeground(STOP_FOREGROUND_REMOVE);
-            } else {
-                stopForeground(true);
-            }
-
-            stopSelf();
+            shutdownService();
 
         } else if (SHOW_PANEL.equals(action)) {
 
@@ -300,7 +291,6 @@ public class FloatingService extends Service {
     private void createFloatingViews() {
 
         if (!Settings.canDrawOverlays(this)) {
-            updateStatus("مجوز نمایش روی برنامه‌ها فعال نیست");
             return;
         }
 
@@ -320,7 +310,6 @@ public class FloatingService extends Service {
         showFloatingViews();
         updateTarget();
 
-        // اگر اجرا از قبل فعال باشد، نشانگر نباید لمس دریافت کند.
         if (running) {
             setMarkerTouchable(false);
         }
@@ -341,82 +330,63 @@ public class FloatingService extends Service {
 
         panel.setOrientation(LinearLayout.VERTICAL);
         panel.setPadding(
-                dp(12),
-                dp(10),
-                dp(12),
-                dp(10)
+                dp(7),
+                dp(6),
+                dp(7),
+                dp(6)
         );
 
         panel.setBackground(
                 makeBackground(
                         PANEL_BACKGROUND,
-                        dp(14)
+                        dp(11)
                 )
         );
 
-        titleView = new TextView(this);
-
-        titleView.setText("Precision Loop | جابه‌جایی پنل");
-        titleView.setTextColor(Color.WHITE);
-        titleView.setTextSize(14);
-        titleView.setTypeface(null, Typeface.BOLD);
-
-        titleView.setPadding(
-                dp(4),
-                dp(5),
-                dp(4),
-                dp(10)
-        );
-
-        statusView = new TextView(this);
-
-        statusView.setText("آماده");
-        statusView.setTextColor(Color.rgb(120, 220, 160));
-        statusView.setTextSize(12);
-
-        statusView.setPadding(
-                dp(4),
-                dp(4),
-                dp(4),
-                dp(4)
-        );
-
-        counterView = new TextView(this);
-
-        counterView.setText("چرخه: 0 | کلیک: 0");
-        counterView.setTextColor(Color.WHITE);
-        counterView.setTextSize(12);
-
-        counterView.setPadding(
-                dp(4),
-                dp(4),
-                dp(4),
-                dp(8)
-        );
-
-        Button stopButton = new Button(this);
-
-        stopButton.setText("توقف کلیک‌ها");
-        stopButton.setOnClickListener(v -> stopLoop());
-
-        Button closeButton = new Button(this);
-
-        closeButton.setText("بستن پنل و نشانگر");
-
-        closeButton.setOnClickListener(
-                v -> removeFloatingViews()
-        );
-
-        panel.addView(titleView);
+        // بخش خالی پنل برای جابه‌جایی استفاده می‌شود.
+        // لمس دکمه‌ها و بخش شمارش معکوس به عملکرد خودشان می‌رسد.
+        panel.setClickable(true);
 
         createCountdownSection();
 
-        panel.addView(statusView);
-        panel.addView(counterView);
-        panel.addView(stopButton);
-        panel.addView(closeButton);
+        LinearLayout buttonsRow =
+                new LinearLayout(this);
 
-        titleView.setOnTouchListener((v, event) -> {
+        buttonsRow.setOrientation(LinearLayout.HORIZONTAL);
+        buttonsRow.setGravity(Gravity.CENTER);
+        buttonsRow.setPadding(0, dp(3), 0, 0);
+
+        TextView startButton =
+                createSmallPanelButton(
+                        "شروع",
+                        Color.rgb(20, 125, 75)
+                );
+
+        TextView stopButton =
+                createSmallPanelButton(
+                        "توقف",
+                        Color.rgb(170, 65, 45)
+                );
+
+        TextView shutdownButton =
+                createSmallPanelButton(
+                        "خاموش",
+                        Color.rgb(75, 75, 85)
+                );
+
+        startButton.setOnClickListener(v -> openMainForStart());
+
+        stopButton.setOnClickListener(v -> stopLoop());
+
+        shutdownButton.setOnClickListener(v -> shutdownService());
+
+        buttonsRow.addView(startButton);
+        buttonsRow.addView(stopButton);
+        buttonsRow.addView(shutdownButton);
+
+        panel.addView(buttonsRow);
+
+        panel.setOnTouchListener((v, event) -> {
 
             if (panelParams == null) {
                 return false;
@@ -451,6 +421,7 @@ public class FloatingService extends Service {
                     return true;
 
                 case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
                     return true;
             }
 
@@ -484,6 +455,89 @@ public class FloatingService extends Service {
         }
     }
 
+    private TextView createSmallPanelButton(
+            String text,
+            int backgroundColor
+    ) {
+
+        TextView button = new TextView(this);
+
+        button.setText(text);
+        button.setTextColor(Color.WHITE);
+        button.setTextSize(11);
+        button.setTypeface(null, Typeface.BOLD);
+        button.setGravity(Gravity.CENTER);
+
+        button.setPadding(
+                dp(7),
+                dp(5),
+                dp(7),
+                dp(5)
+        );
+
+        button.setBackground(
+                makeBackground(
+                        backgroundColor,
+                        dp(7)
+                )
+        );
+
+        LinearLayout.LayoutParams params =
+                new LinearLayout.LayoutParams(
+                        0,
+                        dp(32),
+                        1f
+                );
+
+        params.setMargins(
+                dp(2),
+                0,
+                dp(2),
+                0
+        );
+
+        button.setLayoutParams(params);
+        button.setClickable(true);
+
+        return button;
+    }
+
+    private void openMainForStart() {
+
+        Intent intent =
+                new Intent(this, MainActivity.class);
+
+        intent.setAction(ACTION_START_FROM_FLOATING);
+
+        intent.addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK
+                        | Intent.FLAG_ACTIVITY_CLEAR_TOP
+                        | Intent.FLAG_ACTIVITY_SINGLE_TOP
+        );
+
+        try {
+
+            startActivity(intent);
+
+        } catch (Exception e) {
+            updateCountdownStatus("باز کردن صفحه اصلی ناموفق بود");
+        }
+    }
+
+    private void shutdownService() {
+
+        stopLoop();
+        removeFloatingViews();
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(STOP_FOREGROUND_REMOVE);
+        } else {
+            stopForeground(true);
+        }
+
+        stopSelf();
+    }
+
     // ---------------------------------------------------------
     // Countdown UI
     // ---------------------------------------------------------
@@ -498,16 +552,16 @@ public class FloatingService extends Service {
         );
 
         countdownContainer.setPadding(
-                dp(9),
-                dp(9),
-                dp(9),
-                dp(9)
+                dp(6),
+                dp(5),
+                dp(6),
+                dp(5)
         );
 
         countdownContainer.setBackground(
                 makeBackground(
                         Color.rgb(13, 25, 36),
-                        dp(10)
+                        dp(8)
                 )
         );
 
@@ -519,9 +573,9 @@ public class FloatingService extends Service {
 
         containerParams.setMargins(
                 0,
-                dp(4),
                 0,
-                dp(9)
+                0,
+                dp(3)
         );
 
         countdownContainer.setLayoutParams(containerParams);
@@ -530,24 +584,24 @@ public class FloatingService extends Service {
 
         heading.setText("شمارش معکوس");
         heading.setTextColor(TITLE_COLOR);
-        heading.setTextSize(16);
+        heading.setTextSize(12);
         heading.setTypeface(null, Typeface.BOLD);
         heading.setGravity(Gravity.CENTER);
 
         selectedTimeView = new TextView(this);
 
         selectedTimeView.setText(
-                "زمان انتخابی شروع: --:--:--.---"
+                "شروع: --:--:--.---"
         );
 
         selectedTimeView.setTextColor(Color.WHITE);
-        selectedTimeView.setTextSize(12);
+        selectedTimeView.setTextSize(10);
         selectedTimeView.setGravity(Gravity.CENTER);
         selectedTimeView.setPadding(
                 0,
-                dp(7),
+                dp(3),
                 0,
-                dp(5)
+                dp(2)
         );
 
         countdownStatusView = new TextView(this);
@@ -557,14 +611,14 @@ public class FloatingService extends Service {
                 Color.rgb(180, 190, 205)
         );
 
-        countdownStatusView.setTextSize(11);
+        countdownStatusView.setTextSize(9);
         countdownStatusView.setGravity(Gravity.CENTER);
 
         countdownStatusView.setPadding(
                 0,
-                dp(3),
+                dp(1),
                 0,
-                dp(7)
+                dp(3)
         );
 
         LinearLayout digits =
@@ -581,7 +635,7 @@ public class FloatingService extends Service {
         countdownSecond = createCountdownDigit("00");
         countdownMillis = createCountdownDigit("000");
 
-        countdownMillis.setTextSize(19);
+        countdownMillis.setTextSize(15);
 
         digits.addView(countdownHour);
         digits.addView(createCountdownSeparator(":"));
@@ -608,21 +662,21 @@ public class FloatingService extends Service {
 
         tv.setText(value);
         tv.setTextColor(ACCENT_COLOR);
-        tv.setTextSize(22);
+        tv.setTextSize(17);
         tv.setTypeface(null, Typeface.BOLD);
         tv.setGravity(Gravity.CENTER);
 
         tv.setBackground(
                 makeBackground(
                         Color.rgb(25, 42, 55),
-                        dp(7)
+                        dp(5)
                 )
         );
 
         LinearLayout.LayoutParams params =
                 new LinearLayout.LayoutParams(
                         0,
-                        dp(43),
+                        dp(32),
                         value.length() == 3 ? 1.35f : 1f
                 );
 
@@ -644,14 +698,14 @@ public class FloatingService extends Service {
 
         tv.setText(value);
         tv.setTextColor(Color.WHITE);
-        tv.setTextSize(19);
+        tv.setTextSize(14);
         tv.setTypeface(null, Typeface.BOLD);
         tv.setGravity(Gravity.CENTER);
 
         LinearLayout.LayoutParams params =
                 new LinearLayout.LayoutParams(
-                        dp(12),
-                        dp(43)
+                        dp(9),
+                        dp(32)
                 );
 
         tv.setLayoutParams(params);
@@ -683,7 +737,7 @@ public class FloatingService extends Service {
             if (selectedStartEpochMs > 0) {
 
                 selectedTimeView.setText(
-                        "زمان انتخابی شروع: "
+                        "شروع: "
                                 + format.format(
                                 new Date(selectedStartEpochMs)
                         )
@@ -692,7 +746,7 @@ public class FloatingService extends Service {
             } else {
 
                 selectedTimeView.setText(
-                        "زمان انتخابی شروع: --:--:--.---"
+                        "شروع: --:--:--.---"
                 );
             }
         }
@@ -730,25 +784,26 @@ public class FloatingService extends Service {
 
         if (!running) {
 
-            countdownStatusView.setText("آماده شروع");
+            updateCountdownStatus("آماده شروع");
 
         } else if (cycleActive) {
 
-            countdownStatusView.setText(
-                    "چرخه در حال اجرا است"
-            );
+            updateCountdownStatus("چرخه در حال اجرا است");
 
         } else if (remaining == 0) {
 
-            countdownStatusView.setText(
-                    "در حال شروع کلیک‌ها..."
-            );
+            updateCountdownStatus("در حال شروع کلیک‌ها...");
 
         } else {
 
-            countdownStatusView.setText(
-                    "زمان باقی‌مانده تا شروع"
-            );
+            updateCountdownStatus("زمان باقی‌مانده تا شروع");
+        }
+    }
+
+    private void updateCountdownStatus(String message) {
+
+        if (countdownStatusView != null) {
+            countdownStatusView.setText(message);
         }
     }
 
@@ -844,7 +899,7 @@ public class FloatingService extends Service {
     }
 
     // ---------------------------------------------------------
-    // کنترل دریافت لمس نشانگر
+    // Marker touch control
     // ---------------------------------------------------------
 
     private void setMarkerTouchable(boolean touchable) {
@@ -1014,7 +1069,7 @@ public class FloatingService extends Service {
         stopLoop();
 
         if (config == null) {
-            updateStatus("تنظیمات شروع دریافت نشد");
+            updateCountdownStatus("تنظیمات شروع دریافت نشد");
             return;
         }
 
@@ -1035,7 +1090,7 @@ public class FloatingService extends Service {
                 || clickIntervalMs < 0
                 || clickCount <= 0) {
 
-            updateStatus("مقادیر تنظیمات معتبر نیستند");
+            updateCountdownStatus("مقادیر تنظیمات معتبر نیستند");
             return;
         }
 
@@ -1059,7 +1114,7 @@ public class FloatingService extends Service {
         }
 
         if (delayMs < 0) {
-            updateStatus("زمان شروع گذشته است");
+            updateCountdownStatus("زمان شروع گذشته است");
             return;
         }
 
@@ -1080,7 +1135,7 @@ public class FloatingService extends Service {
         long nowElapsed = SystemClock.elapsedRealtime();
 
         if (delayMs > Long.MAX_VALUE - nowElapsed) {
-            updateStatus("زمان شروع بیش از حد بزرگ است");
+            updateCountdownStatus("زمان شروع بیش از حد بزرگ است");
             return;
         }
 
@@ -1091,8 +1146,7 @@ public class FloatingService extends Service {
         running = true;
         cycleActive = false;
 
-        // نشانگر در تمام مدت اجرای برنامه‌ریزی‌شده
-        // دیده می‌شود اما لمس دریافت نمی‌کند.
+        // هنگام اجرای برنامه‌ریزی‌شده، نشانگر قابل لمس نیست.
         setMarkerTouchable(false);
 
         cycleIndex = 0;
@@ -1119,7 +1173,7 @@ public class FloatingService extends Service {
                 anchorElapsedMs
         );
 
-        updateStatus(
+        updateCountdownStatus(
                 delayMs == 0
                         ? "در حال شروع"
                         : "در انتظار زمان شروع"
@@ -1195,7 +1249,7 @@ public class FloatingService extends Service {
 
             accessibility.setTarget(targetX, targetY);
 
-            updateStatus("سرویس کلیک متصل شد");
+            updateCountdownStatus("سرویس کلیک متصل شد");
 
             if (!cycleActive) {
                 startCycle(generation);
@@ -1206,7 +1260,9 @@ public class FloatingService extends Service {
             return;
         }
 
-        updateStatus("منتظر فعال شدن سرویس دسترسی‌پذیری...");
+        updateCountdownStatus(
+                "منتظر فعال شدن سرویس دسترسی‌پذیری..."
+        );
 
         cycleStartRunnable = () -> {
 
@@ -1368,7 +1424,9 @@ public class FloatingService extends Service {
 
         if (accessibility == null) {
 
-            updateStatus("اتصال سرویس کلیک قطع شده؛ تلاش مجدد");
+            updateCountdownStatus(
+                    "اتصال سرویس کلیک قطع شده؛ تلاش مجدد"
+            );
 
             nextClickRunnable = () -> {
 
@@ -1639,7 +1697,7 @@ public class FloatingService extends Service {
         if (nextTarget == Long.MAX_VALUE) {
 
             stopLoop();
-            updateStatus("محدودیت زمان‌بندی چرخه");
+            updateCountdownStatus("محدودیت زمان‌بندی چرخه");
 
             return;
         }
@@ -1660,7 +1718,7 @@ public class FloatingService extends Service {
     }
 
     // ---------------------------------------------------------
-    // Stop and status
+    // Stop and display
     // ---------------------------------------------------------
 
     private void stopLoop() {
@@ -1675,7 +1733,7 @@ public class FloatingService extends Service {
         // پس از توقف، نشانگر دوباره قابل جابه‌جایی می‌شود.
         setMarkerTouchable(true);
 
-        updateStatus("متوقف شد");
+        updateCountdownStatus("متوقف شد");
         updateDisplay();
     }
 
@@ -1700,79 +1758,9 @@ public class FloatingService extends Service {
         }
     }
 
-    private void updateStatus(String message) {
-
-        if (statusView != null) {
-            statusView.setText(message);
-        }
-    }
-
     private void updateDisplay() {
 
         updateCountdownDisplay();
-
-        if (statusView == null || counterView == null) {
-            return;
-        }
-
-        AutoClickService service = getReadyAccessibility();
-
-        long successes = service != null
-                ? service.getSuccessfulClicks()
-                : 0;
-
-        long failures = service != null
-                ? service.getFailedClicks()
-                : 0;
-
-        if (!running) {
-
-            counterView.setText(
-                    "چرخه: " + cycleIndex
-                            + " | تلاش: " + clickNumber
-                            + " | موفق: " + successes
-                            + " | ناموفق: " + failures
-            );
-
-            return;
-        }
-
-        long now = SystemClock.elapsedRealtime();
-
-        if (!cycleActive) {
-
-            long remaining = Math.max(
-                    0,
-                    anchorElapsedMs - now
-            );
-
-            statusView.setText(String.format(
-                    Locale.US,
-                    "در انتظار شروع: %.3f ثانیه",
-                    remaining / 1000.0
-            ));
-
-        } else {
-
-            long remaining = Math.max(
-                    0,
-                    cycleDeadlineElapsedMs - now
-            );
-
-            statusView.setText(String.format(
-                    Locale.US,
-                    "چرخه فعال | باقی‌مانده: %.3f ثانیه",
-                    remaining / 1000.0
-            ));
-        }
-
-        counterView.setText(
-                "چرخه: " + (cycleIndex + 1)
-                        + " | تلاش: " + clickNumber
-                        + "/" + clickCount
-                        + " | موفق: " + successes
-                        + " | ناموفق: " + failures
-        );
     }
 
     private int dp(float value) {
