@@ -1,3 +1,4 @@
+
 package com.precision.loopclicker;
 
 import android.content.Context;
@@ -7,124 +8,76 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
 import java.util.Locale;
 
-public class CycleReportStore {
+public final class CycleReportStore {
 
     private static final String PREF_NAME = "cycle_reports";
     private static final String KEY_REPORTS = "reports";
     private static final int MAX_REPORTS = 20;
 
+    private static final SimpleDateFormat DATE_FORMAT =
+            new SimpleDateFormat(
+                    "yyyy-MM-dd HH:mm:ss.SSS",
+                    Locale.US
+            );
+
     private CycleReportStore() {
     }
 
-    // نسخه سازگار با گزارش‌های قدیمی
+    // سازگار با فراخوانی فعلی FloatingService
     public static synchronized void addReport(
             Context context,
             long cycleNumber,
-            String startTime,
-            String endTime,
+            long startTimeWallMs,
             long actualDurationMs,
-            int successfulClicks,
-            int failedClicks,
-            long pauseMs
-    ) {
-        addReport(
-                context,
-                cycleNumber,
-                startTime,
-                endTime,
-                actualDurationMs,
-                successfulClicks,
-                failedClicks,
-                pauseMs,
-                "",
-                0L,
-                0L,
-                0L,
-                0L
-        );
-    }
-
-    // نسخه شامل زمان برنامه‌ریزی‌شده و خطای شروع
-    public static synchronized void addReport(
-            Context context,
-            long cycleNumber,
-            String startTime,
-            String endTime,
-            long actualDurationMs,
-            int successfulClicks,
-            int failedClicks,
-            long pauseMs,
-            String scheduledStartTime,
-            long startErrorMs
-    ) {
-        addReport(
-                context,
-                cycleNumber,
-                startTime,
-                endTime,
-                actualDurationMs,
-                successfulClicks,
-                failedClicks,
-                pauseMs,
-                scheduledStartTime,
-                startErrorMs,
-                0L,
-                0L,
-                0L
-        );
-    }
-
-    // نسخه کامل شامل آمار تأخیر Gesture
-    public static synchronized void addReport(
-            Context context,
-            long cycleNumber,
-            String startTime,
-            String endTime,
-            long actualDurationMs,
-            int successfulClicks,
-            int failedClicks,
-            long pauseMs,
-            String scheduledStartTime,
-            long startErrorMs,
+            long successfulClicks,
+            long failedClicks,
             long averageGestureLatencyNanos,
             long maxGestureLatencyNanos,
             long measuredGestures
     ) {
-        SharedPreferences preferences = context.getSharedPreferences(
-                PREF_NAME,
-                Context.MODE_PRIVATE
-        );
+
+        long endTimeWallMs =
+                startTimeWallMs + actualDurationMs;
+
+        SharedPreferences preferences =
+                context.getSharedPreferences(
+                        PREF_NAME,
+                        Context.MODE_PRIVATE
+                );
 
         JSONArray reports = loadArray(preferences);
         JSONObject report = new JSONObject();
 
         try {
             report.put("cycle", cycleNumber);
-            report.put("start", startTime);
-            report.put("end", endTime);
+
+            report.put("start_epoch", startTimeWallMs);
+            report.put("end_epoch", endTimeWallMs);
+
+            report.put("start", formatTime(startTimeWallMs));
+            report.put("end", formatTime(endTimeWallMs));
+
             report.put("duration", actualDurationMs);
+
             report.put("success", successfulClicks);
             report.put("failed", failedClicks);
-            report.put("pause", pauseMs);
 
-            report.put("scheduled_start", scheduledStartTime);
-            report.put("start_error", startErrorMs);
+            report.put("pause", 0L);
 
-            report.put(
-                    "avg_gesture_latency_ns",
-                    averageGestureLatencyNanos
-            );
+            report.put("avg_gesture_latency_ns",
+                    averageGestureLatencyNanos);
 
-            report.put(
-                    "max_gesture_latency_ns",
-                    maxGestureLatencyNanos
-            );
+            report.put("max_gesture_latency_ns",
+                    maxGestureLatencyNanos);
 
-            report.put("measured_gestures", measuredGestures);
+            report.put("measured_gestures",
+                    measuredGestures);
 
         } catch (JSONException e) {
             return;
@@ -132,17 +85,17 @@ public class CycleReportStore {
 
         JSONArray updatedReports = new JSONArray();
 
-        // گزارش جدید در ابتدای فهرست
+        // جدیدترین گزارش در ابتدای فهرست
         updatedReports.put(report);
 
-        // نگهداری حداکثر ۱۹ گزارش قبلی
         int oldCount = Math.min(
                 reports.length(),
                 MAX_REPORTS - 1
         );
 
         for (int i = 0; i < oldCount; i++) {
-            JSONObject oldReport = reports.optJSONObject(i);
+            JSONObject oldReport =
+                    reports.optJSONObject(i);
 
             if (oldReport != null) {
                 updatedReports.put(oldReport);
@@ -150,17 +103,23 @@ public class CycleReportStore {
         }
 
         preferences.edit()
-                .putString(KEY_REPORTS, updatedReports.toString())
+                .putString(
+                        KEY_REPORTS,
+                        updatedReports.toString()
+                )
                 .commit();
     }
 
-    // دریافت خلاصه گزارش‌ها برای صفحه اصلی
-    public static synchronized String getReportSummary(Context context) {
+    // خلاصه گزارش‌ها برای صفحه اصلی
+    public static synchronized String getReportSummary(
+            Context context
+    ) {
 
-        SharedPreferences preferences = context.getSharedPreferences(
-                PREF_NAME,
-                Context.MODE_PRIVATE
-        );
+        SharedPreferences preferences =
+                context.getSharedPreferences(
+                        PREF_NAME,
+                        Context.MODE_PRIVATE
+                );
 
         JSONArray reports = loadArray(preferences);
 
@@ -177,8 +136,8 @@ public class CycleReportStore {
         }
 
         long cycle = latest.optLong("cycle", 0L);
-        int success = latest.optInt("success", 0);
-        int failed = latest.optInt("failed", 0);
+        long success = latest.optLong("success", 0L);
+        long failed = latest.optLong("failed", 0L);
         long duration = latest.optLong("duration", 0L);
 
         StringBuilder summary = new StringBuilder();
@@ -208,39 +167,52 @@ public class CycleReportStore {
         return summary.toString();
     }
 
-    public static synchronized List<String> getReports(Context context) {
+    // دریافت فهرست گزارش‌ها
+    public static synchronized List<String> getReports(
+            Context context
+    ) {
 
-        SharedPreferences preferences = context.getSharedPreferences(
-                PREF_NAME,
-                Context.MODE_PRIVATE
-        );
+        SharedPreferences preferences =
+                context.getSharedPreferences(
+                        PREF_NAME,
+                        Context.MODE_PRIVATE
+                );
 
         JSONArray reports = loadArray(preferences);
+
         List<String> result = new ArrayList<>();
 
         for (int i = 0; i < reports.length(); i++) {
 
-            JSONObject report = reports.optJSONObject(i);
+            JSONObject report =
+                    reports.optJSONObject(i);
 
             if (report == null) {
                 continue;
             }
 
             long cycle = report.optLong("cycle", 0L);
+
             String start = report.optString("start", "-");
             String end = report.optString("end", "-");
 
+            long startEpoch =
+                    report.optLong("start_epoch", 0L);
+
+            long endEpoch =
+                    report.optLong("end_epoch", 0L);
+
+            if (startEpoch > 0) {
+                start = formatTime(startEpoch);
+            }
+
+            if (endEpoch > 0) {
+                end = formatTime(endEpoch);
+            }
+
             long duration = report.optLong("duration", 0L);
-            int success = report.optInt("success", 0);
-            int failed = report.optInt("failed", 0);
-            long pause = report.optLong("pause", 0L);
-
-            String scheduledStart = report.optString(
-                    "scheduled_start",
-                    ""
-            );
-
-            long startError = report.optLong("start_error", 0L);
+            long success = report.optLong("success", 0L);
+            long failed = report.optLong("failed", 0L);
 
             long averageLatency = report.optLong(
                     "avg_gesture_latency_ns",
@@ -263,26 +235,9 @@ public class CycleReportStore {
                     .append(cycle)
                     .append("\n");
 
-            if (!scheduledStart.isEmpty()) {
-
-                text.append("زمان هدف شروع: ")
-                        .append(scheduledStart)
-                        .append("\n");
-
-                text.append("زمان شروع واقعی: ")
-                        .append(start)
-                        .append("\n");
-
-                text.append("خطای شروع: ")
-                        .append(formatSignedMs(startError))
-                        .append("\n");
-
-            } else {
-
-                text.append("شروع: ")
-                        .append(start)
-                        .append("\n");
-            }
+            text.append("شروع: ")
+                    .append(start)
+                    .append("\n");
 
             text.append("پایان: ")
                     .append(end)
@@ -297,12 +252,7 @@ public class CycleReportStore {
                     .append("\n");
 
             text.append("کلیک ناموفق: ")
-                    .append(failed)
-                    .append("\n");
-
-            text.append("مکث تنظیم‌شده: ")
-                    .append(pause)
-                    .append(" ms");
+                    .append(failed);
 
             if (measuredGestures > 0) {
 
@@ -328,21 +278,30 @@ public class CycleReportStore {
         return result;
     }
 
-    public static synchronized void clearReports(Context context) {
+    // پاک‌کردن تمام گزارش‌ها
+    public static synchronized void clearReports(
+            Context context
+    ) {
 
-        SharedPreferences preferences = context.getSharedPreferences(
-                PREF_NAME,
-                Context.MODE_PRIVATE
-        );
+        SharedPreferences preferences =
+                context.getSharedPreferences(
+                        PREF_NAME,
+                        Context.MODE_PRIVATE
+                );
 
         preferences.edit()
                 .remove(KEY_REPORTS)
                 .commit();
     }
 
-    private static JSONArray loadArray(SharedPreferences preferences) {
+    private static JSONArray loadArray(
+            SharedPreferences preferences
+    ) {
 
-        String json = preferences.getString(KEY_REPORTS, "[]");
+        String json = preferences.getString(
+                KEY_REPORTS,
+                "[]"
+        );
 
         if (json == null || json.trim().isEmpty()) {
             return new JSONArray();
@@ -356,22 +315,17 @@ public class CycleReportStore {
         }
     }
 
-    private static String formatSignedMs(long value) {
+    private static String formatTime(long timeMs) {
 
-        if (value > 0) {
-            return "+" + value + " ms (دیرتر)";
+        synchronized (DATE_FORMAT) {
+            return DATE_FORMAT.format(new Date(timeMs));
         }
-
-        if (value < 0) {
-            return value + " ms (زودتر)";
-        }
-
-        return "0 ms (دقیق)";
     }
 
     private static String formatNanosAsMs(long nanos) {
 
-        double milliseconds = nanos / 1_000_000.0;
+        double milliseconds =
+                nanos / 1_000_000.0;
 
         return String.format(
                 Locale.US,
