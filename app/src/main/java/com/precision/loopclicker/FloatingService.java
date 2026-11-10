@@ -10,6 +10,7 @@ import android.app.Service;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.graphics.Color;
+import android.graphics.Paint;
 import android.graphics.PixelFormat;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
@@ -25,10 +26,12 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowManager;
+import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.NumberPicker;
 import android.widget.TextView;
 
+import java.lang.reflect.Field;
 import java.text.SimpleDateFormat;
 import java.util.Calendar;
 import java.util.Date;
@@ -585,7 +588,6 @@ public class FloatingService extends Service {
 
             floatingStartMillis =
                     calendar.get(Calendar.MILLISECOND);
-
         }
 
         Dialog dialog = new Dialog(
@@ -604,9 +606,10 @@ public class FloatingService extends Service {
                 dp(10)
         );
 
+        // فقط پس‌زمینه پنجره تنظیم ساعت سفید شده است.
         root.setBackground(
                 makeBackground(
-                        Color.rgb(24, 36, 49),
+                        Color.WHITE,
                         dp(12)
                 )
         );
@@ -759,12 +762,53 @@ public class FloatingService extends Service {
                 NumberPicker.FOCUS_AFTER_DESCENDANTS
         );
 
+        picker.setBackgroundColor(Color.WHITE);
+
         picker.setLayoutParams(
                 new LinearLayout.LayoutParams(
                         LinearLayout.LayoutParams.MATCH_PARENT,
                         dp(105)
                 )
         );
+
+        // رنگ متن عدد انتخاب‌شده
+        try {
+
+            Field inputField =
+                    NumberPicker.class.getDeclaredField("mInputText");
+
+            inputField.setAccessible(true);
+
+            EditText input =
+                    (EditText) inputField.get(picker);
+
+            if (input != null) {
+                input.setTextColor(Color.BLACK);
+                input.setBackgroundColor(Color.TRANSPARENT);
+            }
+
+        } catch (Exception ignored) {
+        }
+
+        // رنگ متن اعداد چرخ انتخاب‌گر
+        try {
+
+            Field paintField =
+                    NumberPicker.class.getDeclaredField(
+                            "mSelectorWheelPaint"
+                    );
+
+            paintField.setAccessible(true);
+
+            Paint paint =
+                    (Paint) paintField.get(picker);
+
+            if (paint != null) {
+                paint.setColor(Color.BLACK);
+            }
+
+        } catch (Exception ignored) {
+        }
 
         return picker;
     }
@@ -783,7 +827,10 @@ public class FloatingService extends Service {
         TextView title = new TextView(this);
 
         title.setText(label);
-        title.setTextColor(Color.WHITE);
+
+        // عنوان ستون‌ها مشکی برای خوانایی روی زمینه سفید
+        title.setTextColor(Color.BLACK);
+
         title.setTextSize(10);
         title.setGravity(Gravity.CENTER);
 
