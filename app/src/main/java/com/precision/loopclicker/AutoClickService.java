@@ -1,4 +1,3 @@
-
 package com.precision.loopclicker;
 
 import android.accessibilityservice.AccessibilityService;
@@ -25,10 +24,11 @@ public class AutoClickService extends AccessibilityService {
 
     private Runnable activeCompletion;
 
+    private long activeGestureId = 0;
+
     private long successfulClicks = 0;
     private long failedClicks = 0;
 
-    // اطلاعات اندازه‌گیری تأخیر Gesture
     private long dispatchStartNanos = 0;
     private long lastGestureLatencyNanos = 0;
     private long totalGestureLatencyNanos = 0;
@@ -47,18 +47,20 @@ public class AutoClickService extends AccessibilityService {
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-        // نیازی به پردازش رویدادهای صفحه نداریم.
+        // رویدادهای صفحه نیازی به پردازش ندارند.
     }
 
     @Override
     public void onInterrupt() {
-        handler.post(() -> finishGesture(false));
+        handler.post(() ->
+                finishGesture(activeGestureId, false)
+        );
     }
 
     @Override
     public void onDestroy() {
 
-        handler.post(() -> finishGesture(false));
+        finishGesture(activeGestureId, false);
 
         if (instance == this) {
             instance = null;
@@ -68,13 +70,11 @@ public class AutoClickService extends AccessibilityService {
     }
 
     public void setTarget(int x, int y) {
-
         targetX = Math.max(0, x);
         targetY = Math.max(0, y);
     }
 
     public void setTouchDuration(long durationMs) {
-
         touchDurationMs = Math.max(1, durationMs);
     }
 
@@ -138,6 +138,8 @@ public class AutoClickService extends AccessibilityService {
         gestureInProgress = true;
         activeCompletion = completion;
 
+        final long gestureId = ++activeGestureId;
+
         FloatingService.setOverlaysHidden(true);
 
         Path path = new Path();
@@ -155,10 +157,10 @@ public class AutoClickService extends AccessibilityService {
                         .addStroke(stroke)
                         .build();
 
-        boolean accepted;
-
         dispatchStartNanos =
                 SystemClock.elapsedRealtimeNanos();
+
+        boolean accepted;
 
         try {
 
@@ -173,7 +175,7 @@ public class AutoClickService extends AccessibilityService {
 
                             super.onCompleted(description);
 
-                            finishGesture(true);
+                            finishGesture(gestureId, true);
                         }
 
                         @Override
@@ -183,25 +185,29 @@ public class AutoClickService extends AccessibilityService {
 
                             super.onCancelled(description);
 
-                            finishGesture(false);
+                            finishGesture(gestureId, false);
                         }
                     },
                     handler
             );
 
         } catch (Exception e) {
-
             accepted = false;
         }
 
         if (!accepted) {
-            finishGesture(false);
+            finishGesture(gestureId, false);
         }
     }
 
-    private void finishGesture(boolean success) {
+    private void finishGesture(
+            long gestureId,
+            boolean success
+    ) {
 
-        if (!gestureInProgress) {
+        // جلوگیری از اجرای دوباره یا اجرای callback قدیمی
+        if (!gestureInProgress ||
+                gestureId != activeGestureId) {
             return;
         }
 
