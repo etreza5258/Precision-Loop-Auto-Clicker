@@ -26,7 +26,10 @@ import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
+import java.text.SimpleDateFormat;
+import java.util.Date;
 import java.util.Locale;
+import java.util.TimeZone;
 
 public class FloatingService extends Service {
 
@@ -49,6 +52,16 @@ public class FloatingService extends Service {
 
     private static final long SERVICE_RETRY_MS = 250;
     private static final long GESTURE_RETRY_MS = 10;
+    private static final long DISPLAY_UPDATE_MS = 50;
+
+    private static final int PANEL_BACKGROUND =
+            Color.rgb(20, 30, 42);
+
+    private static final int ACCENT_COLOR =
+            Color.rgb(3, 218, 197);
+
+    private static final int TITLE_COLOR =
+            Color.rgb(255, 152, 0);
 
     private static volatile FloatingService instance;
 
@@ -58,10 +71,20 @@ public class FloatingService extends Service {
     private WindowManager windowManager;
 
     private LinearLayout panel;
+
     private TextView titleView;
     private TextView statusView;
     private TextView counterView;
     private TextView markerView;
+
+    // Countdown views
+    private TextView selectedTimeView;
+    private TextView countdownStatusView;
+
+    private TextView countdownHour;
+    private TextView countdownMinute;
+    private TextView countdownSecond;
+    private TextView countdownMillis;
 
     private WindowManager.LayoutParams panelParams;
     private WindowManager.LayoutParams markerParams;
@@ -78,6 +101,8 @@ public class FloatingService extends Service {
     private long cycleIndex;
 
     private long anchorElapsedMs;
+    private long selectedStartEpochMs;
+
     private long cycleDurationMs;
     private long pauseDurationMs;
     private long clickIntervalMs;
@@ -135,7 +160,7 @@ public class FloatingService extends Service {
             @Override
             public void run() {
                 updateDisplay();
-                handler.postDelayed(this, 100);
+                handler.postDelayed(this, DISPLAY_UPDATE_MS);
             }
         };
 
@@ -320,7 +345,7 @@ public class FloatingService extends Service {
 
         panel.setBackground(
                 makeBackground(
-                        Color.rgb(20, 30, 42),
+                        PANEL_BACKGROUND,
                         dp(14)
                 )
         );
@@ -379,6 +404,9 @@ public class FloatingService extends Service {
         );
 
         panel.addView(titleView);
+
+        createCountdownSection();
+
         panel.addView(statusView);
         panel.addView(counterView);
         panel.addView(stopButton);
@@ -451,6 +479,278 @@ public class FloatingService extends Service {
             panelParams = null;
         }
     }
+
+    // ---------------------------------------------------------
+    // Countdown UI
+    // ---------------------------------------------------------
+
+    private void createCountdownSection() {
+
+        LinearLayout countdownContainer =
+                new LinearLayout(this);
+
+        countdownContainer.setOrientation(
+                LinearLayout.VERTICAL
+        );
+
+        countdownContainer.setPadding(
+                dp(9),
+                dp(9),
+                dp(9),
+                dp(9)
+        );
+
+        countdownContainer.setBackground(
+                makeBackground(
+                        Color.rgb(13, 25, 36),
+                        dp(10)
+                )
+        );
+
+        LinearLayout.LayoutParams containerParams =
+                new LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT
+                );
+
+        containerParams.setMargins(
+                0,
+                dp(4),
+                0,
+                dp(9)
+        );
+
+        countdownContainer.setLayoutParams(containerParams);
+
+        TextView heading = new TextView(this);
+
+        heading.setText("شمارش معکوس");
+        heading.setTextColor(TITLE_COLOR);
+        heading.setTextSize(16);
+        heading.setTypeface(null, Typeface.BOLD);
+        heading.setGravity(Gravity.CENTER);
+
+        selectedTimeView = new TextView(this);
+
+        selectedTimeView.setText(
+                "زمان انتخابی شروع: --:--:--.---"
+        );
+
+        selectedTimeView.setTextColor(Color.WHITE);
+        selectedTimeView.setTextSize(12);
+        selectedTimeView.setGravity(Gravity.CENTER);
+        selectedTimeView.setPadding(
+                0,
+                dp(7),
+                0,
+                dp(5)
+        );
+
+        countdownStatusView = new TextView(this);
+
+        countdownStatusView.setText("آماده");
+        countdownStatusView.setTextColor(
+                Color.rgb(180, 190, 205)
+        );
+
+        countdownStatusView.setTextSize(11);
+        countdownStatusView.setGravity(Gravity.CENTER);
+
+        countdownStatusView.setPadding(
+                0,
+                dp(3),
+                0,
+                dp(7)
+        );
+
+        LinearLayout digits =
+                new LinearLayout(this);
+
+        digits.setOrientation(
+                LinearLayout.HORIZONTAL
+        );
+
+        digits.setGravity(Gravity.CENTER);
+
+        countdownHour = createCountdownDigit("00");
+        countdownMinute = createCountdownDigit("00");
+        countdownSecond = createCountdownDigit("00");
+        countdownMillis = createCountdownDigit("000");
+
+        countdownMillis.setTextSize(19);
+
+        digits.addView(countdownHour);
+        digits.addView(createCountdownSeparator(":"));
+
+        digits.addView(countdownMinute);
+        digits.addView(createCountdownSeparator(":"));
+
+        digits.addView(countdownSecond);
+        digits.addView(createCountdownSeparator("."));
+
+        digits.addView(countdownMillis);
+
+        countdownContainer.addView(heading);
+        countdownContainer.addView(selectedTimeView);
+        countdownContainer.addView(countdownStatusView);
+        countdownContainer.addView(digits);
+
+        panel.addView(countdownContainer);
+    }
+
+    private TextView createCountdownDigit(String value) {
+
+        TextView tv = new TextView(this);
+
+        tv.setText(value);
+        tv.setTextColor(ACCENT_COLOR);
+        tv.setTextSize(22);
+        tv.setTypeface(null, Typeface.BOLD);
+        tv.setGravity(Gravity.CENTER);
+
+        tv.setBackground(
+                makeBackground(
+                        Color.rgb(25, 42, 55),
+                        dp(7)
+                )
+        );
+
+        LinearLayout.LayoutParams params =
+                new LinearLayout.LayoutParams(
+                        0,
+                        dp(43),
+                        value.length() == 3 ? 1.35f : 1f
+                );
+
+        params.setMargins(
+                dp(1),
+                0,
+                dp(1),
+                0
+        );
+
+        tv.setLayoutParams(params);
+
+        return tv;
+    }
+
+    private TextView createCountdownSeparator(String value) {
+
+        TextView tv = new TextView(this);
+
+        tv.setText(value);
+        tv.setTextColor(Color.WHITE);
+        tv.setTextSize(19);
+        tv.setTypeface(null, Typeface.BOLD);
+        tv.setGravity(Gravity.CENTER);
+
+        LinearLayout.LayoutParams params =
+                new LinearLayout.LayoutParams(
+                        dp(12),
+                        dp(43)
+                );
+
+        tv.setLayoutParams(params);
+
+        return tv;
+    }
+
+    private void updateCountdownDisplay() {
+
+        if (countdownHour == null
+                || countdownMinute == null
+                || countdownSecond == null
+                || countdownMillis == null) {
+            return;
+        }
+
+        SimpleDateFormat format =
+                new SimpleDateFormat(
+                        "HH:mm:ss.SSS",
+                        Locale.US
+                );
+
+        format.setTimeZone(
+                TimeZone.getTimeZone("Asia/Tehran")
+        );
+
+        if (selectedTimeView != null) {
+
+            if (selectedStartEpochMs > 0) {
+
+                selectedTimeView.setText(
+                        "زمان انتخابی شروع: "
+                                + format.format(
+                                new Date(selectedStartEpochMs)
+                        )
+                );
+
+            } else {
+
+                selectedTimeView.setText(
+                        "زمان انتخابی شروع: --:--:--.---"
+                );
+            }
+        }
+
+        long remaining = 0;
+
+        if (running && !cycleActive) {
+
+            remaining = Math.max(
+                    0,
+                    anchorElapsedMs - SystemClock.elapsedRealtime()
+            );
+        }
+
+        long hours = remaining / 3600000L;
+        long minutes = (remaining % 3600000L) / 60000L;
+        long seconds = (remaining % 60000L) / 1000L;
+        long millis = remaining % 1000L;
+
+        countdownHour.setText(
+                String.format(Locale.US, "%02d", hours)
+        );
+
+        countdownMinute.setText(
+                String.format(Locale.US, "%02d", minutes)
+        );
+
+        countdownSecond.setText(
+                String.format(Locale.US, "%02d", seconds)
+        );
+
+        countdownMillis.setText(
+                String.format(Locale.US, "%03d", millis)
+        );
+
+        if (!running) {
+
+            countdownStatusView.setText("آماده شروع");
+
+        } else if (cycleActive) {
+
+            countdownStatusView.setText(
+                    "چرخه در حال اجرا است"
+            );
+
+        } else if (remaining == 0) {
+
+            countdownStatusView.setText(
+                    "در حال شروع کلیک‌ها..."
+            );
+
+        } else {
+
+            countdownStatusView.setText(
+                    "زمان باقی‌مانده تا شروع"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------
+    // Marker
+    // ---------------------------------------------------------
 
     private void createMarker() {
 
@@ -633,6 +933,14 @@ public class FloatingService extends Service {
 
         panelParams = null;
         markerParams = null;
+
+        selectedTimeView = null;
+        countdownStatusView = null;
+
+        countdownHour = null;
+        countdownMinute = null;
+        countdownSecond = null;
+        countdownMillis = null;
     }
 
     public static void setOverlaysHidden(boolean hidden) {
@@ -719,6 +1027,20 @@ public class FloatingService extends Service {
             return;
         }
 
+        long nowWall = System.currentTimeMillis();
+
+        if (config.hasExtra("start_time_epoch_ms")) {
+
+            selectedStartEpochMs = config.getLongExtra(
+                    "start_time_epoch_ms",
+                    nowWall + delayMs
+            );
+
+        } else {
+
+            selectedStartEpochMs = nowWall + delayMs;
+        }
+
         long nowElapsed = SystemClock.elapsedRealtime();
 
         if (delayMs > Long.MAX_VALUE - nowElapsed) {
@@ -739,6 +1061,7 @@ public class FloatingService extends Service {
 
         showFloatingViews();
         updateTarget();
+        updateCountdownDisplay();
 
         runGeneration++;
 
@@ -921,10 +1244,6 @@ public class FloatingService extends Service {
         updateDisplay();
     }
 
-    /*
-     * زمان شروع دسته بعدی بر اساس تعداد کلیک‌های دسته قبلی
-     * محاسبه می‌شود، نه صرفاً یک فاصله کلیک.
-     */
     private void scheduleNextClick(long generation) {
 
         if (!isCurrentRun(generation) || !cycleActive) {
@@ -999,10 +1318,6 @@ public class FloatingService extends Service {
         );
     }
 
-    /*
-     * به‌جای ارسال یک کلیک در هر فراخوانی،
-     * چند کلیک در یک GestureDescription زمان‌بندی می‌شوند.
-     */
     private void dispatchNextClick(long generation) {
 
         if (!isCurrentRun(generation) || !cycleActive) {
@@ -1096,10 +1411,6 @@ public class FloatingService extends Service {
             return;
         }
 
-        /*
-         * تعداد شروع‌هایی که تا قبل از پایان چرخه
-         * فرصت اجرا دارند.
-         */
         long clicksFittingInCycle =
                 ((remainingTime - 1L) / effectiveInterval) + 1L;
 
@@ -1120,10 +1431,6 @@ public class FloatingService extends Service {
 
         final long callbackGeneration = generation;
 
-        /*
-         * شمارنده قبل از فراخوانی تغییر می‌کند تا
-         * در صورت callback هم‌زمان، وضعیت دوباره‌کاری نشود.
-         */
         clickNumber += batchCount;
 
         lastClickDispatchElapsedMs = now;
@@ -1157,10 +1464,6 @@ public class FloatingService extends Service {
                 }
         );
 
-        /*
-         * مقدار صفر یعنی دسته‌ای ارسال نشده است.
-         * در این حالت شمارنده را برمی‌گردانیم و دوباره تلاش می‌کنیم.
-         */
         if (acceptedCount <= 0) {
 
             clickNumber -= batchCount;
@@ -1182,10 +1485,6 @@ public class FloatingService extends Service {
             return;
         }
 
-        /*
-         * اگر سرویس تعداد کمتری از مقدار درخواستی را پذیرفته باشد،
-         * اختلاف به شمارنده کلیک‌های باقی‌مانده برمی‌گردد.
-         */
         if (acceptedCount < batchCount) {
 
             long difference = batchCount - acceptedCount;
@@ -1366,6 +1665,8 @@ public class FloatingService extends Service {
     }
 
     private void updateDisplay() {
+
+        updateCountdownDisplay();
 
         if (statusView == null || counterView == null) {
             return;
