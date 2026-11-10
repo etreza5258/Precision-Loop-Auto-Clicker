@@ -101,7 +101,6 @@ public class CycleReportStore {
         );
 
         JSONArray reports = loadArray(preferences);
-
         JSONObject report = new JSONObject();
 
         try {
@@ -134,11 +133,14 @@ public class CycleReportStore {
 
         JSONArray updatedReports = new JSONArray();
 
-        // گزارش جدید در ابتدای فهرست قرار می‌گیرد.
+        // گزارش جدید در ابتدای فهرست
         updatedReports.put(report);
 
-        // فقط ۱۹ گزارش قبلی را نگه می‌داریم.
-        int oldCount = Math.min(reports.length(), MAX_REPORTS - 1);
+        // نگهداری حداکثر ۱۹ گزارش قبلی
+        int oldCount = Math.min(
+                reports.length(),
+                MAX_REPORTS - 1
+        );
 
         for (int i = 0; i < oldCount; i++) {
             JSONObject oldReport = reports.optJSONObject(i);
@@ -153,7 +155,62 @@ public class CycleReportStore {
                 .commit();
     }
 
+    // دریافت خلاصه گزارش‌ها برای صفحه اصلی
+    public static synchronized String getReportSummary(Context context) {
+
+        SharedPreferences preferences = context.getSharedPreferences(
+                PREF_NAME,
+                Context.MODE_PRIVATE
+        );
+
+        JSONArray reports = loadArray(preferences);
+
+        int count = reports.length();
+
+        if (count == 0) {
+            return "هنوز هیچ چرخه‌ای تکمیل نشده است.";
+        }
+
+        JSONObject latest = reports.optJSONObject(0);
+
+        if (latest == null) {
+            return "تعداد گزارش‌های ثبت‌شده: " + count;
+        }
+
+        long cycle = latest.optLong("cycle", 0L);
+        int success = latest.optInt("success", 0);
+        int failed = latest.optInt("failed", 0);
+        long duration = latest.optLong("duration", 0L);
+
+        StringBuilder summary = new StringBuilder();
+
+        summary.append("تعداد گزارش‌های ذخیره‌شده: ")
+                .append(count)
+                .append(" از ")
+                .append(MAX_REPORTS)
+                .append("\n\n");
+
+        summary.append("آخرین چرخه تکمیل‌شده: ")
+                .append(cycle)
+                .append("\n");
+
+        summary.append("کلیک موفق: ")
+                .append(success)
+                .append("\n");
+
+        summary.append("کلیک ناموفق: ")
+                .append(failed)
+                .append("\n");
+
+        summary.append("مدت واقعی چرخه: ")
+                .append(duration)
+                .append(" ms");
+
+        return summary.toString();
+    }
+
     public static synchronized List<String> getReports(Context context) {
+
         SharedPreferences preferences = context.getSharedPreferences(
                 PREF_NAME,
                 Context.MODE_PRIVATE
@@ -163,6 +220,7 @@ public class CycleReportStore {
         List<String> result = new ArrayList<>();
 
         for (int i = 0; i < reports.length(); i++) {
+
             JSONObject report = reports.optJSONObject(i);
 
             if (report == null) {
@@ -207,6 +265,7 @@ public class CycleReportStore {
                     .append("\n");
 
             if (!scheduledStart.isEmpty()) {
+
                 text.append("زمان هدف شروع: ")
                         .append(scheduledStart)
                         .append("\n");
@@ -218,7 +277,9 @@ public class CycleReportStore {
                 text.append("خطای شروع: ")
                         .append(formatSignedMs(startError))
                         .append("\n");
+
             } else {
+
                 text.append("شروع: ")
                         .append(start)
                         .append("\n");
@@ -245,6 +306,7 @@ public class CycleReportStore {
                     .append(" ms");
 
             if (measuredGestures > 0) {
+
                 text.append("\nمیانگین زمان Gesture: ")
                         .append(formatNanosAsMs(averageLatency))
                         .append(" ms");
@@ -255,7 +317,9 @@ public class CycleReportStore {
 
                 text.append("\nتعداد Gesture اندازه‌گیری‌شده: ")
                         .append(measuredGestures);
+
             } else {
+
                 text.append("\nآمار زمان Gesture: موجود نیست");
             }
 
@@ -266,6 +330,7 @@ public class CycleReportStore {
     }
 
     public static synchronized void clearReports(Context context) {
+
         SharedPreferences preferences = context.getSharedPreferences(
                 PREF_NAME,
                 Context.MODE_PRIVATE
@@ -277,6 +342,7 @@ public class CycleReportStore {
     }
 
     private static JSONArray loadArray(SharedPreferences preferences) {
+
         String json = preferences.getString(KEY_REPORTS, "[]");
 
         if (json == null || json.trim().isEmpty()) {
@@ -285,12 +351,14 @@ public class CycleReportStore {
 
         try {
             return new JSONArray(json);
+
         } catch (JSONException e) {
             return new JSONArray();
         }
     }
 
     private static String formatSignedMs(long value) {
+
         if (value > 0) {
             return "+" + value + " ms (دیرتر)";
         }
@@ -303,6 +371,7 @@ public class CycleReportStore {
     }
 
     private static String formatNanosAsMs(long nanos) {
+
         double milliseconds = nanos / 1_000_000.0;
 
         return String.format(
