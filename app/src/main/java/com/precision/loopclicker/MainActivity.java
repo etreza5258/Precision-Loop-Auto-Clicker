@@ -106,14 +106,17 @@ public class MainActivity extends Activity {
     private final Runnable clockRunnable = new Runnable() {
         @Override
         public void run() {
+
             updateClocks();
             updateCountdown();
 
             if (!syncInProgress) {
+
                 long now = SystemClock.elapsedRealtime();
 
                 if (!timeSynced
                         || now - lastSyncElapsed >= 60000L) {
+
                     syncInternetTime();
                 }
             }
@@ -137,8 +140,6 @@ public class MainActivity extends Activity {
 
         handler.post(clockRunnable);
 
-        // اگر صفحه از طریق دکمه شروع پنل شناور باز شده باشد،
-        // پس از آماده‌شدن تمام Viewها فرمان اجرا می‌شود.
         handleFloatingStartIntent(getIntent());
     }
 
@@ -148,10 +149,12 @@ public class MainActivity extends Activity {
 
         setIntent(intent);
 
-        // وقتی Activity از قبل باز است،
-        // فرمان جدید از این مسیر دریافت می‌شود.
         handleFloatingStartIntent(intent);
     }
+
+    // ---------------------------------------------------------
+    // دریافت فرمان شروع از پنل شناور
+    // ---------------------------------------------------------
 
     private void handleFloatingStartIntent(Intent intent) {
 
@@ -165,7 +168,6 @@ public class MainActivity extends Activity {
             return;
         }
 
-        // ابتدا اطلاعات زمان انتخاب‌شده در پنل شناور را می‌خوانیم.
         boolean floatingTimeConfigured =
                 intent.getBooleanExtra(
                         "floating_start_time_configured",
@@ -196,7 +198,7 @@ public class MainActivity extends Activity {
                         0
                 );
 
-        // جلوگیری از اجرای دوباره همین فرمان.
+        // جلوگیری از اجرای مجدد فرمان
         intent.setAction(null);
 
         if (startButton == null
@@ -215,8 +217,7 @@ public class MainActivity extends Activity {
             return;
         }
 
-        // اگر زمان از پنل شناور انتخاب شده باشد،
-        // آن را در ورودی‌های زمان صفحه اصلی قرار می‌دهیم.
+        // انتقال زمان انتخاب‌شده از پنل شناور
         if (floatingTimeConfigured) {
 
             startHourInput.setText(
@@ -236,9 +237,13 @@ public class MainActivity extends Activity {
             );
         }
 
-        // ادامه اجرا با همان تنظیمات و منطق قبلی.
+        // اجرای تنظیمات با منطق اصلی برنامه
         startClicking();
     }
+
+    // ---------------------------------------------------------
+    // اتصال Viewها
+    // ---------------------------------------------------------
 
     private void bindViews() {
 
@@ -295,6 +300,10 @@ public class MainActivity extends Activity {
         shutdownButton = findViewById(R.id.shutdownButton);
     }
 
+    // ---------------------------------------------------------
+    // دکمه‌ها
+    // ---------------------------------------------------------
+
     private void setupButtons() {
 
         startButton.setOnClickListener(v -> startClicking());
@@ -302,9 +311,11 @@ public class MainActivity extends Activity {
         stopButton.setOnClickListener(v -> stopClicking());
 
         accessibilityButton.setOnClickListener(v -> {
+
             Intent intent = new Intent(
                     Settings.ACTION_ACCESSIBILITY_SETTINGS
             );
+
             startActivity(intent);
         });
 
@@ -313,7 +324,9 @@ public class MainActivity extends Activity {
         showFloatingButton.setOnClickListener(v -> showFloatingPanel());
 
         clearReportsButton.setOnClickListener(v -> {
+
             CycleReportStore.clearReports(this);
+
             refreshReports();
 
             Toast.makeText(
@@ -347,7 +360,6 @@ public class MainActivity extends Activity {
                             + formatIranTime(internetEpoch)
             );
 
-            // اختلاف همیشه گوشی منهای اینترنت است.
             long difference = phoneEpoch - internetEpoch;
 
             clockDifference.setText(
@@ -376,10 +388,13 @@ public class MainActivity extends Activity {
             );
 
             if (syncInProgress) {
+
                 syncStatus.setText(
                         "در حال دریافت زمان اینترنتی..."
                 );
+
             } else {
+
                 syncStatus.setText(
                         "زمان اینترنتی هنوز دریافت نشده است"
                 );
@@ -424,6 +439,7 @@ public class MainActivity extends Activity {
         }
 
         syncInProgress = true;
+
         handler.post(this::updateClocks);
 
         networkExecutor.execute(() -> {
@@ -433,6 +449,7 @@ public class MainActivity extends Activity {
             for (String server : NTP_SERVERS) {
 
                 try {
+
                     NtpResult result = queryNtpServer(server);
 
                     if (result != null) {
@@ -485,11 +502,14 @@ public class MainActivity extends Activity {
                 } else {
 
                     if (!timeSynced) {
+
                         syncStatus.setText(
                                 "دریافت زمان اینترنتی ناموفق بود؛ "
                                         + "اتصال اینترنت و دسترسی NTP را بررسی کن."
                         );
+
                     } else {
+
                         syncStatus.setText(
                                 "اتصال مجدد ناموفق؛ "
                                         + "آخرین زمان دریافت‌شده استفاده می‌شود."
@@ -515,7 +535,6 @@ public class MainActivity extends Activity {
 
             byte[] request = new byte[48];
 
-            // NTP version 4, client mode
             request[0] = 0x23;
 
             DatagramPacket requestPacket =
@@ -594,6 +613,7 @@ public class MainActivity extends Activity {
             );
 
         } finally {
+
             socket.close();
         }
     }
@@ -619,6 +639,7 @@ public class MainActivity extends Activity {
                 long receivedElapsedMs,
                 long roundTripMs
         ) {
+
             this.server = server;
             this.estimatedEpochMs = estimatedEpochMs;
             this.receivedElapsedMs = receivedElapsedMs;
@@ -652,6 +673,7 @@ public class MainActivity extends Activity {
             ).show();
 
             openOverlaySettings();
+
             return;
         }
 
@@ -669,6 +691,7 @@ public class MainActivity extends Activity {
             ).show();
 
             syncInternetTime();
+
             return;
         }
 
@@ -685,6 +708,7 @@ public class MainActivity extends Activity {
                     || millis < 0 || millis > 999) {
 
                 showError("زمان شروع معتبر نیست.");
+
                 return;
             }
 
@@ -723,6 +747,7 @@ public class MainActivity extends Activity {
                     || pauseMillis < 0) {
 
                 showError("یکی از مقادیر تنظیمات معتبر نیست.");
+
                 return;
             }
 
@@ -745,7 +770,9 @@ public class MainActivity extends Activity {
                     );
 
             if (cycleDuration <= 0) {
+
                 showError("مدت چرخه باید بیشتر از صفر باشد.");
+
                 return;
             }
 
@@ -754,7 +781,9 @@ public class MainActivity extends Activity {
                     : System.currentTimeMillis();
 
             if (sourceNow <= 0) {
+
                 showError("زمان مبنا معتبر نیست.");
+
                 return;
             }
 
@@ -793,7 +822,9 @@ public class MainActivity extends Activity {
                     SystemClock.elapsedRealtime();
 
             if (startDelay > Long.MAX_VALUE - nowElapsed) {
+
                 showError("فاصله زمانی شروع بیش از حد بزرگ است.");
+
                 return;
             }
 
@@ -843,8 +874,11 @@ public class MainActivity extends Activity {
             );
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+
                 startForegroundService(serviceIntent);
+
             } else {
+
                 startService(serviceIntent);
             }
 
@@ -937,6 +971,7 @@ public class MainActivity extends Activity {
             );
 
             countdownActive = false;
+
             return;
         }
 
@@ -976,8 +1011,11 @@ public class MainActivity extends Activity {
         intent.setAction(FloatingService.ACTION_STOP);
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+
             startForegroundService(intent);
+
         } else {
+
             startService(intent);
         }
 
@@ -993,7 +1031,9 @@ public class MainActivity extends Activity {
     private void showFloatingPanel() {
 
         if (!Settings.canDrawOverlays(this)) {
+
             openOverlaySettings();
+
             return;
         }
 
@@ -1003,8 +1043,11 @@ public class MainActivity extends Activity {
         intent.setAction(FloatingService.SHOW_PANEL);
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+
             startForegroundService(intent);
+
         } else {
+
             startService(intent);
         }
     }
@@ -1019,5 +1062,88 @@ public class MainActivity extends Activity {
         intent.setAction(FloatingService.ACTION_SHUTDOWN);
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+
             startForegroundService(intent);
+
+        } else {
+
+            startService(intent);
         }
+
+        finish();
+    }
+
+    // ---------------------------------------------------------
+    // مجوزها
+    // ---------------------------------------------------------
+
+    private boolean isAccessibilityEnabled() {
+
+        String enabledServices = Secure.getString(
+                getContentResolver(),
+                Secure.ENABLED_ACCESSIBILITY_SERVICES
+        );
+
+        if (enabledServices == null) {
+            return false;
+        }
+
+        ComponentName serviceComponent =
+                new ComponentName(
+                        this,
+                        AutoClickService.class
+                );
+
+        String expected =
+                serviceComponent.flattenToString();
+
+        return enabledServices.toLowerCase(Locale.ROOT)
+                .contains(expected.toLowerCase(Locale.ROOT));
+    }
+
+    private void openOverlaySettings() {
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+
+            Intent intent = new Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:" + getPackageName())
+            );
+
+            startActivity(intent);
+        }
+    }
+
+    // ---------------------------------------------------------
+    // گزارش چرخه‌ها
+    // ---------------------------------------------------------
+
+    private void refreshReports() {
+
+        if (reportSummary == null) {
+            return;
+        }
+
+        reportSummary.setText(
+                CycleReportStore.getReportSummary(this)
+        );
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+
+        refreshReports();
+        updateClocks();
+    }
+
+    @Override
+    protected void onDestroy() {
+
+        handler.removeCallbacks(clockRunnable);
+
+        networkExecutor.shutdownNow();
+
+        super.onDestroy();
+    }
+}
