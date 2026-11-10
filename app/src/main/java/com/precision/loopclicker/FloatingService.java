@@ -77,7 +77,6 @@ public class FloatingService extends Service {
     private TextView counterView;
     private TextView markerView;
 
-    // Countdown views
     private TextView selectedTimeView;
     private TextView countdownStatusView;
 
@@ -320,6 +319,11 @@ public class FloatingService extends Service {
 
         showFloatingViews();
         updateTarget();
+
+        // اگر اجرا از قبل فعال باشد، نشانگر نباید لمس دریافت کند.
+        if (running) {
+            setMarkerTouchable(false);
+        }
     }
 
     private int getOverlayType() {
@@ -839,6 +843,38 @@ public class FloatingService extends Service {
         }
     }
 
+    // ---------------------------------------------------------
+    // کنترل دریافت لمس نشانگر
+    // ---------------------------------------------------------
+
+    private void setMarkerTouchable(boolean touchable) {
+
+        if (markerView == null || markerParams == null) {
+            return;
+        }
+
+        int flags =
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN;
+
+        if (!touchable) {
+
+            flags |=
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
+        }
+
+        if (markerParams.flags == flags) {
+            return;
+        }
+
+        markerParams.flags = flags;
+
+        updateViewLayout(
+                markerView,
+                markerParams
+        );
+    }
+
     private GradientDrawable makeBackground(
             int color,
             int radius
@@ -1054,6 +1090,10 @@ public class FloatingService extends Service {
 
         running = true;
         cycleActive = false;
+
+        // نشانگر در تمام مدت اجرای برنامه‌ریزی‌شده
+        // دیده می‌شود اما لمس دریافت نمی‌کند.
+        setMarkerTouchable(false);
 
         cycleIndex = 0;
         clickNumber = 0;
@@ -1631,6 +1671,9 @@ public class FloatingService extends Service {
         runGeneration++;
 
         removeScheduledCallbacks();
+
+        // پس از توقف، نشانگر دوباره قابل جابه‌جایی می‌شود.
+        setMarkerTouchable(true);
 
         updateStatus("متوقف شد");
         updateDisplay();
