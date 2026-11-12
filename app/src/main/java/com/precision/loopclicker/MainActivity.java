@@ -1,4 +1,3 @@
-
 package com.precision.loopclicker;
 
 import android.app.Activity;
@@ -7,8 +6,6 @@ import android.content.Intent;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
 import android.os.SystemClock;
 import android.provider.Settings;
 import android.provider.Settings.Secure;
@@ -26,6 +23,7 @@ import java.text.SimpleDateFormat;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
+import java.util.Arrays;
 import java.util.Date;
 import java.util.Locale;
 import java.util.TimeZone;
@@ -34,8 +32,7 @@ import java.util.concurrent.Executors;
 
 public class MainActivity extends Activity {
 
-    private static final ZoneId IRAN_ZONE =
-            ZoneId.of("Asia/Tehran");
+    private static final ZoneId IRAN_ZONE = ZoneId.of("Asia/Tehran");
 
     private static final String[] NTP_SERVERS = {
             "time.google.com",
@@ -43,11 +40,13 @@ public class MainActivity extends Activity {
             "pool.ntp.org"
     };
 
+    private static final long NTP_EPOCH_OFFSET = 2208988800L;
     private static final int NTP_PORT = 123;
     private static final int NTP_TIMEOUT_MS = 1800;
+    private static final int NTP_PACKET_SIZE = 48;
 
-    private final Handler handler =
-            new Handler(Looper.getMainLooper());
+    private final android.os.Handler handler =
+            new android.os.Handler(android.os.Looper.getMainLooper());
 
     private final ExecutorService networkExecutor =
             Executors.newSingleThreadExecutor();
@@ -63,6 +62,7 @@ public class MainActivity extends Activity {
     private EditText cycleSecondsInput;
     private EditText cycleMillisInput;
     private EditText clickCountInput;
+    private EditText cycleTotalCountInput;
     private EditText touchMillisInput;
 
     private EditText pauseSecondsInput;
@@ -91,6 +91,7 @@ public class MainActivity extends Activity {
     private Button clearReportsButton;
     private Button shutdownButton;
 
+    // زمان مرجع اینترنتی در لحظه دریافت پاسخ NTP
     private volatile long trustedEpochAtSync = 0;
     private volatile long elapsedAtSync = 0;
 
@@ -114,9 +115,7 @@ public class MainActivity extends Activity {
 
                 long now = SystemClock.elapsedRealtime();
 
-                if (!timeSynced
-                        || now - lastSyncElapsed >= 60000L) {
-
+                if (!timeSynced || now - lastSyncElapsed >= 60000L) {
                     syncInternetTime();
                 }
             }
@@ -175,28 +174,16 @@ public class MainActivity extends Activity {
                 );
 
         int floatingHour =
-                intent.getIntExtra(
-                        "floating_start_hour",
-                        0
-                );
+                intent.getIntExtra("floating_start_hour", 0);
 
         int floatingMinute =
-                intent.getIntExtra(
-                        "floating_start_minute",
-                        0
-                );
+                intent.getIntExtra("floating_start_minute", 0);
 
         int floatingSecond =
-                intent.getIntExtra(
-                        "floating_start_second",
-                        0
-                );
+                intent.getIntExtra("floating_start_second", 0);
 
         int floatingMillis =
-                intent.getIntExtra(
-                        "floating_start_millis",
-                        0
-                );
+                intent.getIntExtra("floating_start_millis", 0);
 
         // جلوگیری از اجرای مجدد فرمان
         intent.setAction(null);
@@ -217,27 +204,14 @@ public class MainActivity extends Activity {
             return;
         }
 
-        // انتقال زمان انتخاب‌شده از پنل شناور
         if (floatingTimeConfigured) {
 
-            startHourInput.setText(
-                    String.valueOf(floatingHour)
-            );
-
-            startMinuteInput.setText(
-                    String.valueOf(floatingMinute)
-            );
-
-            startSecondInput.setText(
-                    String.valueOf(floatingSecond)
-            );
-
-            startMillisInput.setText(
-                    String.valueOf(floatingMillis)
-            );
+            startHourInput.setText(String.valueOf(floatingHour));
+            startMinuteInput.setText(String.valueOf(floatingMinute));
+            startSecondInput.setText(String.valueOf(floatingSecond));
+            startMillisInput.setText(String.valueOf(floatingMillis));
         }
 
-        // اجرای تنظیمات با منطق اصلی برنامه
         startClicking();
     }
 
@@ -266,6 +240,9 @@ public class MainActivity extends Activity {
 
         clickCountInput =
                 findViewById(R.id.clickCountInput);
+
+        cycleTotalCountInput =
+                findViewById(R.id.cycleTotalCountInput);
 
         touchMillisInput =
                 findViewById(R.id.touchMillisInput);
@@ -345,6 +322,10 @@ public class MainActivity extends Activity {
 
     private void updateClocks() {
 
+        if (phoneClock == null) {
+            return;
+        }
+
         long phoneEpoch = System.currentTimeMillis();
 
         phoneClock.setText(
@@ -364,11 +345,7 @@ public class MainActivity extends Activity {
 
             clockDifference.setText(
                     "اختلاف ساعت گوشی با اینترنت: "
-                            + String.format(
-                                    Locale.US,
-                                    "%+d ms",
-                                    difference
-                            )
+                            + String.format(Locale.US, "%+d ms", difference)
             );
 
             syncStatus.setText(
@@ -388,13 +365,8 @@ public class MainActivity extends Activity {
             );
 
             if (syncInProgress) {
-
-                syncStatus.setText(
-                        "در حال دریافت زمان اینترنتی..."
-                );
-
+                syncStatus.setText("در حال دریافت زمان اینترنتی...");
             } else {
-
                 syncStatus.setText(
                         "زمان اینترنتی هنوز دریافت نشده است"
                 );
@@ -409,9 +381,7 @@ public class MainActivity extends Activity {
                 Locale.US
         );
 
-        format.setTimeZone(
-                TimeZone.getTimeZone("Asia/Tehran")
-        );
+        format.setTimeZone(TimeZone.getTimeZone("Asia/Tehran"));
 
         return format.format(new Date(epochMillis));
     }
@@ -424,22 +394,20 @@ public class MainActivity extends Activity {
 
         long elapsedNow = SystemClock.elapsedRealtime();
 
-        return trustedEpochAtSync
-                + (elapsedNow - elapsedAtSync);
+        return trustedEpochAtSync + (elapsedNow - elapsedAtSync);
     }
 
     // ---------------------------------------------------------
-    // همگام‌سازی NTP
+    // همگام‌سازی NTP با محاسبه offset استاندارد
     // ---------------------------------------------------------
 
     private void syncInternetTime() {
 
-        if (syncInProgress) {
+        if (syncInProgress || isFinishing()) {
             return;
         }
 
         syncInProgress = true;
-
         handler.post(this::updateClocks);
 
         networkExecutor.execute(() -> {
@@ -452,17 +420,15 @@ public class MainActivity extends Activity {
 
                     NtpResult result = queryNtpServer(server);
 
-                    if (result != null) {
+                    if (result != null
+                            && (bestResult == null
+                            || result.roundTripMs < bestResult.roundTripMs)) {
 
-                        if (bestResult == null
-                                || result.roundTripMs
-                                < bestResult.roundTripMs) {
-
-                            bestResult = result;
-                        }
+                        bestResult = result;
                     }
 
                 } catch (Exception ignored) {
+                    // تلاش با سرور بعدی
                 }
             }
 
@@ -472,23 +438,21 @@ public class MainActivity extends Activity {
 
                 syncInProgress = false;
 
+                if (isFinishing() || isDestroyed()) {
+                    return;
+                }
+
                 if (finalResult != null) {
 
-                    trustedEpochAtSync =
-                            finalResult.estimatedEpochMs;
+                    trustedEpochAtSync = finalResult.estimatedEpochMs;
+                    elapsedAtSync = finalResult.receivedElapsedMs;
 
-                    elapsedAtSync =
-                            finalResult.receivedElapsedMs;
+                    syncUncertaintyMs = Math.max(
+                            1,
+                            (finalResult.roundTripMs + 1) / 2
+                    );
 
-                    syncUncertaintyMs =
-                            Math.max(
-                                    1,
-                                    (finalResult.roundTripMs + 1) / 2
-                            );
-
-                    lastSyncElapsed =
-                            finalResult.receivedElapsedMs;
-
+                    lastSyncElapsed = finalResult.receivedElapsedMs;
                     timeSynced = true;
 
                     syncStatus.setText(
@@ -533,89 +497,171 @@ public class MainActivity extends Activity {
 
             InetAddress address = InetAddress.getByName(server);
 
-            byte[] request = new byte[48];
+            byte[] request = new byte[NTP_PACKET_SIZE];
 
+            // LI=0, VN=4, Mode=3 (client)
             request[0] = 0x23;
 
-            DatagramPacket requestPacket =
-                    new DatagramPacket(
-                            request,
-                            request.length,
-                            address,
-                            NTP_PORT
-                    );
+            long sendWallEpochMs = System.currentTimeMillis();
+            long sendElapsed = SystemClock.elapsedRealtime();
 
-            long sendElapsed =
-                    SystemClock.elapsedRealtime();
+            // زمان ارسال کلاینت را در فیلد Transmit Timestamp قرار می‌دهیم.
+            writeNtpTimestamp(request, 40, sendWallEpochMs);
+
+            byte[] clientTransmitTimestamp =
+                    Arrays.copyOfRange(request, 40, 48);
+
+            DatagramPacket requestPacket = new DatagramPacket(
+                    request,
+                    request.length,
+                    address,
+                    NTP_PORT
+            );
 
             socket.send(requestPacket);
 
-            byte[] response = new byte[48];
+            byte[] response = new byte[NTP_PACKET_SIZE];
 
-            DatagramPacket responsePacket =
-                    new DatagramPacket(
-                            response,
-                            response.length
-                    );
+            DatagramPacket responsePacket = new DatagramPacket(
+                    response,
+                    response.length
+            );
 
             socket.receive(responsePacket);
 
-            long receiveElapsed =
-                    SystemClock.elapsedRealtime();
+            long receiveElapsed = SystemClock.elapsedRealtime();
+            long receiveWallEpochMs = System.currentTimeMillis();
 
-            long roundTripMs = Math.max(
+            if (responsePacket.getLength() < NTP_PACKET_SIZE) {
+                return null;
+            }
+
+            int leapIndicator = (response[0] >> 6) & 0x03;
+            int version = (response[0] >> 3) & 0x07;
+            int mode = response[0] & 0x07;
+            int stratum = response[1] & 0xFF;
+
+            if (leapIndicator == 3
+                    || (version != 3 && version != 4)
+                    || mode != 4
+                    || stratum < 1
+                    || stratum > 15) {
+
+                return null;
+            }
+
+            // پاسخ باید به درخواست همین کلاینت تعلق داشته باشد.
+            byte[] originateTimestamp =
+                    Arrays.copyOfRange(response, 24, 32);
+
+            if (!Arrays.equals(
+                    clientTransmitTimestamp,
+                    originateTimestamp
+            )) {
+                return null;
+            }
+
+            long serverReceiveEpochMs =
+                    readNtpTimestamp(response, 32);
+
+            long serverTransmitEpochMs =
+                    readNtpTimestamp(response, 40);
+
+            if (serverReceiveEpochMs <= 0
+                    || serverTransmitEpochMs <= 0
+                    || serverTransmitEpochMs < serverReceiveEpochMs) {
+
+                return null;
+            }
+
+            // t1: زمان ارسال کلاینت
+            // t2: زمان دریافت درخواست توسط سرور
+            // t3: زمان ارسال پاسخ توسط سرور
+            // t4: زمان دریافت پاسخ توسط کلاینت
+            //
+            // offset = ((t2 - t1) + (t3 - t4)) / 2
+
+            long t1 = sendWallEpochMs;
+            long t2 = serverReceiveEpochMs;
+            long t3 = serverTransmitEpochMs;
+            long t4 = receiveWallEpochMs;
+
+            double offset =
+                    ((double) (t2 - t1) + (double) (t3 - t4)) / 2.0;
+
+            long estimatedEpochAtReceive =
+                    t4 + Math.round(offset);
+
+            // تأخیر شبکه از ساعت یکنواخت محاسبه می‌شود تا تغییر
+            // ساعت دیواری گوشی در طول درخواست روی RTT اثر نگذارد.
+            long elapsedRoundTrip = Math.max(
                     0,
                     receiveElapsed - sendElapsed
             );
 
-            if (responsePacket.getLength() < 48) {
-                return null;
-            }
+            long serverProcessingMs = Math.max(
+                    0,
+                    t3 - t2
+            );
 
-            int mode = response[0] & 0x07;
-            int stratum = response[1] & 0xFF;
+            long networkRoundTrip = Math.max(
+                    0,
+                    elapsedRoundTrip - serverProcessingMs
+            );
 
-            if (mode != 4 && mode != 5) {
-                return null;
-            }
-
-            if (stratum < 1 || stratum > 15) {
-                return null;
-            }
-
-            long seconds = readUnsignedInt(response, 40);
-            long fraction = readUnsignedInt(response, 44);
-
-            if (seconds == 0) {
-                return null;
-            }
-
-            long unixSeconds = seconds - 2208988800L;
-
-            long fractionMillis =
-                    (fraction * 1000L) >>> 32;
-
-            long serverTransmitEpoch =
-                    unixSeconds * 1000L + fractionMillis;
-
-            long estimatedEpoch =
-                    serverTransmitEpoch + roundTripMs / 2L;
-
-            if (estimatedEpoch < 1577836800000L) {
+            if (estimatedEpochAtReceive < 1577836800000L
+                    || estimatedEpochAtReceive > 4102444800000L) {
                 return null;
             }
 
             return new NtpResult(
                     server,
-                    estimatedEpoch,
+                    estimatedEpochAtReceive,
                     receiveElapsed,
-                    roundTripMs
+                    networkRoundTrip
             );
 
         } finally {
-
             socket.close();
         }
+    }
+
+    private void writeNtpTimestamp(
+            byte[] data,
+            int offset,
+            long unixEpochMillis
+    ) {
+
+        long seconds = unixEpochMillis / 1000L + NTP_EPOCH_OFFSET;
+        long millis = unixEpochMillis % 1000L;
+
+        long fraction = (millis << 32) / 1000L;
+
+        writeUnsignedInt(data, offset, seconds);
+        writeUnsignedInt(data, offset + 4, fraction);
+    }
+
+    private void writeUnsignedInt(
+            byte[] data,
+            int offset,
+            long value
+    ) {
+
+        data[offset] = (byte) (value >>> 24);
+        data[offset + 1] = (byte) (value >>> 16);
+        data[offset + 2] = (byte) (value >>> 8);
+        data[offset + 3] = (byte) value;
+    }
+
+    private long readNtpTimestamp(byte[] data, int offset) {
+
+        long seconds = readUnsignedInt(data, offset);
+        long fraction = readUnsignedInt(data, offset + 4);
+
+        long unixSeconds = seconds - NTP_EPOCH_OFFSET;
+        long fractionMillis = (fraction * 1000L) >>> 32;
+
+        return unixSeconds * 1000L + fractionMillis;
     }
 
     private long readUnsignedInt(byte[] data, int offset) {
@@ -673,7 +719,6 @@ public class MainActivity extends Activity {
             ).show();
 
             openOverlaySettings();
-
             return;
         }
 
@@ -691,7 +736,6 @@ public class MainActivity extends Activity {
             ).show();
 
             syncInternetTime();
-
             return;
         }
 
@@ -708,7 +752,6 @@ public class MainActivity extends Activity {
                     || millis < 0 || millis > 999) {
 
                 showError("زمان شروع معتبر نیست.");
-
                 return;
             }
 
@@ -727,6 +770,9 @@ public class MainActivity extends Activity {
             long clickCount =
                     readNumber(clickCountInput, 2);
 
+            long totalCycleCount =
+                    readNumber(cycleTotalCountInput, 1);
+
             long touchMillis =
                     readNumber(touchMillisInput, 5);
 
@@ -742,37 +788,27 @@ public class MainActivity extends Activity {
                     || cycleMillis < 0
                     || clickCount <= 0
                     || clickCount > Integer.MAX_VALUE
+                    || totalCycleCount <= 0
+                    || totalCycleCount > Integer.MAX_VALUE
                     || touchMillis <= 0
                     || pauseSeconds < 0
                     || pauseMillis < 0) {
 
                 showError("یکی از مقادیر تنظیمات معتبر نیست.");
-
                 return;
             }
 
             long intervalDuration =
-                    combineDuration(
-                            intervalSeconds,
-                            intervalMillis
-                    );
+                    combineDuration(intervalSeconds, intervalMillis);
 
             long cycleDuration =
-                    combineDuration(
-                            cycleSeconds,
-                            cycleMillis
-                    );
+                    combineDuration(cycleSeconds, cycleMillis);
 
             long pauseDuration =
-                    combineDuration(
-                            pauseSeconds,
-                            pauseMillis
-                    );
+                    combineDuration(pauseSeconds, pauseMillis);
 
             if (cycleDuration <= 0) {
-
                 showError("مدت چرخه باید بیشتر از صفر باشد.");
-
                 return;
             }
 
@@ -781,9 +817,7 @@ public class MainActivity extends Activity {
                     : System.currentTimeMillis();
 
             if (sourceNow <= 0) {
-
                 showError("زمان مبنا معتبر نیست.");
-
                 return;
             }
 
@@ -805,8 +839,7 @@ public class MainActivity extends Activity {
                             .toInstant()
                             .toEpochMilli();
 
-            long startDelay =
-                    scheduledStartEpoch - sourceNow;
+            long startDelay = scheduledStartEpoch - sourceNow;
 
             if (startDelay <= 0) {
 
@@ -818,19 +851,14 @@ public class MainActivity extends Activity {
                 return;
             }
 
-            long nowElapsed =
-                    SystemClock.elapsedRealtime();
+            long nowElapsed = SystemClock.elapsedRealtime();
 
             if (startDelay > Long.MAX_VALUE - nowElapsed) {
-
                 showError("فاصله زمانی شروع بیش از حد بزرگ است.");
-
                 return;
             }
 
-            scheduledStartElapsed =
-                    nowElapsed + startDelay;
-
+            scheduledStartElapsed = nowElapsed + startDelay;
             countdownActive = true;
 
             Intent serviceIntent =
@@ -838,6 +866,8 @@ public class MainActivity extends Activity {
 
             serviceIntent.setAction(FloatingService.ACTION_START);
 
+            // زمان دیواری فقط برای نمایش/گزارش است؛ زمان‌بندی
+            // واقعی سرویس با start_delay_ms انجام می‌شود.
             serviceIntent.putExtra(
                     "start_time_epoch_ms",
                     System.currentTimeMillis() + startDelay
@@ -859,6 +889,11 @@ public class MainActivity extends Activity {
             );
 
             serviceIntent.putExtra(
+                    "cycle_total_count",
+                    totalCycleCount
+            );
+
+            serviceIntent.putExtra(
                     "touch_duration_ms",
                     touchMillis
             );
@@ -874,11 +909,8 @@ public class MainActivity extends Activity {
             );
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-
                 startForegroundService(serviceIntent);
-
             } else {
-
                 startService(serviceIntent);
             }
 
@@ -892,7 +924,8 @@ public class MainActivity extends Activity {
 
             Toast.makeText(
                     this,
-                    "زمان شروع ثبت شد.",
+                    "زمان شروع ثبت شد. تعداد چرخه‌ها: "
+                            + totalCycleCount,
                     Toast.LENGTH_SHORT
             ).show();
 
@@ -912,9 +945,7 @@ public class MainActivity extends Activity {
 
     private long readNumber(EditText input, long defaultValue) {
 
-        String value = input.getText()
-                .toString()
-                .trim();
+        String value = input.getText().toString().trim();
 
         if (value.isEmpty()) {
             return defaultValue;
@@ -956,8 +987,7 @@ public class MainActivity extends Activity {
         }
 
         long remaining =
-                scheduledStartElapsed
-                        - SystemClock.elapsedRealtime();
+                scheduledStartElapsed - SystemClock.elapsedRealtime();
 
         if (remaining <= 0) {
 
@@ -966,12 +996,9 @@ public class MainActivity extends Activity {
             countdownSecond.setText("00");
             countdownMillis.setText("000");
 
-            countdownText.setText(
-                    "زمان شروع فرا رسیده است."
-            );
+            countdownText.setText("زمان شروع فرا رسیده است.");
 
             countdownActive = false;
-
             return;
         }
 
@@ -1005,17 +1032,12 @@ public class MainActivity extends Activity {
 
         countdownActive = false;
 
-        Intent intent =
-                new Intent(this, FloatingService.class);
-
+        Intent intent = new Intent(this, FloatingService.class);
         intent.setAction(FloatingService.ACTION_STOP);
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-
             startForegroundService(intent);
-
         } else {
-
             startService(intent);
         }
 
@@ -1031,23 +1053,16 @@ public class MainActivity extends Activity {
     private void showFloatingPanel() {
 
         if (!Settings.canDrawOverlays(this)) {
-
             openOverlaySettings();
-
             return;
         }
 
-        Intent intent =
-                new Intent(this, FloatingService.class);
-
+        Intent intent = new Intent(this, FloatingService.class);
         intent.setAction(FloatingService.SHOW_PANEL);
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-
             startForegroundService(intent);
-
         } else {
-
             startService(intent);
         }
     }
@@ -1056,17 +1071,12 @@ public class MainActivity extends Activity {
 
         countdownActive = false;
 
-        Intent intent =
-                new Intent(this, FloatingService.class);
-
+        Intent intent = new Intent(this, FloatingService.class);
         intent.setAction(FloatingService.ACTION_SHUTDOWN);
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-
             startForegroundService(intent);
-
         } else {
-
             startService(intent);
         }
 
@@ -1089,13 +1099,9 @@ public class MainActivity extends Activity {
         }
 
         ComponentName serviceComponent =
-                new ComponentName(
-                        this,
-                        AutoClickService.class
-                );
+                new ComponentName(this, AutoClickService.class);
 
-        String expected =
-                serviceComponent.flattenToString();
+        String expected = serviceComponent.flattenToString();
 
         return enabledServices.toLowerCase(Locale.ROOT)
                 .contains(expected.toLowerCase(Locale.ROOT));
@@ -1141,7 +1147,6 @@ public class MainActivity extends Activity {
     protected void onDestroy() {
 
         handler.removeCallbacks(clockRunnable);
-
         networkExecutor.shutdownNow();
 
         super.onDestroy();
