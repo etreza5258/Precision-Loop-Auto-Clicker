@@ -29,6 +29,7 @@ import android.view.WindowManager;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.NumberPicker;
+import android.widget.ScrollView;
 import android.widget.TextView;
 
 import java.lang.reflect.Field;
@@ -36,6 +37,7 @@ import java.text.SimpleDateFormat;
 import java.util.Calendar;
 import java.util.Date;
 import java.util.Locale;
+import java.util.List;
 import java.util.TimeZone;
 
 public class FloatingService extends Service {
@@ -91,6 +93,7 @@ public class FloatingService extends Service {
     private TextView countdownMinute;
     private TextView countdownSecond;
     private TextView countdownMillis;
+    private TextView reportsButton;
 
     private WindowManager.LayoutParams panelParams;
     private WindowManager.LayoutParams markerParams;
@@ -105,6 +108,7 @@ public class FloatingService extends Service {
 
     private long runGeneration;
     private long cycleIndex;
+    private long totalCycleCount = 1;
 
     private long anchorElapsedMs;
     private long selectedStartEpochMs;
@@ -124,6 +128,11 @@ public class FloatingService extends Service {
 
     private long successAtStart;
     private long failedAtStart;
+
+    private boolean cycleYellow;
+    private boolean cycleIntervalViolation;
+    private boolean cycleDeadlineSkipped;
+    private boolean cycleOtherFailure;
 
     private Runnable cycleStartRunnable;
     private Runnable nextClickRunnable;
@@ -1077,8 +1086,32 @@ public class FloatingService extends Service {
         countdownContainer.addView(heading);
         countdownContainer.addView(selectedTimeView);
         countdownContainer.addView(countdownStatusView);
-        countdownContainer.addView(digits);
 
+        LinearLayout digitsAndReports = new LinearLayout(this);
+        digitsAndReports.setOrientation(LinearLayout.HORIZONTAL);
+        digitsAndReports.setGravity(Gravity.CENTER_VERTICAL);
+
+        LinearLayout.LayoutParams digitsParams =
+                new LinearLayout.LayoutParams(0, dp(32), 1f);
+        digits.setLayoutParams(digitsParams);
+        digitsAndReports.addView(digits);
+
+        reportsButton = new TextView(this);
+        reportsButton.setText("▤");
+        reportsButton.setTextColor(Color.WHITE);
+        reportsButton.setTextSize(19);
+        reportsButton.setGravity(Gravity.CENTER);
+        reportsButton.setBackground(makeBackground(
+                Color.rgb(55, 85, 110), dp(6)));
+        LinearLayout.LayoutParams reportsParams =
+                new LinearLayout.LayoutParams(dp(34), dp(32));
+        reportsParams.setMargins(dp(4), 0, 0, 0);
+        reportsButton.setLayoutParams(reportsParams);
+        reportsButton.setContentDescription("گزارش چرخه‌ها");
+        reportsButton.setOnClickListener(v -> showFloatingReports());
+        digitsAndReports.addView(reportsButton);
+
+        countdownContainer.addView(digitsAndReports);
         panel.addView(countdownContainer);
     }
 
@@ -1235,6 +1268,99 @@ public class FloatingService extends Service {
 
         if (countdownStatusView != null) {
             countdownStatusView.setText(message);
+        }
+    }
+
+    private void showFloatingReports() {
+
+        List<String> reports = CycleReportStore.getFloatingReports(this);
+
+        Dialog dialog = new Dialog(
+                this,
+                android.R.style.Theme_Material_Light_Dialog_Alert
+        );
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setPadding(dp(14), dp(12), dp(14), dp(12));
+        root.setBackground(makeBackground(Color.WHITE, dp(12)));
+
+        TextView title = new TextView(this);
+        title.setText("۱۰ چرخهٔ اخیر");
+        title.setTextColor(TITLE_COLOR);
+        title.setTextSize(16);
+        title.setTypeface(null, Typeface.BOLD);
+        title.setGravity(Gravity.CENTER);
+        title.setPadding(0, 0, 0, dp(8));
+        root.addView(title);
+
+        ScrollView scrollView = new ScrollView(this);
+        scrollView.setFillViewport(true);
+        LinearLayout rows = new LinearLayout(this);
+        rows.setOrientation(LinearLayout.VERTICAL);
+
+        if (reports == null || reports.isEmpty()) {
+            TextView empty = new TextView(this);
+            empty.setText("هنوز گزارشی ثبت نشده است");
+            empty.setTextColor(Color.DKGRAY);
+            empty.setTextSize(13);
+            empty.setGravity(Gravity.CENTER);
+            empty.setPadding(dp(8), dp(18), dp(8), dp(18));
+            rows.addView(empty);
+        } else {
+            for (String report : reports) {
+                TextView row = new TextView(this);
+                row.setText(report == null ? "" : report);
+                row.setTextColor(Color.rgb(35, 45, 55));
+                row.setTextSize(12);
+                row.setGravity(Gravity.CENTER_VERTICAL);
+                row.setPadding(dp(9), dp(9), dp(9), dp(9));
+                row.setBackground(makeBackground(
+                        Color.rgb(242, 245, 248), dp(6)));
+                LinearLayout.LayoutParams rowParams =
+                        new LinearLayout.LayoutParams(
+                                LinearLayout.LayoutParams.MATCH_PARENT,
+                                LinearLayout.LayoutParams.WRAP_CONTENT);
+                rowParams.setMargins(0, 0, 0, dp(5));
+                row.setLayoutParams(rowParams);
+                rows.addView(row);
+            }
+        }
+
+        scrollView.addView(rows);
+        LinearLayout.LayoutParams scrollParams =
+                new LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT, dp(300));
+        root.addView(scrollView, scrollParams);
+
+        TextView close = createDialogButton("بستن", Color.rgb(65, 85, 105));
+        LinearLayout.LayoutParams closeParams =
+                new LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT, dp(40));
+        closeParams.setMargins(0, dp(8), 0, 0);
+        close.setLayoutParams(closeParams);
+        close.setOnClickListener(v -> dialog.dismiss());
+        root.addView(close);
+
+        dialog.setContentView(root);
+        dialog.setCancelable(true);
+        Window window = dialog.getWindow();
+        if (window != null) {
+            window.setType(getOverlayType());
+            window.setBackgroundDrawableResource(android.R.color.transparent);
+            WindowManager.LayoutParams params = window.getAttributes();
+            params.width = dp(320);
+            params.height = WindowManager.LayoutParams.WRAP_CONTENT;
+            params.gravity = Gravity.CENTER;
+            window.setAttributes(params);
+        }
+        try {
+            dialog.show();
+            if (window != null) {
+                window.setLayout(dp(320), WindowManager.LayoutParams.WRAP_CONTENT);
+            }
+        } catch (Exception e) {
+            updateCountdownStatus("نمایش گزارش‌ها ممکن نشد");
         }
     }
 
@@ -1516,10 +1642,13 @@ public class FloatingService extends Service {
         clickCount =
                 config.getLongExtra("click_count", 1);
 
+        totalCycleCount = config.getLongExtra("cycle_total_count", 1);
+
         if (cycleDurationMs <= 0
                 || pauseDurationMs < 0
                 || clickIntervalMs < 0
-                || clickCount <= 0) {
+                || clickCount <= 0
+                || totalCycleCount <= 0) {
 
             updateCountdownStatus("مقادیر تنظیمات معتبر نیستند");
             return;
@@ -1582,6 +1711,10 @@ public class FloatingService extends Service {
         cycleIndex = 0;
         clickNumber = 0;
         lastBatchCount = 0;
+        cycleYellow = false;
+        cycleIntervalViolation = false;
+        cycleDeadlineSkipped = false;
+        cycleOtherFailure = false;
 
         showFloatingViews();
         updateTarget();
@@ -1745,6 +1878,10 @@ public class FloatingService extends Service {
 
         clickNumber = 0;
         lastBatchCount = 0;
+        cycleYellow = false;
+        cycleIntervalViolation = false;
+        cycleDeadlineSkipped = false;
+        cycleOtherFailure = false;
 
         cycleStartElapsedMs =
                 SystemClock.elapsedRealtime();
@@ -1781,67 +1918,56 @@ public class FloatingService extends Service {
             return;
         }
 
-        accessibility = getReadyAccessibility();
+        long now = SystemClock.elapsedRealtime();
+        if (now >= cycleDeadlineElapsedMs) {
+            cycleYellow = true;
+            cycleDeadlineSkipped = true;
+            waitForCycleEnd(generation);
+            return;
+        }
 
+        accessibility = getReadyAccessibility();
         if (accessibility == null) {
             waitForAccessibility(generation);
             return;
         }
 
-        long effectiveInterval =
-                Math.max(
-                        1L,
-                        accessibility.getEffectiveClickIntervalMs(
-                                clickIntervalMs
-                        )
-                );
+        long effectiveInterval = Math.max(
+                1L,
+                accessibility.getEffectiveClickIntervalMs(clickIntervalMs)
+        );
 
         long targetElapsed;
-
         if (clickNumber == 0 || lastBatchCount <= 0) {
-
-            targetElapsed = SystemClock.elapsedRealtime();
-
+            targetElapsed = now;
         } else {
-
-            long offset;
-
-            if (lastBatchCount >
-                    Long.MAX_VALUE / effectiveInterval) {
-
+            if (lastBatchCount > Long.MAX_VALUE / effectiveInterval) {
+                cycleOtherFailure = true;
                 waitForCycleEnd(generation);
                 return;
             }
-
-            offset = lastBatchCount * effectiveInterval;
-
-            if (lastClickDispatchElapsedMs >
-                    Long.MAX_VALUE - offset) {
-
+            long offset = lastBatchCount * effectiveInterval;
+            if (lastClickDispatchElapsedMs > Long.MAX_VALUE - offset) {
+                cycleOtherFailure = true;
                 waitForCycleEnd(generation);
                 return;
             }
-
-            targetElapsed =
-                    lastClickDispatchElapsedMs + offset;
+            targetElapsed = lastClickDispatchElapsedMs + offset;
         }
 
         if (targetElapsed >= cycleDeadlineElapsedMs) {
+            cycleYellow = true;
+            cycleDeadlineSkipped = true;
             waitForCycleEnd(generation);
             return;
         }
 
         nextClickRunnable = () -> {
-
             if (isCurrentRun(generation) && cycleActive) {
                 dispatchNextClick(generation);
             }
         };
-
-        postAtElapsedTime(
-                nextClickRunnable,
-                targetElapsed
-        );
+        postAtElapsedTime(nextClickRunnable, targetElapsed);
     }
 
     private void dispatchNextClick(long generation) {
@@ -1850,175 +1976,133 @@ public class FloatingService extends Service {
             return;
         }
 
+        // Deadline check precedes service lookup/retry: no new Gesture may
+        // be queued once the cycle has ended.
+        long now = SystemClock.elapsedRealtime();
+        if (now >= cycleDeadlineElapsedMs) {
+            cycleYellow = true;
+            cycleDeadlineSkipped = true;
+            waitForCycleEnd(generation);
+            return;
+        }
+
         accessibility = getReadyAccessibility();
-
         if (accessibility == null) {
-
-            updateCountdownStatus(
-                    "اتصال سرویس کلیک قطع شده؛ تلاش مجدد"
-            );
-
+            updateCountdownStatus("اتصال سرویس کلیک قطع شده؛ تلاش مجدد");
             nextClickRunnable = () -> {
-
                 if (isCurrentRun(generation) && cycleActive) {
                     dispatchNextClick(generation);
                 }
             };
-
-            handler.postDelayed(
-                    nextClickRunnable,
-                    SERVICE_RETRY_MS
-            );
-
+            handler.postDelayed(nextClickRunnable, SERVICE_RETRY_MS);
             return;
         }
 
         if (accessibility.isGestureInProgress()) {
-
             nextClickRunnable = () -> {
-
                 if (isCurrentRun(generation) && cycleActive) {
                     dispatchNextClick(generation);
                 }
             };
-
-            handler.postDelayed(
-                    nextClickRunnable,
-                    GESTURE_RETRY_MS
-            );
-
-            return;
-        }
-
-        long now = SystemClock.elapsedRealtime();
-
-        if (now >= cycleDeadlineElapsedMs) {
-            waitForCycleEnd(generation);
+            handler.postDelayed(nextClickRunnable, GESTURE_RETRY_MS);
             return;
         }
 
         accessibility.setTarget(targetX, targetY);
-
         final AutoClickService clickService = accessibility;
 
         long remainingClicks = clickCount - clickNumber;
-
-        int maxBatchCount =
-                clickService.getMaxBatchClickCount(clickIntervalMs);
-
+        int maxBatchCount = clickService.getMaxBatchClickCount(clickIntervalMs);
         if (maxBatchCount <= 0) {
-
-            nextClickRunnable = () -> {
-
-                if (isCurrentRun(generation) && cycleActive) {
-                    dispatchNextClick(generation);
-                }
-            };
-
-            handler.postDelayed(
-                    nextClickRunnable,
-                    GESTURE_RETRY_MS
-            );
-
-            return;
-        }
-
-        long effectiveInterval =
-                Math.max(
-                        1L,
-                        clickService.getEffectiveClickIntervalMs(
-                                clickIntervalMs
-                        )
-                );
-
-        long remainingTime =
-                cycleDeadlineElapsedMs - now;
-
-        if (remainingTime <= 0) {
+            cycleOtherFailure = true;
             waitForCycleEnd(generation);
             return;
         }
 
-        long clicksFittingInCycle =
-                ((remainingTime - 1L) / effectiveInterval) + 1L;
-
-        long requestedBatchCount = Math.min(
+        int requestedBatchCount = (int) Math.min(
                 remainingClicks,
-                Math.min(
-                        (long) maxBatchCount,
-                        clicksFittingInCycle
-                )
+                (long) maxBatchCount
         );
-
         if (requestedBatchCount <= 0) {
             waitForCycleEnd(generation);
             return;
         }
 
-        final int batchCount = (int) requestedBatchCount;
-
         final long callbackGeneration = generation;
+        final long dispatchElapsed = SystemClock.elapsedRealtime();
+        if (dispatchElapsed >= cycleDeadlineElapsedMs) {
+            cycleYellow = true;
+            cycleDeadlineSkipped = true;
+            waitForCycleEnd(generation);
+            return;
+        }
 
-        clickNumber += batchCount;
-
-        lastClickDispatchElapsedMs = now;
-        lastBatchCount = batchCount;
+        lastClickDispatchElapsedMs = dispatchElapsed;
+        lastBatchCount = 0;
 
         int acceptedCount = clickService.performClickBatch(
-                batchCount,
+                requestedBatchCount,
                 clickIntervalMs,
-                () -> {
+                cycleDeadlineElapsedMs,
+                () -> handler.post(() -> {
+                    if (!isCurrentRun(callbackGeneration) || !cycleActive) {
+                        return;
+                    }
 
-                    handler.post(() -> {
+                    if (clickService.wasLastBatchRejectedForInterval()) {
+                        cycleYellow = true;
+                        cycleIntervalViolation = true;
+                    }
+                    if (clickService.getLastBatchSkippedByDeadline() > 0) {
+                        cycleYellow = true;
+                        cycleDeadlineSkipped = true;
+                    }
+                    if (clickService.getFailedClicks() > 0) {
+                        cycleOtherFailure = true;
+                    }
 
-                        if (!isCurrentRun(callbackGeneration)
-                                || !cycleActive) {
-                            return;
-                        }
-
-                        if (SystemClock.elapsedRealtime()
-                                >= cycleDeadlineElapsedMs
-                                || clickNumber >= clickCount) {
-
-                            waitForCycleEnd(callbackGeneration);
-
-                        } else {
-
-                            scheduleNextClick(callbackGeneration);
-                        }
-
-                        updateDisplay();
-                    });
-                }
+                    if (SystemClock.elapsedRealtime() >= cycleDeadlineElapsedMs
+                            || clickNumber >= clickCount
+                            || cycleIntervalViolation
+                            || cycleOtherFailure) {
+                        waitForCycleEnd(callbackGeneration);
+                    } else {
+                        scheduleNextClick(callbackGeneration);
+                    }
+                    updateDisplay();
+                })
         );
 
+        // AutoClickService returns the number of Stroke objects accepted
+        // for dispatch. Rejected interval/deadline batches are not retried:
+        // retrying could conceal a real interval violation.
         if (acceptedCount <= 0) {
-
-            clickNumber -= batchCount;
+            if (clickService.wasLastBatchRejectedForInterval()) {
+                cycleYellow = true;
+                cycleIntervalViolation = true;
+            } else if (clickService.getLastBatchSkippedByDeadline() > 0) {
+                cycleYellow = true;
+                cycleDeadlineSkipped = true;
+            } else {
+                cycleOtherFailure = true;
+            }
             lastBatchCount = 0;
-
-            nextClickRunnable = () -> {
-
-                if (isCurrentRun(generation) && cycleActive) {
-                    dispatchNextClick(generation);
-                }
-            };
-
-            handler.postDelayed(
-                    nextClickRunnable,
-                    GESTURE_RETRY_MS
-            );
-
+            waitForCycleEnd(generation);
             updateDisplay();
             return;
         }
 
-        if (acceptedCount < batchCount) {
+        lastBatchCount = acceptedCount;
+        clickNumber += acceptedCount;
 
-            long difference = batchCount - acceptedCount;
+        if (acceptedCount < requestedBatchCount) {
+            cycleYellow = true;
+            cycleDeadlineSkipped = true;
+        }
 
-            clickNumber -= difference;
-            lastBatchCount = acceptedCount;
+        if (clickService.getLastBatchSkippedByDeadline() > 0) {
+            cycleYellow = true;
+            cycleDeadlineSkipped = true;
         }
 
         updateDisplay();
@@ -2026,7 +2110,7 @@ public class FloatingService extends Service {
 
     private void waitForCycleEnd(long generation) {
 
-        if (!isCurrentRun(generation)) {
+        if (!isCurrentRun(generation) || !cycleActive) {
             return;
         }
 
@@ -2036,9 +2120,14 @@ public class FloatingService extends Service {
             nextClickRunnable = null;
         }
 
-        cycleFinishRunnable = () -> {
+        if (cycleFinishRunnable != null) {
+            handler.removeCallbacks(cycleFinishRunnable);
+            cycleFinishRunnable = null;
+        }
 
-            if (isCurrentRun(generation)) {
+        cycleFinishRunnable = () -> {
+            cycleFinishRunnable = null;
+            if (isCurrentRun(generation) && cycleActive) {
                 finishCycle(generation);
             }
         };
@@ -2051,99 +2140,79 @@ public class FloatingService extends Service {
 
     private void finishCycle(long generation) {
 
-        if (!isCurrentRun(generation)) {
+        if (!isCurrentRun(generation) || !cycleActive) {
             return;
         }
 
+        cycleFinishRunnable = null;
+
         accessibility = getReadyAccessibility();
-
-        if (accessibility != null
-                && accessibility.isGestureInProgress()) {
-
+        if (accessibility != null && accessibility.isGestureInProgress()) {
             cycleFinishRunnable = () -> {
-
                 if (isCurrentRun(generation)) {
                     finishCycle(generation);
                 }
             };
-
-            handler.postDelayed(
-                    cycleFinishRunnable,
-                    GESTURE_RETRY_MS
-            );
-
+            handler.postDelayed(cycleFinishRunnable, GESTURE_RETRY_MS);
             return;
         }
 
         cycleActive = false;
 
-        if (accessibility != null) {
+        long successes = accessibility == null
+                ? 0L : accessibility.getSuccessfulClicks();
+        long failures = accessibility == null
+                ? 1L : accessibility.getFailedClicks();
 
-            long successes = Math.max(
-                    0L,
-                    accessibility.getSuccessfulClicks()
-                            - successAtStart
-            );
-
-            long failures = Math.max(
-                    0L,
-                    accessibility.getFailedClicks()
-                            - failedAtStart
-            );
-
-            long averageLatency =
-                    accessibility.getAverageGestureLatencyNanos();
-
-            long maxLatency =
-                    accessibility.getMaxGestureLatencyNanos();
-
-            long measured =
-                    accessibility.getMeasuredGestures();
-
-            long actualDuration = Math.max(
-                    0,
-                    SystemClock.elapsedRealtime()
-                            - cycleStartElapsedMs
-            );
-
-            CycleReportStore.addReport(
-                    this,
-                    cycleIndex + 1,
-                    cycleStartWallMs,
-                    actualDuration,
-                    successes,
-                    failures,
-                    averageLatency,
-                    maxLatency,
-                    measured
-            );
+        if (accessibility == null) {
+            cycleOtherFailure = true;
         }
+
+        boolean incomplete = successes < clickCount;
+        if (incomplete && SystemClock.elapsedRealtime() >= cycleDeadlineElapsedMs) {
+            cycleYellow = true;
+            cycleDeadlineSkipped = true;
+        }
+
+        final String status;
+        if (cycleIntervalViolation || cycleDeadlineSkipped) {
+            status = CycleReportStore.STATUS_YELLOW;
+        } else if (!cycleOtherFailure && failures == 0 && successes >= clickCount) {
+            status = CycleReportStore.STATUS_GREEN;
+        } else {
+            status = CycleReportStore.STATUS_RED;
+        }
+
+        CycleReportStore.addReport(
+                this,
+                cycleIndex + 1,
+                cycleStartWallMs,
+                status,
+                successes
+        );
 
         cycleIndex++;
 
-        long nextTarget =
-                getCycleTargetElapsed(cycleIndex);
+        if (cycleIndex >= totalCycleCount) {
+            stopLoop();
+            updateCountdownStatus("همهٔ چرخه‌ها به پایان رسیدند");
+            updateDisplay();
+            return;
+        }
 
+        long nextTarget = getCycleTargetElapsed(cycleIndex);
         if (nextTarget == Long.MAX_VALUE) {
-
             stopLoop();
             updateCountdownStatus("محدودیت زمان‌بندی چرخه");
-
             return;
         }
 
         cycleStartRunnable = () -> {
-
             if (isCurrentRun(generation)) {
                 startCycle(generation);
             }
         };
-
-        postAtElapsedTime(
-                cycleStartRunnable,
-                nextTarget
-        );
-
+        postAtElapsedTime(cycleStartRunnable, nextTarget);
         updateDisplay();
     }
 
@@ -2162,7 +2231,9 @@ public class FloatingService extends Service {
 
         setMarkerTouchable(true);
 
-        updateCountdownStatus("متوقف شد");
+        if (countdownStatusView != null) {
+            updateCountdownStatus("متوقف شد");
+        }
         updateDisplay();
     }
 
