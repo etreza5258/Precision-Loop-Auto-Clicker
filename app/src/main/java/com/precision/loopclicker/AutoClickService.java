@@ -18,10 +18,7 @@ public class AutoClickService extends AccessibilityService {
     private static final long MIN_SEQUENTIAL_INTERVAL_MS = 1L;
     private static final long NANOS_PER_MILLI = 1_000_000L;
 
-    // حاشیه ایمنی پایه برای تأخیر احتمالی سیستم اندروید
     private static final long BASE_DEADLINE_GUARD_MS = 50L;
-
-    // حاشیه اضافه برای نوسان زمان اجرای Gesture
     private static final long EXTRA_DEADLINE_GUARD_MS = 20L;
 
     private static volatile AutoClickService instance;
@@ -58,8 +55,7 @@ public class AutoClickService extends AccessibilityService {
     private volatile long maxGestureLatencyNanos = 0;
     private volatile long measuredGestures = 0;
 
-    private volatile String lastError =
-            "هنوز کلیکی ارسال نشده";
+    private volatile String lastError = "هنوز کلیکی ارسال نشده";
 
     // ---------------------------------------------------------
     // اتصال سرویس
@@ -78,7 +74,6 @@ public class AutoClickService extends AccessibilityService {
 
     @Override
     protected void onServiceConnected() {
-
         super.onServiceConnected();
 
         instance = this;
@@ -96,7 +91,6 @@ public class AutoClickService extends AccessibilityService {
     public void onInterrupt() {
 
         handler.post(() -> {
-
             if (gestureInProgress) {
                 finishGesture(
                         activeGestureId,
@@ -125,7 +119,6 @@ public class AutoClickService extends AccessibilityService {
         } else {
 
             handler.post(() -> {
-
                 if (gestureInProgress) {
                     finishGesture(
                             activeGestureId,
@@ -154,7 +147,6 @@ public class AutoClickService extends AccessibilityService {
     }
 
     public void setTarget(int x, int y) {
-
         targetX = Math.max(0, x);
         targetY = Math.max(0, y);
     }
@@ -245,7 +237,7 @@ public class AutoClickService extends AccessibilityService {
     }
 
     // ---------------------------------------------------------
-    // محاسبه فاصله کلیک
+    // فاصله کلیک
     // ---------------------------------------------------------
 
     public long getEffectiveClickIntervalMs(long requestedIntervalMs) {
@@ -275,8 +267,7 @@ public class AutoClickService extends AccessibilityService {
         long maxDuration =
                 GestureDescription.getMaxGestureDuration();
 
-        if (maxStrokes <= 0
-                || maxDuration < TAP_DURATION_MS) {
+        if (maxStrokes <= 0 || maxDuration < TAP_DURATION_MS) {
             return 0;
         }
 
@@ -296,7 +287,7 @@ public class AutoClickService extends AccessibilityService {
     }
 
     // ---------------------------------------------------------
-    // تبدیل و محاسبات امن زمان
+    // محاسبات امن زمان
     // ---------------------------------------------------------
 
     private long elapsedMillisToNanos(long elapsedMillis) {
@@ -326,10 +317,7 @@ public class AutoClickService extends AccessibilityService {
     }
 
     /**
-     * حاشیه ایمنی بر اساس بیشترین زمان پاسخ مشاهده‌شده.
-     *
-     * این مقدار برای جلوگیری از ارسال کلیک در نزدیکی
-     * پایان چرخه استفاده می‌شود.
+     * حاشیه اطمینان براساس بیشترین تأخیر مشاهده‌شده.
      */
     private long getDeadlineSafetyMarginNanos() {
 
@@ -342,6 +330,39 @@ public class AutoClickService extends AccessibilityService {
                 BASE_DEADLINE_GUARD_MS * NANOS_PER_MILLI;
 
         return Math.max(baseGuard, measuredGuard);
+    }
+
+    /**
+     * بررسی می‌کند که Gesture با احتساب حاشیه اطمینان،
+     * پیش از deadline تمام شود.
+     *
+     * زمان پایان باید اکیداً کوچک‌تر از deadline باشد.
+     */
+    private boolean canFitBeforeDeadline(
+            long currentNanos,
+            long deadlineNanos
+    ) {
+
+        if (deadlineNanos == Long.MAX_VALUE) {
+            return true;
+        }
+
+        if (currentNanos >= deadlineNanos) {
+            return false;
+        }
+
+        long tapNanos =
+                TAP_DURATION_MS * NANOS_PER_MILLI;
+
+        long requiredNanos = safeAdd(
+                tapNanos,
+                getDeadlineSafetyMarginNanos()
+        );
+
+        long predictedEnd =
+                safeAdd(currentNanos, requiredNanos);
+
+        return predictedEnd < deadlineNanos;
     }
 
     // ---------------------------------------------------------
@@ -358,7 +379,7 @@ public class AutoClickService extends AccessibilityService {
     }
 
     // ---------------------------------------------------------
-    // اجرای دسته کلیک بدون مهلت
+    // اجرای دسته کلیک بدون deadline
     // ---------------------------------------------------------
 
     public int performClickBatch(
@@ -376,7 +397,7 @@ public class AutoClickService extends AccessibilityService {
     }
 
     // ---------------------------------------------------------
-    // اجرای کلیک با کنترل مهلت چرخه
+    // اجرای کلیک با کنترل deadline چرخه
     // ---------------------------------------------------------
 
     public int performClickBatch(
@@ -404,10 +425,7 @@ public class AutoClickService extends AccessibilityService {
         lastBatchSkippedByDeadline = 0;
         lastBatchRejectedClickCount = 0;
 
-        // -----------------------------------------------------
         // بررسی سرویس
-        // -----------------------------------------------------
-
         if (!serviceReady) {
 
             lastError = "سرویس دسترسی‌پذیری آماده نیست";
@@ -420,10 +438,7 @@ public class AutoClickService extends AccessibilityService {
             return 0;
         }
 
-        // -----------------------------------------------------
         // جلوگیری از هم‌پوشانی Gesture
-        // -----------------------------------------------------
-
         if (gestureInProgress) {
 
             lastError = "Gesture قبلی هنوز تمام نشده است";
@@ -436,8 +451,7 @@ public class AutoClickService extends AccessibilityService {
             return 0;
         }
 
-        if (requestedCount <= 0
-                || requestedIntervalMs < 0) {
+        if (requestedCount <= 0 || requestedIntervalMs < 0) {
 
             lastError = "تعداد یا فاصله کلیک معتبر نیست";
 
@@ -463,18 +477,44 @@ public class AutoClickService extends AccessibilityService {
         final long intervalNanos =
                 effectiveInterval * NANOS_PER_MILLI;
 
-        final long tapNanos =
-                TAP_DURATION_MS * NANOS_PER_MILLI;
+        final boolean hasDeadline =
+                deadlineElapsedRealtimeMs != Long.MAX_VALUE;
 
-        final long nowNanos =
+        final long deadlineNanos =
+                hasDeadline
+                        ? elapsedMillisToNanos(
+                                deadlineElapsedRealtimeMs
+                        )
+                        : Long.MAX_VALUE;
+
+        // -----------------------------------------------------
+        // کنترل فاصله بین کلیک‌ها
+        // -----------------------------------------------------
+
+        long nowNanos =
                 SystemClock.elapsedRealtimeNanos();
-
-        // -----------------------------------------------------
-        // کنترل فاصله واقعی بین کلیک‌ها
-        // -----------------------------------------------------
 
         if (nextAllowedClickNanos > 0
                 && nowNanos < nextAllowedClickNanos) {
+
+            // اگر تا زمان مجاز بعدی دیگر فرصت امنی باقی نمانده،
+            // کلیک را به علت deadline رد می‌کنیم.
+            if (hasDeadline
+                    && !canFitBeforeDeadline(
+                            nextAllowedClickNanos,
+                            deadlineNanos
+                    )) {
+
+                lastBatchSkippedByDeadline = requestedCount;
+                lastBatchRejectedClickCount = requestedCount;
+
+                lastError =
+                        "کلیک بعدی تا پایان چرخه فرصت امن ندارد";
+
+                runCompletion(completion);
+
+                return 0;
+            }
 
             lastBatchRejectedForInterval = true;
             lastBatchRejectedClickCount = 1;
@@ -495,7 +535,7 @@ public class AutoClickService extends AccessibilityService {
         }
 
         // -----------------------------------------------------
-        // محاسبه ظرفیت
+        // محاسبه ظرفیت Gesture
         // -----------------------------------------------------
 
         final int maxBatchCount =
@@ -510,66 +550,33 @@ public class AutoClickService extends AccessibilityService {
             return 0;
         }
 
-        final boolean hasDeadline =
-                deadlineElapsedRealtimeMs != Long.MAX_VALUE;
-
-        final long deadlineNanos =
-                hasDeadline
-                        ? elapsedMillisToNanos(
-                                deadlineElapsedRealtimeMs
-                        )
-                        : Long.MAX_VALUE;
-
-        // -----------------------------------------------------
-        // قانون اصلی:
-        // در چرخه محدود، فقط یک کلیک در هر Gesture
-        // -----------------------------------------------------
-
-        int batchCount;
+        final int batchCount;
 
         if (hasDeadline) {
 
-            long safetyMargin =
-                    getDeadlineSafetyMarginNanos();
+            // در چرخه محدود، فقط یک کلیک در هر Gesture.
+            // کلیک بعدی فقط پس از callback و بررسی مجدد deadline.
+            batchCount = 1;
 
-            long requiredNanos =
-                    safeAdd(tapNanos, safetyMargin);
-
-            long remainingNanos =
-                    deadlineNanos - nowNanos;
-
-            if (remainingNanos <= requiredNanos) {
+            if (!canFitBeforeDeadline(
+                    SystemClock.elapsedRealtimeNanos(),
+                    deadlineNanos
+            )) {
 
                 lastBatchSkippedByDeadline = requestedCount;
                 lastBatchRejectedClickCount = requestedCount;
 
                 lastError =
-                        "زمان امن کافی برای کلیک بعدی تا پایان چرخه وجود ندارد";
-
-                Log.w(
-                        TAG,
-                        lastError
-                                + " | remainingMs="
-                                + (remainingNanos / NANOS_PER_MILLI)
-                                + " | safetyMs="
-                                + (safetyMargin / NANOS_PER_MILLI)
-                );
+                        "زمان امن کافی برای کلیک بعدی وجود ندارد";
 
                 runCompletion(completion);
 
                 return 0;
             }
 
-            // در چرخه محدود، کلیک‌ها یکی‌یکی ارسال می‌شوند.
-            batchCount = 1;
-
-            if (requestedCount > 1) {
-                lastBatchSkippedByDeadline = 0;
-            }
-
         } else {
 
-            // بدون مهلت چرخه، رفتار دسته‌ای قبلی حفظ می‌شود.
+            // بدون deadline، batching قبلی حفظ می‌شود.
             batchCount = Math.min(
                     requestedCount,
                     maxBatchCount
@@ -643,37 +650,24 @@ public class AutoClickService extends AccessibilityService {
         }
 
         // -----------------------------------------------------
-        // کنترل مجدد مهلت پس از ساخت Gesture
+        // بررسی deadline بعد از ساخت Gesture
         // -----------------------------------------------------
 
-        final long dispatchCheckNanos =
-                SystemClock.elapsedRealtimeNanos();
+        if (hasDeadline
+                && !canFitBeforeDeadline(
+                        SystemClock.elapsedRealtimeNanos(),
+                        deadlineNanos
+                )) {
 
-        if (hasDeadline) {
+            lastBatchSkippedByDeadline = requestedCount;
+            lastBatchRejectedClickCount = requestedCount;
 
-            long safetyMargin =
-                    getDeadlineSafetyMarginNanos();
+            lastError =
+                    "Gesture در مهلت باقی‌مانده جا نمی‌شود";
 
-            long requiredNanos =
-                    safeAdd(tapNanos, safetyMargin);
+            runCompletion(completion);
 
-            long predictedEnd =
-                    safeAdd(dispatchCheckNanos, requiredNanos);
-
-            if (predictedEnd >= deadlineNanos) {
-
-                lastBatchSkippedByDeadline = requestedCount;
-                lastBatchRejectedClickCount = requestedCount;
-
-                lastError =
-                        "کلیک به دلیل نزدیک بودن به پایان چرخه ارسال نشد";
-
-                Log.w(TAG, lastError);
-
-                runCompletion(completion);
-
-                return 0;
-            }
+            return 0;
         }
 
         // -----------------------------------------------------
@@ -682,47 +676,40 @@ public class AutoClickService extends AccessibilityService {
 
         final long gestureId = ++activeGestureId;
 
-        final long previousNextAllowed =
-                nextAllowedClickNanos;
-
         gestureInProgress = true;
 
         activeCompletion = completion;
         activeBatchClickCount = batchCount;
         activeBatchIntervalMs = effectiveInterval;
 
+        // -----------------------------------------------------
+        // کنترل نهایی در نزدیک‌ترین نقطه به dispatchGesture
+        // -----------------------------------------------------
+
         dispatchStartNanos =
                 SystemClock.elapsedRealtimeNanos();
 
-        // آخرین بررسی درست پیش از dispatchGesture
-        if (hasDeadline) {
+        if (hasDeadline
+                && !canFitBeforeDeadline(
+                        dispatchStartNanos,
+                        deadlineNanos
+                )) {
 
-            long safetyMargin =
-                    getDeadlineSafetyMarginNanos();
+            gestureInProgress = false;
 
-            long requiredNanos =
-                    safeAdd(tapNanos, safetyMargin);
+            activeCompletion = null;
+            activeBatchClickCount = 0;
+            activeBatchIntervalMs = 0;
 
-            long predictedEnd =
-                    safeAdd(dispatchStartNanos, requiredNanos);
+            lastBatchSkippedByDeadline = requestedCount;
+            lastBatchRejectedClickCount = requestedCount;
 
-            if (predictedEnd >= deadlineNanos) {
+            lastError =
+                    "کلیک در کنترل نهایی deadline رد شد";
 
-                gestureInProgress = false;
-                activeCompletion = null;
-                activeBatchClickCount = 0;
-                activeBatchIntervalMs = 0;
+            runCompletion(completion);
 
-                lastBatchSkippedByDeadline = requestedCount;
-                lastBatchRejectedClickCount = requestedCount;
-
-                lastError =
-                        "کلیک در کنترل نهایی مهلت چرخه رد شد";
-
-                runCompletion(completion);
-
-                return 0;
-            }
+            return 0;
         }
 
         final long proposedNextAllowed =
@@ -733,7 +720,7 @@ public class AutoClickService extends AccessibilityService {
 
         Log.d(
                 TAG,
-                "Dispatch click"
+                "Dispatch Gesture"
                         + " | count=" + batchCount
                         + " | interval=" + effectiveInterval
                         + " | deadline=" + deadlineElapsedRealtimeMs
@@ -751,6 +738,35 @@ public class AutoClickService extends AccessibilityService {
         boolean accepted = false;
 
         try {
+
+            // زمان‌گیری و کنترل نهایی بلافاصله پیش از ارسال.
+            // هیچ عملیات محاسباتی یا Log بین این بررسی و
+            // dispatchGesture قرار نگرفته است.
+            dispatchStartNanos =
+                    SystemClock.elapsedRealtimeNanos();
+
+            if (hasDeadline
+                    && !canFitBeforeDeadline(
+                            dispatchStartNanos,
+                            deadlineNanos
+                    )) {
+
+                gestureInProgress = false;
+
+                activeCompletion = null;
+                activeBatchClickCount = 0;
+                activeBatchIntervalMs = 0;
+
+                lastBatchSkippedByDeadline = requestedCount;
+                lastBatchRejectedClickCount = requestedCount;
+
+                lastError =
+                        "کلیک در آخرین بررسی deadline رد شد";
+
+                runCompletion(completion);
+
+                return 0;
+            }
 
             accepted = dispatchGesture(
                     gesture,
@@ -797,8 +813,6 @@ public class AutoClickService extends AccessibilityService {
 
         if (!accepted) {
 
-            nextAllowedClickNanos = previousNextAllowed;
-
             lastBatchRejectedClickCount = batchCount;
 
             finishGesture(
@@ -813,8 +827,13 @@ public class AutoClickService extends AccessibilityService {
             return 0;
         }
 
-        // درخواست توسط Android پذیرفته شده است.
-        nextAllowedClickNanos = proposedNextAllowed;
+        // فقط پس از پذیرفته‌شدن درخواست توسط اندروید،
+        // زمان مجاز کلیک بعدی به‌روزرسانی می‌شود.
+        nextAllowedClickNanos = safeAdd(
+                dispatchStartNanos,
+                intervalNanos
+        );
+
         dispatchedClicks += batchCount;
 
         lastError = "کلیک در حال اجرا است";
@@ -906,8 +925,7 @@ public class AutoClickService extends AccessibilityService {
             Log.d(
                     TAG,
                     message
-                            + " | clicks="
-                            + completedBatchCount
+                            + " | clicks=" + completedBatchCount
                             + " | latencyMs="
                             + (latency / NANOS_PER_MILLI)
             );
@@ -920,8 +938,7 @@ public class AutoClickService extends AccessibilityService {
             Log.e(
                     TAG,
                     message
-                            + " | clicks="
-                            + completedBatchCount
+                            + " | clicks=" + completedBatchCount
                             + " | latencyMs="
                             + (latency / NANOS_PER_MILLI)
             );
