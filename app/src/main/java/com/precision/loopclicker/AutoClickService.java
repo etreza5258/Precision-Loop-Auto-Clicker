@@ -14,11 +14,9 @@ public class AutoClickService extends AccessibilityService {
 
     private static final String TAG = "PrecisionAutoClick";
 
-    // مدت هر لمس؛ اندروید برای Stroke مدت مثبت می‌خواهد.
     private static final long TAP_DURATION_MS = 1L;
-
-    // فاصله صفر به معنی سریع‌ترین فاصله متوالی قابل زمان‌بندی است.
     private static final long MIN_SEQUENTIAL_INTERVAL_MS = 1L;
+    private static final long NANOS_PER_MILLI = 1_000_000L;
 
     private static volatile AutoClickService instance;
 
@@ -36,24 +34,23 @@ public class AutoClickService extends AccessibilityService {
     private long activeGestureId = 0;
     private long dispatchStartNanos = 0;
 
-    // تعداد لمس‌های موجود در Gesture فعال
     private int activeBatchClickCount = 0;
-
     private long activeBatchIntervalMs = 0;
 
-    // زمان مجاز شروع کلیک بعدی بر اساس زمان‌بندی Strokeهای Gesture قبلی
     private long nextAllowedClickNanos = 0;
 
-    // نتیجه آخرین تلاش برای ارسال دسته؛ FloatingService از این مقادیر
-    // برای ثبت وضعیت زرد گزارش استفاده خواهد کرد.
     private volatile boolean lastBatchRejectedForInterval = false;
     private volatile int lastBatchSkippedByDeadline = 0;
     private volatile int lastBatchRejectedClickCount = 0;
 
+    // شمارنده‌های قابل مشاهده برای داشبورد زنده
     private volatile long successfulClicks = 0;
     private volatile long failedClicks = 0;
 
-    // این مقادیر زمان پاسخ کل Gesture هستند، نه زمان تماس انگشت.
+    // تعداد Strokeهایی که dispatchGesture پذیرفته است.
+    private volatile long dispatchedClicks = 0;
+
+    // آمار زمان پاسخ Gesture
     private volatile long lastGestureLatencyNanos = 0;
     private volatile long totalGestureLatencyNanos = 0;
     private volatile long maxGestureLatencyNanos = 0;
@@ -61,6 +58,10 @@ public class AutoClickService extends AccessibilityService {
 
     private volatile String lastError =
             "هنوز کلیکی ارسال نشده";
+
+    // ---------------------------------------------------------
+    // اتصال سرویس
+    // ---------------------------------------------------------
 
     public static AutoClickService getInstance() {
 
@@ -169,7 +170,7 @@ public class AutoClickService extends AccessibilityService {
     }
 
     // ---------------------------------------------------------
-    // شمارنده‌ها و گزارش‌ها
+    // شمارنده‌ها و آمار زنده
     // ---------------------------------------------------------
 
     public long getSuccessfulClicks() {
@@ -178,6 +179,10 @@ public class AutoClickService extends AccessibilityService {
 
     public long getFailedClicks() {
         return failedClicks;
+    }
+
+    public long getDispatchedClicks() {
+        return dispatchedClicks;
     }
 
     public String getLastError() {
@@ -219,8 +224,10 @@ public class AutoClickService extends AccessibilityService {
 
     public void resetClickCounters() {
 
+        // این متد باید بین Gestureها فراخوانی شود.
         successfulClicks = 0;
         failedClicks = 0;
+        dispatchedClicks = 0;
 
         lastGestureLatencyNanos = 0;
         totalGestureLatencyNanos = 0;
@@ -228,6 +235,7 @@ public class AutoClickService extends AccessibilityService {
         measuredGestures = 0;
 
         nextAllowedClickNanos = 0;
+
         lastBatchRejectedForInterval = false;
         lastBatchSkippedByDeadline = 0;
         lastBatchRejectedClickCount = 0;
@@ -287,6 +295,36 @@ public class AutoClickService extends AccessibilityService {
     }
 
     // ---------------------------------------------------------
+    // تبدیل امن زمان
+    // ---------------------------------------------------------
+
+    private long elapsedMillisToNanos(long elapsedMillis) {
+
+        if (elapsedMillis >= Long.MAX_VALUE / NANOS_PER_MILLI) {
+            return Long.MAX_VALUE;
+        }
+
+        if (elapsedMillis <= 0) {
+            return 0;
+        }
+
+        return elapsedMillis * NANOS_PER_MILLI;
+    }
+
+    private long safeAdd(long first, long second) {
+
+        if (second > 0 && first > Long.MAX_VALUE - second) {
+            return Long.MAX_VALUE;
+        }
+
+        if (second < 0 && first < Long.MIN_VALUE - second) {
+            return Long.MIN_VALUE;
+        }
+
+        return first + second;
+    }
+
+    // ---------------------------------------------------------
     // اجرای یک کلیک
     // ---------------------------------------------------------
 
@@ -308,6 +346,7 @@ public class AutoClickService extends AccessibilityService {
             long requestedIntervalMs,
             Runnable completion
     ) {
+
         return performClickBatch(
                 requestedCount,
                 requestedIntervalMs,
@@ -317,12 +356,16 @@ public class AutoClickService extends AccessibilityService {
     }
 
     /**
-     * ارسال دسته کلیک با مهلت پایان چرخه.
+     * deadlineElapsedRealtimeMs زمان مطلق پایان چرخه است.
+     * مبنای آن SystemClock.elapsedRealtime() است.
      *
-     * deadlineElapsedRealtimeMs زمان مطلق پایان چرخه بر اساس
-     * SystemClock.elapsedRealtime() است. برای استفاده بدون محدودیت،
-     * مقدار Long.MAX_VALUE ارسال می‌شود.
+     * مقدار Long.MAX_VALUE یعنی بدون محدودیت زمانی.
+     *
+     * خروجی:
+     * تعداد کلیک‌های پذیرفته‌شده برای ارسال.
+     * اگر dispatchGesture درخواست را نپذیرد، خروجی صفر است.
      */
+
     public int performClickBatch(
             int requestedCount,
             long requestedIntervalMs,
@@ -348,30 +391,40 @@ public class AutoClickService extends AccessibilityService {
         lastBatchSkippedByDeadline = 0;
         lastBatchRejectedClickCount = 0;
 
+        // -----------------------------------------------------
+        // بررسی آمادگی سرویس
+        // -----------------------------------------------------
+
         if (!serviceReady) {
 
             lastError =
                     "سرویس دسترسی‌پذیری آماده نیست";
 
+            lastBatchRejectedClickCount =
+                    Math.max(0, requestedCount);
+
             Log.e(TAG, lastError);
 
-            if (completion != null) {
-                completion.run();
-            }
+            runCompletion(completion);
 
             return 0;
         }
+
+        // -----------------------------------------------------
+        // جلوگیری از هم‌پوشانی Gesture
+        // -----------------------------------------------------
 
         if (gestureInProgress) {
 
             lastError =
                     "Gesture قبلی هنوز تمام نشده است";
 
-            lastBatchRejectedClickCount = Math.max(0, requestedCount);
+            lastBatchRejectedClickCount =
+                    Math.max(0, requestedCount);
 
-            if (completion != null) {
-                completion.run();
-            }
+            Log.w(TAG, lastError);
+
+            runCompletion(completion);
 
             return 0;
         }
@@ -382,40 +435,49 @@ public class AutoClickService extends AccessibilityService {
             lastError =
                     "تعداد یا فاصله کلیک معتبر نیست";
 
-            if (completion != null) {
-                completion.run();
-            }
+            runCompletion(completion);
 
             return 0;
         }
 
+        // -----------------------------------------------------
+        // فاصله مؤثر
+        // -----------------------------------------------------
+
         final long effectiveInterval =
                 getEffectiveClickIntervalMs(requestedIntervalMs);
 
-        if (effectiveInterval <= 0) {
+        if (effectiveInterval <= 0
+                || effectiveInterval >
+                Long.MAX_VALUE / NANOS_PER_MILLI) {
 
-            lastError = "فاصله مؤثر کلیک معتبر نیست";
+            lastError =
+                    "فاصله مؤثر کلیک معتبر نیست";
 
-            if (completion != null) {
-                completion.run();
-            }
+            runCompletion(completion);
 
             return 0;
         }
 
         final long intervalNanos =
-                effectiveInterval * 1_000_000L;
+                effectiveInterval * NANOS_PER_MILLI;
+
+        final long tapNanos =
+                TAP_DURATION_MS * NANOS_PER_MILLI;
 
         final long nowNanos =
                 SystemClock.elapsedRealtimeNanos();
 
-        // کنترل فاصله واقعی بین شروع Stroke آخر دسته قبلی
-        // و شروع اولین Stroke دسته جدید.
+        // -----------------------------------------------------
+        // کنترل فاصله واقعی بین دسته‌ها
+        // -----------------------------------------------------
+
         if (nextAllowedClickNanos > 0
                 && nowNanos < nextAllowedClickNanos) {
 
             lastBatchRejectedForInterval = true;
             lastBatchRejectedClickCount = 1;
+
             lastError =
                     "کلیک به علت کمتر بودن فاصله واقعی از مقدار تنظیم‌شده لغو شد";
 
@@ -426,12 +488,14 @@ public class AutoClickService extends AccessibilityService {
                             + (nextAllowedClickNanos - nowNanos)
             );
 
-            if (completion != null) {
-                completion.run();
-            }
+            runCompletion(completion);
 
             return 0;
         }
+
+        // -----------------------------------------------------
+        // ظرفیت Gesture
+        // -----------------------------------------------------
 
         final int maxBatchCount =
                 getMaxBatchClickCount(requestedIntervalMs);
@@ -441,32 +505,26 @@ public class AutoClickService extends AccessibilityService {
             lastError =
                     "ظرفیت اجرای Gesture معتبر نیست";
 
-            if (completion != null) {
-                completion.run();
-            }
+            runCompletion(completion);
 
             return 0;
         }
 
-        // ابتدا تعداد Strokeهایی را محاسبه می‌کنیم که با مهلت چرخه
-        // کاملاً جا می‌شوند. شرط پایان شامل مدت خود لمس نیز هست.
+        // -----------------------------------------------------
+        // محاسبه تعداد کلیک‌های مجاز تا پایان چرخه
+        // -----------------------------------------------------
+
         int deadlineAllowedCount = requestedCount;
 
         if (deadlineElapsedRealtimeMs != Long.MAX_VALUE) {
 
-            long deadlineNanos;
+            long deadlineNanos =
+                    elapsedMillisToNanos(
+                            deadlineElapsedRealtimeMs
+                    );
 
-            if (deadlineElapsedRealtimeMs > Long.MAX_VALUE / 1_000_000L) {
-                deadlineNanos = Long.MAX_VALUE;
-            } else if (deadlineElapsedRealtimeMs < 0) {
-                deadlineNanos = 0;
-            } else {
-                deadlineNanos =
-                        deadlineElapsedRealtimeMs * 1_000_000L;
-            }
-
-            long remainingNanos = deadlineNanos - nowNanos;
-            long tapNanos = TAP_DURATION_MS * 1_000_000L;
+            long remainingNanos =
+                    deadlineNanos - nowNanos;
 
             if (remainingNanos < tapNanos) {
 
@@ -475,7 +533,8 @@ public class AutoClickService extends AccessibilityService {
             } else {
 
                 long countByDeadline =
-                        ((remainingNanos - tapNanos) / intervalNanos) + 1L;
+                        ((remainingNanos - tapNanos)
+                                / intervalNanos) + 1L;
 
                 deadlineAllowedCount = (int) Math.min(
                         (long) requestedCount,
@@ -485,6 +544,7 @@ public class AutoClickService extends AccessibilityService {
         }
 
         if (deadlineAllowedCount < requestedCount) {
+
             lastBatchSkippedByDeadline =
                     requestedCount - deadlineAllowedCount;
         }
@@ -506,12 +566,14 @@ public class AutoClickService extends AccessibilityService {
                             + lastBatchSkippedByDeadline
             );
 
-            if (completion != null) {
-                completion.run();
-            }
+            runCompletion(completion);
 
             return 0;
         }
+
+        // -----------------------------------------------------
+        // ساخت Gesture
+        // -----------------------------------------------------
 
         final int clickX = targetX;
         final int clickY = targetY;
@@ -544,15 +606,14 @@ public class AutoClickService extends AccessibilityService {
             lastError =
                     "خطا در ساخت Gesture: " + e.getMessage();
 
-            Log.e(TAG, lastError, e);
-
+            lastBatchRejectedClickCount = batchCount;
             failedClicks += batchCount;
 
-            if (completion != null) {
-                completion.run();
-            }
+            Log.e(TAG, lastError, e);
 
-            return batchCount;
+            runCompletion(completion);
+
+            return 0;
         }
 
         final GestureDescription gesture;
@@ -567,56 +628,68 @@ public class AutoClickService extends AccessibilityService {
                     "خطا در آماده‌سازی Gesture: "
                             + e.getMessage();
 
-            Log.e(TAG, lastError, e);
-
+            lastBatchRejectedClickCount = batchCount;
             failedClicks += batchCount;
 
-            if (completion != null) {
-                completion.run();
-            }
+            Log.e(TAG, lastError, e);
 
-            return batchCount;
+            runCompletion(completion);
+
+            return 0;
         }
 
-        // کنترل نهایی درست پیش از dispatch؛ اگر ساخت Gesture باعث
-        // عبور از مهلت شده باشد، هیچ Strokeای از این دسته ارسال نمی‌شود.
+        // -----------------------------------------------------
+        // کنترل مهلت بعد از ساخت Gesture
+        // -----------------------------------------------------
+
         final long dispatchCheckNanos =
                 SystemClock.elapsedRealtimeNanos();
 
-        if (deadlineElapsedRealtimeMs != Long.MAX_VALUE) {
-
-            long deadlineNanos =
-                    deadlineElapsedRealtimeMs > Long.MAX_VALUE / 1_000_000L
-                            ? Long.MAX_VALUE
-                            : Math.max(0L, deadlineElapsedRealtimeMs)
-                                    * 1_000_000L;
-
-            long lastStrokeEndNanos =
-                    dispatchCheckNanos
-                            + ((long) (batchCount - 1)
-                            * intervalNanos)
-                            + (TAP_DURATION_MS * 1_000_000L);
-
-            if (lastStrokeEndNanos > deadlineNanos) {
-
-                lastBatchSkippedByDeadline =
-                        Math.max(
-                                lastBatchSkippedByDeadline,
-                                requestedCount
+        final long deadlineNanos =
+                deadlineElapsedRealtimeMs == Long.MAX_VALUE
+                        ? Long.MAX_VALUE
+                        : elapsedMillisToNanos(
+                                deadlineElapsedRealtimeMs
                         );
 
-                lastError =
-                        "دسته کلیک به دلیل عبور احتمالی از مهلت چرخه ارسال نشد";
+        long lastStrokeOffsetNanos =
+                (long) (batchCount - 1) * intervalNanos;
 
-                Log.w(TAG, lastError);
+        long requiredDurationNanos =
+                safeAdd(lastStrokeOffsetNanos, tapNanos);
 
-                if (completion != null) {
-                    completion.run();
-                }
+        long estimatedLastEndNanos =
+                safeAdd(
+                        dispatchCheckNanos,
+                        requiredDurationNanos
+                );
 
-                return 0;
-            }
+        if (deadlineElapsedRealtimeMs != Long.MAX_VALUE
+                && estimatedLastEndNanos > deadlineNanos) {
+
+            lastBatchSkippedByDeadline =
+                    Math.max(
+                            lastBatchSkippedByDeadline,
+                            requestedCount
+                    );
+
+            lastBatchRejectedClickCount = requestedCount;
+
+            lastError =
+                    "دسته کلیک به دلیل عبور از مهلت چرخه ارسال نشد";
+
+            Log.w(TAG, lastError);
+
+            runCompletion(completion);
+
+            return 0;
         }
+
+        // -----------------------------------------------------
+        // آماده‌سازی ارسال
+        // -----------------------------------------------------
+
+        final long gestureId = ++activeGestureId;
 
         gestureInProgress = true;
 
@@ -624,27 +697,19 @@ public class AutoClickService extends AccessibilityService {
         activeBatchClickCount = batchCount;
         activeBatchIntervalMs = effectiveInterval;
 
-        final long gestureId = ++activeGestureId;
-
         dispatchStartNanos =
                 SystemClock.elapsedRealtimeNanos();
 
-        // آخرین کنترل مهلت، بلافاصله پیش از فراخوانی dispatchGesture.
-        // در صورت تمام شدن زمان، هیچ کلیکی از این دسته ارسال نمی‌شود.
+        // کنترل نهایی درست پیش از dispatchGesture
         if (deadlineElapsedRealtimeMs != Long.MAX_VALUE) {
 
-            long deadlineNanos =
-                    deadlineElapsedRealtimeMs > Long.MAX_VALUE / 1_000_000L
-                            ? Long.MAX_VALUE
-                            : Math.max(0L, deadlineElapsedRealtimeMs)
-                                    * 1_000_000L;
+            long finalLastEndNanos =
+                    safeAdd(
+                            dispatchStartNanos,
+                            requiredDurationNanos
+                    );
 
-            long lastStrokeEndNanos =
-                    dispatchStartNanos
-                            + ((long) (batchCount - 1) * intervalNanos)
-                            + (TAP_DURATION_MS * 1_000_000L);
-
-            if (lastStrokeEndNanos > deadlineNanos) {
+            if (finalLastEndNanos > deadlineNanos) {
 
                 gestureInProgress = false;
                 activeCompletion = null;
@@ -652,24 +717,34 @@ public class AutoClickService extends AccessibilityService {
                 activeBatchIntervalMs = 0;
 
                 lastBatchSkippedByDeadline =
-                        Math.max(lastBatchSkippedByDeadline, requestedCount);
+                        Math.max(
+                                lastBatchSkippedByDeadline,
+                                requestedCount
+                        );
+
+                lastBatchRejectedClickCount = requestedCount;
 
                 lastError =
                         "دسته کلیک به دلیل عبور از مهلت چرخه ارسال نشد";
 
                 Log.w(TAG, lastError);
 
-                if (completion != null) {
-                    completion.run();
-                }
+                runCompletion(completion);
 
                 return 0;
             }
         }
 
-        // زمان مجاز کلیک بعدی پس از آخرین Stroke این دسته.
-        nextAllowedClickNanos =
-                dispatchStartNanos + ((long) batchCount * intervalNanos);
+        // زمان مجاز کلیک بعدی پس از آخرین Stroke
+        // فقط پس از پذیرش dispatchGesture نهایی می‌شود.
+        final long previousNextAllowed =
+                nextAllowedClickNanos;
+
+        final long proposedNextAllowed =
+                safeAdd(
+                        dispatchStartNanos,
+                        (long) batchCount * intervalNanos
+                );
 
         Log.d(
                 TAG,
@@ -684,6 +759,10 @@ public class AutoClickService extends AccessibilityService {
                         + " | x=" + clickX
                         + " | y=" + clickY
         );
+
+        // -----------------------------------------------------
+        // ارسال Gesture
+        // -----------------------------------------------------
 
         boolean accepted = false;
 
@@ -734,14 +813,55 @@ public class AutoClickService extends AccessibilityService {
 
         if (!accepted) {
 
+            // درخواست پذیرفته نشده است؛
+            // زمان مجاز کلیک بعدی نباید جلو برود.
+            nextAllowedClickNanos = previousNextAllowed;
+
+            lastBatchRejectedClickCount = batchCount;
+
             finishGesture(
                     gestureId,
                     false,
-                    "dispatchGesture درخواست را نپذیرفت"
+                    lastError != null
+                            && lastError.startsWith("خطای ارسال")
+                            ? lastError
+                            : "dispatchGesture درخواست را نپذیرفت"
             );
+
+            return 0;
         }
 
+        // درخواست واقعاً توسط Android پذیرفته شده است.
+        nextAllowedClickNanos = proposedNextAllowed;
+        dispatchedClicks += batchCount;
+
+        lastError =
+                "دسته کلیک در حال اجرا است";
+
         return batchCount;
+    }
+
+    // ---------------------------------------------------------
+    // اجرای Callback
+    // ---------------------------------------------------------
+
+    private void runCompletion(Runnable completion) {
+
+        if (completion == null) {
+            return;
+        }
+
+        try {
+            completion.run();
+
+        } catch (Exception e) {
+
+            Log.e(
+                    TAG,
+                    "Completion callback error",
+                    e
+            );
+        }
     }
 
     // ---------------------------------------------------------
@@ -835,8 +955,6 @@ public class AutoClickService extends AccessibilityService {
         Runnable callback = activeCompletion;
         activeCompletion = null;
 
-        if (callback != null) {
-            callback.run();
-        }
+        runCompletion(callback);
     }
 }
