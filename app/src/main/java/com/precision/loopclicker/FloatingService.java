@@ -37,11 +37,11 @@ import android.widget.TextView;
 import java.lang.reflect.Field;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
-import java.util.Calendar;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
 import java.util.TimeZone;
+import java.util.Calendar;
 
 public class FloatingService extends Service {
 
@@ -159,18 +159,10 @@ public class FloatingService extends Service {
     private int markerStartX;
     private int markerStartY;
 
-    // ---------------------------------------------------------
-    // Clock source
-    // ---------------------------------------------------------
-
     private static final String CLOCK_PHONE = "phone";
     private static final String CLOCK_INTERNET = "internet";
 
     private String clockSource = CLOCK_PHONE;
-
-    // ---------------------------------------------------------
-    // Dynamic clock source receiver
-    // ---------------------------------------------------------
 
     private static final String ACTION_CLOCK_SOURCE_CHANGED =
             "com.precision.loopclicker.ACTION_CLOCK_SOURCE_CHANGED";
@@ -198,8 +190,6 @@ public class FloatingService extends Service {
                 return;
             }
 
-            // فقط منبع نمایش و انتخاب بعدی به‌روزرسانی می‌شود.
-            // زمان‌بندی چرخه‌ای که قبلاً شروع شده تغییر نمی‌کند.
             clockSource = newSource;
 
             updateCountdownDisplay();
@@ -279,20 +269,12 @@ public class FloatingService extends Service {
         }
     }
 
-    // ---------------------------------------------------------
-    // Floating start-time settings
-    // ---------------------------------------------------------
-
     private boolean floatingTimeConfigured;
 
     private int floatingStartHour;
     private int floatingStartMinute;
     private int floatingStartSecond;
     private int floatingStartMillis;
-
-    // ---------------------------------------------------------
-    // Live dashboard
-    // ---------------------------------------------------------
 
     private Dialog dashboardDialog;
 
@@ -331,10 +313,7 @@ public class FloatingService extends Service {
 
         markerSize = dp(56);
 
-        // بازیابی انتخاب ساعت ذخیره‌شده
         loadSavedClockSource();
-
-        // دریافت تغییرات انتخاب ساعت از داشبورد
         registerClockSourceReceiver();
 
         createNotificationChannel();
@@ -390,10 +369,6 @@ public class FloatingService extends Service {
 
         return START_STICKY;
     }
-
-    // ---------------------------------------------------------
-    // Notification
-    // ---------------------------------------------------------
 
     private void createNotificationChannel() {
 
@@ -468,10 +443,6 @@ public class FloatingService extends Service {
             );
         }
     }
-
-    // ---------------------------------------------------------
-    // Floating views
-    // ---------------------------------------------------------
 
     private void createFloatingViews() {
 
@@ -676,10 +647,6 @@ public class FloatingService extends Service {
 
         return button;
     }
-
-    // ---------------------------------------------------------
-    // Floating time picker
-    // ---------------------------------------------------------
 
     private void showStartTimePicker() {
 
@@ -989,10 +956,6 @@ public class FloatingService extends Service {
         stopSelf();
     }
 
-    // ---------------------------------------------------------
-    // Countdown UI
-    // ---------------------------------------------------------
-
     private void createCountdownSection() {
 
         LinearLayout countdownContainer = new LinearLayout(this);
@@ -1211,10 +1174,6 @@ public class FloatingService extends Service {
             dashboardStateView.setText("وضعیت: " + message);
         }
     }
-
-    // ---------------------------------------------------------
-    // Live dashboard
-    // ---------------------------------------------------------
 
     private void showLiveDashboard() {
 
@@ -1591,10 +1550,6 @@ public class FloatingService extends Service {
         }
     }
 
-    // ---------------------------------------------------------
-    // Marker
-    // ---------------------------------------------------------
-
     private void createMarker() {
 
         markerView = new TextView(this);
@@ -1915,6 +1870,7 @@ public class FloatingService extends Service {
         cycleIndex = 0;
         clickNumber = 0;
         lastBatchCount = 0;
+        lastClickDispatchElapsedMs = 0;
 
         completedSuccessfulClicks = 0;
         completedFailedClicks = 0;
@@ -1992,10 +1948,6 @@ public class FloatingService extends Service {
 
         return anchorElapsedMs + index * period;
     }
-
-    // ---------------------------------------------------------
-    // Accessibility connection
-    // ---------------------------------------------------------
 
     private AutoClickService getReadyAccessibility() {
 
@@ -2079,6 +2031,7 @@ public class FloatingService extends Service {
 
         clickNumber = 0;
         lastBatchCount = 0;
+        lastClickDispatchElapsedMs = 0;
 
         cycleYellow = false;
         cycleIntervalViolation = false;
@@ -2097,6 +2050,22 @@ public class FloatingService extends Service {
 
         scheduleNextClick(generation);
         updateDisplay();
+    }
+
+    /*
+     * زمان مجاز کلیک بعدی را از خود AutoClickService می‌گیریم.
+     * این کار مانع می‌شود Callback با تأخیر باعث ارسال زودهنگام
+     * بسته بعدی و رد شدن آن به علت interval شود.
+     */
+    private long getNextAllowedElapsedMs(
+            AutoClickService service
+    ) {
+
+        if (service == null) {
+            return SystemClock.elapsedRealtime();
+        }
+
+        return service.getNextAllowedClickElapsedRealtimeMs();
     }
 
     private void scheduleNextClick(long generation) {
@@ -2157,6 +2126,15 @@ public class FloatingService extends Service {
 
             targetElapsed = lastClickDispatchElapsedMs + offset;
         }
+
+        /*
+         * زمان مجاز اعلام‌شده از AutoClickService نیز بررسی می‌شود.
+         * بنابراین اگر Callback دیر برسد، هدف زمان‌بندی در گذشته
+         * باقی نمی‌ماند و بسته زودهنگام رد نمی‌شود.
+         */
+        long nextAllowedElapsed = getNextAllowedElapsedMs(accessibility);
+
+        targetElapsed = Math.max(targetElapsed, nextAllowedElapsed);
 
         if (targetElapsed >= cycleDeadlineElapsedMs) {
             cycleYellow = true;
@@ -2224,6 +2202,34 @@ public class FloatingService extends Service {
 
         final AutoClickService clickService = accessibility;
 
+        /*
+         * قبل از ارسال بسته، دوباره زمان مجاز را کنترل می‌کنیم.
+         * اگر هنوز زمان آن نرسیده باشد، به‌جای ارسال زودهنگام،
+         * دوباره در زمان مجاز برنامه‌ریزی می‌کنیم.
+         */
+        long allowedElapsed = getNextAllowedElapsedMs(clickService);
+        long currentElapsed = SystemClock.elapsedRealtime();
+
+        if (currentElapsed < allowedElapsed) {
+
+            if (allowedElapsed >= cycleDeadlineElapsedMs) {
+                cycleYellow = true;
+                cycleDeadlineSkipped = true;
+                waitForCycleEnd(generation);
+                return;
+            }
+
+            nextClickRunnable = () -> {
+
+                if (isCurrentRun(generation) && cycleActive) {
+                    dispatchNextClick(generation);
+                }
+            };
+
+            postAtElapsedTime(nextClickRunnable, allowedElapsed);
+            return;
+        }
+
         long remainingClicks = clickCount - clickNumber;
 
         int maxBatchCount =
@@ -2248,8 +2254,7 @@ public class FloatingService extends Service {
 
         final long callbackGeneration = generation;
 
-        final long dispatchElapsed =
-                SystemClock.elapsedRealtime();
+        long dispatchElapsed = SystemClock.elapsedRealtime();
 
         if (dispatchElapsed >= cycleDeadlineElapsedMs) {
             cycleYellow = true;
@@ -2324,6 +2329,11 @@ public class FloatingService extends Service {
 
             if (clickService.wasLastBatchRejectedForInterval()) {
 
+                /*
+                 * این حالت نباید در زمان‌بندی عادی رخ دهد.
+                 * اگر رخ دهد، چرخه زرد ثبت می‌شود و بسته دوباره
+                 * با فاصله نامعتبر ارسال نخواهد شد.
+                 */
                 cycleYellow = true;
                 cycleIntervalViolation = true;
 
@@ -2354,6 +2364,17 @@ public class FloatingService extends Service {
             waitForCycleEnd(generation);
             updateDisplay();
             return;
+        }
+
+        /*
+         * زمان واقعی Dispatch را از AutoClickService می‌خوانیم.
+         * زمان ثبت‌شده قبل از فراخوانی فقط مقدار موقت بود.
+         */
+        long actualDispatchElapsed =
+                clickService.getLastDispatchElapsedRealtimeMs();
+
+        if (actualDispatchElapsed > 0) {
+            lastClickDispatchElapsedMs = actualDispatchElapsed;
         }
 
         lastBatchCount = acceptedCount;
@@ -2449,7 +2470,6 @@ public class FloatingService extends Service {
             addLiveError("سرویس دسترسی‌پذیری هنگام پایان چرخه متصل نبود");
         }
 
-        // آمار این چرخه فقط یک بار به مجموع اجرا اضافه می‌شود.
         if (!currentCycleStatsFinalized) {
 
             completedSuccessfulClicks += successes;
@@ -2530,10 +2550,6 @@ public class FloatingService extends Service {
 
         updateDisplay();
     }
-
-    // ---------------------------------------------------------
-    // Stop and display
-    // ---------------------------------------------------------
 
     private void stopLoop() {
 
