@@ -1,3 +1,4 @@
+
 <?xml version="1.0" encoding="utf-8"?>
 <ScrollView
     xmlns:android="http://schemas.android.com/apk/res/android"
@@ -33,8 +34,6 @@
             android:textStyle="bold"
             android:gravity="center"
             android:paddingBottom="16dp"/>
-
-        <!-- نمایش ساعت‌ها -->
 
         <TextView
             android:id="@+id/phoneClock"
@@ -82,8 +81,6 @@
             android:gravity="center"
             android:paddingBottom="10dp"/>
 
-        <!-- انتخاب ساعت مبنا -->
-
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -130,8 +127,6 @@
             android:textColor="#80CBC4"
             android:textSize="12sp"
             android:paddingTop="6dp"/>
-
-        <!-- زمان شروع -->
 
         <TextView
             android:layout_width="match_parent"
@@ -215,8 +210,6 @@
             android:textSize="12sp"
             android:paddingTop="6dp"/>
 
-        <!-- سرعت کلیک -->
-
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -262,8 +255,6 @@
             android:backgroundTint="#03DAC5"
             android:textColor="#FFFFFF"
             android:textColorHint="#AAAAAA"/>
-
-        <!-- تنظیمات چرخه -->
 
         <TextView
             android:layout_width="match_parent"
@@ -328,6 +319,35 @@
             android:textColor="#FFFFFF"
             android:textColorHint="#AAAAAA"/>
 
+        <!-- تعداد کل چرخه‌ها -->
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="تعداد کل چرخه‌های اجرا"
+            android:textColor="#03DAC5"
+            android:textStyle="bold"
+            android:paddingTop="14dp"/>
+
+        <EditText
+            android:id="@+id/cycleTotalCountInput"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:hint="1"
+            android:inputType="number"
+            android:singleLine="true"
+            android:backgroundTint="#03DAC5"
+            android:textColor="#FFFFFF"
+            android:textColorHint="#AAAAAA"/>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="مثلاً اگر عدد ۱۰ وارد کنی، برنامه پس از اجرای ۱۰ چرخه متوقف می‌شود."
+            android:textColor="#80CBC4"
+            android:textSize="12sp"
+            android:paddingTop="5dp"/>
+
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -345,8 +365,6 @@
             android:backgroundTint="#03DAC5"
             android:textColor="#FFFFFF"
             android:textColorHint="#AAAAAA"/>
-
-        <!-- مکث بین چرخه‌ها -->
 
         <TextView
             android:layout_width="match_parent"
@@ -392,8 +410,6 @@
             android:backgroundTint="#03DAC5"
             android:textColor="#FFFFFF"
             android:textColorHint="#AAAAAA"/>
-
-        <!-- شمارش معکوس -->
 
         <TextView
             android:layout_width="match_parent"
@@ -490,8 +506,6 @@
             android:gravity="center"
             android:padding="12dp"/>
 
-        <!-- کنترل‌ها -->
-
         <Button
             android:id="@+id/startButton"
             android:layout_width="match_parent"
@@ -533,8 +547,6 @@
             android:layout_marginTop="8dp"
             android:text="نمایش نشانگر و پنل شناور"/>
 
-        <!-- گزارش‌ها -->
-
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -564,8 +576,6 @@
             android:text="پاک کردن گزارش‌ها"
             android:backgroundTint="#455A64"
             android:textColor="#FFFFFF"/>
-
-        <!-- خاموش کردن برنامه -->
 
         <Button
             android:id="@+id/shutdownButton"
