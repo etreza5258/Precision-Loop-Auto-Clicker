@@ -18,8 +18,8 @@ public class AutoClickService extends AccessibilityService {
     private static final long MIN_SEQUENTIAL_INTERVAL_MS = 1L;
     private static final long NANOS_PER_MILLI = 1_000_000L;
 
-    private static final long BASE_DEADLINE_GUARD_MS = 50L;
-    private static final long EXTRA_DEADLINE_GUARD_MS = 20L;
+    // حاشیه امن ثابت؛ تأخیر Callback در آن دخالت ندارد.
+    private static final long DEADLINE_GUARD_MS = 50L;
 
     private static volatile AutoClickService instance;
 
@@ -40,7 +40,8 @@ public class AutoClickService extends AccessibilityService {
     private int activeBatchClickCount = 0;
     private long activeBatchIntervalMs = 0;
 
-    private long nextAllowedClickNanos = 0;
+    private volatile long nextAllowedClickNanos = 0;
+    private volatile long lastDispatchElapsedRealtimeMs = 0;
 
     private volatile boolean lastBatchRejectedForInterval = false;
     private volatile int lastBatchSkippedByDeadline = 0;
@@ -164,6 +165,42 @@ public class AutoClickService extends AccessibilityService {
     }
 
     // ---------------------------------------------------------
+    // زمان‌بندی ارسال
+    // ---------------------------------------------------------
+
+    /**
+     * زمان مجاز شروع دسته بعدی برحسب نانوثانیه.
+     * مبنای زمان SystemClock.elapsedRealtimeNanos است.
+     */
+    public long getNextAllowedClickElapsedRealtimeNanos() {
+        return nextAllowedClickNanos;
+    }
+
+    /**
+     * زمان مجاز شروع دسته بعدی برحسب میلی‌ثانیه.
+     * مقدار به بالا گرد می‌شود تا ارسال زودهنگام رخ ندهد.
+     */
+    public long getNextAllowedClickElapsedRealtimeMs() {
+
+        long nanos = nextAllowedClickNanos;
+
+        if (nanos <= 0) {
+            return 0;
+        }
+
+        return nanos / NANOS_PER_MILLI
+                + (nanos % NANOS_PER_MILLI == 0 ? 0 : 1);
+    }
+
+    /**
+     * زمان واقعی آخرین dispatch پذیرفته‌شده.
+     * برحسب elapsedRealtime و با گرد کردن رو به بالا.
+     */
+    public long getLastDispatchElapsedRealtimeMs() {
+        return lastDispatchElapsedRealtimeMs;
+    }
+
+    // ---------------------------------------------------------
     // شمارنده‌ها و آمار
     // ---------------------------------------------------------
 
@@ -228,6 +265,7 @@ public class AutoClickService extends AccessibilityService {
         measuredGestures = 0;
 
         nextAllowedClickNanos = 0;
+        lastDispatchElapsedRealtimeMs = 0;
 
         lastBatchRejectedForInterval = false;
         lastBatchSkippedByDeadline = 0;
@@ -317,24 +355,17 @@ public class AutoClickService extends AccessibilityService {
     }
 
     /**
-     * حاشیه اطمینان براساس بیشترین تأخیر مشاهده‌شده.
+     * حاشیه امن ثابت است و از تأخیر Callback
+     * یا بیشترین latency مشاهده‌شده استفاده نمی‌کند.
      */
     private long getDeadlineSafetyMarginNanos() {
 
-        long measuredGuard = safeAdd(
-                maxGestureLatencyNanos,
-                EXTRA_DEADLINE_GUARD_MS * NANOS_PER_MILLI
-        );
-
-        long baseGuard =
-                BASE_DEADLINE_GUARD_MS * NANOS_PER_MILLI;
-
-        return Math.max(baseGuard, measuredGuard);
+        return DEADLINE_GUARD_MS * NANOS_PER_MILLI;
     }
 
     /**
      * محاسبه تعداد کلیک‌هایی که با فاصله تعیین‌شده
-     * و حاشیه اطمینان، پیش از deadline جا می‌شوند.
+     * و حاشیه امن، پیش از deadline جا می‌شوند.
      */
     private int getDeadlineBatchCapacity(
             long startNanos,
@@ -361,8 +392,6 @@ public class AutoClickService extends AccessibilityService {
                 getDeadlineSafetyMarginNanos()
         );
 
-        // پایان لمس به همراه حاشیه باید اکیداً
-        // قبل از deadline باشد.
         if (remainingNanos <= requiredAfterLastStart) {
             return 0;
         }
@@ -628,11 +657,6 @@ public class AutoClickService extends AccessibilityService {
 
         if (hasDeadline) {
 
-            // برخلاف نسخه قبلی، در چرخه محدود نیز
-            // چند Stroke در یک Gesture مجاز است؛
-            // به شرط آنکه آخرین لمس با حاشیه امن
-            // پیش از deadline پایان یابد.
-
             int safeCapacity =
                     getDeadlineBatchCapacity(
                             SystemClock.elapsedRealtimeNanos(),
@@ -728,7 +752,7 @@ public class AutoClickService extends AccessibilityService {
         }
 
         // -----------------------------------------------------
-        // کنترل deadline بعد از ساخت Gesture
+        // کنترل deadline پس از ساخت Gesture
         // -----------------------------------------------------
 
         long beforeDispatchNanos =
@@ -766,7 +790,7 @@ public class AutoClickService extends AccessibilityService {
         activeBatchIntervalMs = effectiveInterval;
 
         // -----------------------------------------------------
-        // کنترل نهایی نزدیک به dispatchGesture
+        // بررسی نهایی deadline
         // -----------------------------------------------------
 
         dispatchStartNanos =
@@ -803,9 +827,7 @@ public class AutoClickService extends AccessibilityService {
                         + " | count=" + batchCount
                         + " | interval=" + effectiveInterval
                         + " | deadline=" + deadlineElapsedRealtimeMs
-                        + " | guardMs="
-                        + (getDeadlineSafetyMarginNanos()
-                        / NANOS_PER_MILLI)
+                        + " | guardMs=" + DEADLINE_GUARD_MS
                         + " | x=" + clickX
                         + " | y=" + clickY
         );
@@ -818,7 +840,7 @@ public class AutoClickService extends AccessibilityService {
 
         try {
 
-            // بررسی نهایی بلافاصله پیش از ارسال
+            // آخرین بررسی بلافاصله پیش از dispatch
             dispatchStartNanos =
                     SystemClock.elapsedRealtimeNanos();
 
@@ -906,10 +928,20 @@ public class AutoClickService extends AccessibilityService {
             return 0;
         }
 
-        // زمان مجاز شروع دسته بعدی:
-        // بعد از فاصله مربوط به تمام Strokeهای این دسته.
+        // -----------------------------------------------------
+        // ثبت زمان واقعی dispatch پذیرفته‌شده
+        // -----------------------------------------------------
+
+        long acceptedDispatchNanos = dispatchStartNanos;
+
+        lastDispatchElapsedRealtimeMs =
+                acceptedDispatchNanos / NANOS_PER_MILLI
+                        + (acceptedDispatchNanos % NANOS_PER_MILLI == 0
+                        ? 0 : 1);
+
+        // شروع دسته بعدی پس از فاصله تمام Strokeهای این دسته
         nextAllowedClickNanos = safeAdd(
-                dispatchStartNanos,
+                acceptedDispatchNanos,
                 (long) batchCount * intervalNanos
         );
 
