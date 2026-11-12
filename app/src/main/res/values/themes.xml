@@ -1,27 +1,5 @@
+
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-
-    <style name="AppTheme" parent="Theme.MaterialComponents.NoActionBar">
-
-        <item name="colorPrimary">#1976D2</item>
-        <item name="colorPrimaryVariant">#0D47A1</item>
-        <item name="colorSecondary">#03DAC5</item>
-
-        <item name="colorSurface">#1B303A</item>
-        <item name="colorOnSurface">#FFFFFF</item>
-        <item name="colorOnPrimary">#FFFFFF</item>
-        <item name="colorOnSecondary">#101820</item>
-
-        <item name="android:windowBackground">#101820</item>
-        <item name="android:textColorPrimary">#FFFFFF</item>
-        <item name="android:textColorSecondary">#B0BEC5</item>
-        <item name="android:colorAccent">#03DAC5</item>
-
-        <item name="android:statusBarColor">#0B1218</item>
-        <item name="android:navigationBarColor">#101820</item>
-        <item name="android:windowLightStatusBar">false</item>
-        <item name="android:windowActionModeOverlay">true</item>
-
-    </style>
-
+    <!-- AppTheme is defined in themes.xml -->
 </resources>
