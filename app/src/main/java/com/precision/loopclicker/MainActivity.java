@@ -1,4 +1,3 @@
-
 package com.precision.loopclicker;
 
 import android.app.Activity;
@@ -48,6 +47,10 @@ public class MainActivity extends Activity {
 
     private static final String CLOCK_PHONE = "phone";
     private static final String CLOCK_INTERNET = "internet";
+
+    // اطلاع‌رسانی تغییر مبنای ساعت به FloatingService
+    private static final String ACTION_CLOCK_SOURCE_CHANGED =
+            "com.precision.loopclicker.ACTION_CLOCK_SOURCE_CHANGED";
 
     private static final long NTP_EPOCH_OFFSET = 2208988800L;
     private static final int NTP_PORT = 123;
@@ -258,6 +261,22 @@ public class MainActivity extends Activity {
     }
 
     // ---------------------------------------------------------
+    // اطلاع‌رسانی تغییر مبنای ساعت به پنل شناور
+    // ---------------------------------------------------------
+
+    private void notifyFloatingClockSourceChanged(String source) {
+
+        Intent intent = new Intent(ACTION_CLOCK_SOURCE_CHANGED);
+
+        // فقط گیرنده‌های داخل همین برنامه
+        intent.setPackage(getPackageName());
+
+        intent.putExtra("clock_source", source);
+
+        sendBroadcast(intent);
+    }
+
+    // ---------------------------------------------------------
     // دریافت فرمان شروع از پنل شناور
     // ---------------------------------------------------------
 
@@ -441,9 +460,17 @@ public class MainActivity extends Activity {
 
                         saveClockSource(CLOCK_INTERNET);
 
+                        notifyFloatingClockSourceChanged(
+                                CLOCK_INTERNET
+                        );
+
                     } else if (checkedId != -1) {
 
                         saveClockSource(CLOCK_PHONE);
+
+                        notifyFloatingClockSourceChanged(
+                                CLOCK_PHONE
+                        );
                     }
                 }
         );
