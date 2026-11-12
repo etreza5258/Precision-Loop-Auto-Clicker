@@ -70,6 +70,13 @@ public class FloatingService extends Service {
     private static final long DISPLAY_UPDATE_MS = 50;
     private static final long DASHBOARD_UPDATE_MS = 250;
 
+    /*
+     * حاشیه امن برای شروع بسته کلیک قبل از پایان چرخه.
+     * این مقدار برای جلوگیری از ارسال بسته‌ای است که احتمالاً
+     * در انتهای چرخه فرصت اجرای امن ندارد.
+     */
+    private static final long DEADLINE_GUARD_MS = 50L;
+
     private static final int PANEL_BACKGROUND =
             Color.rgb(20, 30, 42);
 
@@ -2039,7 +2046,14 @@ public class FloatingService extends Service {
         cycleOtherFailure = false;
 
         cycleStartElapsedMs = SystemClock.elapsedRealtime();
-        cycleDeadlineElapsedMs = cycleStartElapsedMs + cycleDurationMs;
+
+        if (cycleDurationMs > Long.MAX_VALUE - cycleStartElapsedMs) {
+            cycleDeadlineElapsedMs = Long.MAX_VALUE;
+        } else {
+            cycleDeadlineElapsedMs =
+                    cycleStartElapsedMs + cycleDurationMs;
+        }
+
         cycleStartWallMs = System.currentTimeMillis();
 
         accessibility.resetClickCounters();
@@ -2068,6 +2082,29 @@ public class FloatingService extends Service {
         return service.getNextAllowedClickElapsedRealtimeMs();
     }
 
+    /*
+     * آخرین زمانی که شروع یک بسته هنوز از حاشیه امن چرخه
+     * عبور نکرده است.
+     */
+    private long getLatestSafeStartElapsedMs() {
+
+        if (cycleDeadlineElapsedMs == Long.MAX_VALUE) {
+            return Long.MAX_VALUE;
+        }
+
+        return cycleDeadlineElapsedMs - DEADLINE_GUARD_MS;
+    }
+
+    private void markDeadlineSkipped(String message) {
+
+        cycleYellow = true;
+        cycleDeadlineSkipped = true;
+
+        if (message != null && !message.trim().isEmpty()) {
+            addLiveError(message);
+        }
+    }
+
     private void scheduleNextClick(long generation) {
 
         if (!isCurrentRun(generation) || !cycleActive) {
@@ -2082,8 +2119,9 @@ public class FloatingService extends Service {
         long now = SystemClock.elapsedRealtime();
 
         if (now >= cycleDeadlineElapsedMs) {
-            cycleYellow = true;
-            cycleDeadlineSkipped = true;
+            markDeadlineSkipped(
+                    "زمان چرخه پیش از ارسال کلیک بعدی پایان یافت"
+            );
             waitForCycleEnd(generation);
             return;
         }
@@ -2136,9 +2174,18 @@ public class FloatingService extends Service {
 
         targetElapsed = Math.max(targetElapsed, nextAllowedElapsed);
 
-        if (targetElapsed >= cycleDeadlineElapsedMs) {
-            cycleYellow = true;
-            cycleDeadlineSkipped = true;
+        long latestSafeStart = getLatestSafeStartElapsedMs();
+
+        /*
+         * اگر زمان مجاز کلیک بعدی از آخرین زمان امن شروع بسته
+         * عبور کرده باشد، دیگر هیچ کلیکی برای این چرخه ارسال نمی‌شود.
+         */
+        if (targetElapsed > latestSafeStart) {
+
+            markDeadlineSkipped(
+                    "برای ارسال کلیک بعدی فرصت امن کافی تا پایان چرخه باقی نمانده است"
+            );
+
             waitForCycleEnd(generation);
             return;
         }
@@ -2162,8 +2209,11 @@ public class FloatingService extends Service {
         long now = SystemClock.elapsedRealtime();
 
         if (now >= cycleDeadlineElapsedMs) {
-            cycleYellow = true;
-            cycleDeadlineSkipped = true;
+
+            markDeadlineSkipped(
+                    "زمان چرخه پیش از ارسال بسته کلیک پایان یافت"
+            );
+
             waitForCycleEnd(generation);
             return;
         }
@@ -2203,18 +2253,21 @@ public class FloatingService extends Service {
         final AutoClickService clickService = accessibility;
 
         /*
-         * قبل از ارسال بسته، دوباره زمان مجاز را کنترل می‌کنیم.
-         * اگر هنوز زمان آن نرسیده باشد، به‌جای ارسال زودهنگام،
-         * دوباره در زمان مجاز برنامه‌ریزی می‌کنیم.
+         * پیش از ارسال بسته، زمان مجاز دوباره بررسی می‌شود.
          */
         long allowedElapsed = getNextAllowedElapsedMs(clickService);
         long currentElapsed = SystemClock.elapsedRealtime();
 
         if (currentElapsed < allowedElapsed) {
 
-            if (allowedElapsed >= cycleDeadlineElapsedMs) {
-                cycleYellow = true;
-                cycleDeadlineSkipped = true;
+            long latestSafeStart = getLatestSafeStartElapsedMs();
+
+            if (allowedElapsed > latestSafeStart) {
+
+                markDeadlineSkipped(
+                        "زمان مجاز کلیک بعدی از محدوده امن چرخه عبور کرد"
+                );
+
                 waitForCycleEnd(generation);
                 return;
             }
@@ -2230,14 +2283,32 @@ public class FloatingService extends Service {
             return;
         }
 
+        /*
+         * حتی اگر زمان مجاز رسیده باشد، شروع بسته باید
+         * داخل محدوده امن چرخه قرار داشته باشد.
+         */
+        long latestSafeStart = getLatestSafeStartElapsedMs();
+
+        if (currentElapsed > latestSafeStart) {
+
+            markDeadlineSkipped(
+                    "شروع بسته کلیک به محدوده پایانی چرخه رسید"
+            );
+
+            waitForCycleEnd(generation);
+            return;
+        }
+
         long remainingClicks = clickCount - clickNumber;
 
         int maxBatchCount =
                 clickService.getMaxBatchClickCount(clickIntervalMs);
 
         if (maxBatchCount <= 0) {
+
             cycleOtherFailure = true;
             addLiveError("تعداد مجاز کلیک در بسته صفر شد");
+
             waitForCycleEnd(generation);
             return;
         }
@@ -2256,9 +2327,12 @@ public class FloatingService extends Service {
 
         long dispatchElapsed = SystemClock.elapsedRealtime();
 
-        if (dispatchElapsed >= cycleDeadlineElapsedMs) {
-            cycleYellow = true;
-            cycleDeadlineSkipped = true;
+        if (dispatchElapsed > latestSafeStart) {
+
+            markDeadlineSkipped(
+                    "مهلت امن ارسال بسته پیش از Dispatch به پایان رسید"
+            );
+
             waitForCycleEnd(generation);
             return;
         }
@@ -2276,14 +2350,58 @@ public class FloatingService extends Service {
                         return;
                     }
 
+                    /*
+                     * رد شدن موقت به علت interval به‌تنهایی
+                     * خطای چرخه نیست. در صورت وجود فرصت امن،
+                     * بسته در اولین زمان مجاز دوباره تلاش می‌شود.
+                     */
                     if (clickService.wasLastBatchRejectedForInterval()) {
 
-                        cycleYellow = true;
-                        cycleIntervalViolation = true;
+                        long retryElapsed =
+                                getNextAllowedElapsedMs(clickService);
 
-                        addLiveError(
-                                "بسته کلیک به علت رعایت نشدن فاصله زمانی رد شد"
-                        );
+                        long callbackNow =
+                                SystemClock.elapsedRealtime();
+
+                        if (retryElapsed <= callbackNow) {
+                            retryElapsed = callbackNow + 2L;
+                        }
+
+                        long retryLatestSafeStart =
+                                getLatestSafeStartElapsedMs();
+
+                        if (retryElapsed <= retryLatestSafeStart) {
+
+                            nextClickRunnable = () -> {
+
+                                if (isCurrentRun(callbackGeneration)
+                                        && cycleActive) {
+
+                                    dispatchNextClick(callbackGeneration);
+                                }
+                            };
+
+                            postAtElapsedTime(
+                                    nextClickRunnable,
+                                    retryElapsed
+                            );
+
+                            updateDisplay();
+                            return;
+
+                        } else {
+
+                            cycleYellow = true;
+                            cycleDeadlineSkipped = true;
+
+                            addLiveError(
+                                    "پس از رد موقت بسته، فرصت امن برای تلاش مجدد باقی نماند"
+                            );
+
+                            waitForCycleEnd(callbackGeneration);
+                            updateDisplay();
+                            return;
+                        }
                     }
 
                     if (clickService.getLastBatchSkippedByDeadline() > 0) {
@@ -2311,7 +2429,7 @@ public class FloatingService extends Service {
 
                     if (SystemClock.elapsedRealtime() >= cycleDeadlineElapsedMs
                             || clickNumber >= clickCount
-                            || cycleIntervalViolation
+                            || cycleDeadlineSkipped
                             || cycleOtherFailure) {
 
                         waitForCycleEnd(callbackGeneration);
@@ -2327,24 +2445,24 @@ public class FloatingService extends Service {
 
         if (acceptedCount <= 0) {
 
+            /*
+             * در صورت رد شدن به علت interval، Callback بالا
+             * خودش زمان تلاش مجدد را برنامه‌ریزی می‌کند.
+             * در این شاخه نباید چرخه را متوقف یا زرد کنیم.
+             */
             if (clickService.wasLastBatchRejectedForInterval()) {
 
-                /*
-                 * این حالت نباید در زمان‌بندی عادی رخ دهد.
-                 * اگر رخ دهد، چرخه زرد ثبت می‌شود و بسته دوباره
-                 * با فاصله نامعتبر ارسال نخواهد شد.
-                 */
-                cycleYellow = true;
-                cycleIntervalViolation = true;
-
-                addLiveError("ارسال کلیک به علت فاصله زمانی زودهنگام رد شد");
+                updateDisplay();
+                return;
 
             } else if (clickService.getLastBatchSkippedByDeadline() > 0) {
 
                 cycleYellow = true;
                 cycleDeadlineSkipped = true;
 
-                addLiveError("مهلت چرخه پیش از ارسال بسته کلیک پایان یافت");
+                addLiveError(
+                        "مهلت چرخه پیش از ارسال بسته کلیک پایان یافت"
+                );
 
             } else {
 
@@ -2385,7 +2503,9 @@ public class FloatingService extends Service {
             cycleYellow = true;
             cycleDeadlineSkipped = true;
 
-            addLiveError("همه کلیک‌های درخواستی در مهلت چرخه ارسال نشدند");
+            addLiveError(
+                    "همه کلیک‌های درخواستی در مهلت چرخه ارسال نشدند"
+            );
         }
 
         if (clickService.getLastBatchSkippedByDeadline() > 0) {
