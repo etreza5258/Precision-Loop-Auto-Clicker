@@ -23,7 +23,6 @@ import android.provider.Settings;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
-import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowManager;
 import android.widget.EditText;
@@ -34,10 +33,11 @@ import android.widget.TextView;
 
 import java.lang.reflect.Field;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Date;
-import java.util.Locale;
 import java.util.List;
+import java.util.Locale;
 import java.util.TimeZone;
 
 public class FloatingService extends Service {
@@ -65,6 +65,7 @@ public class FloatingService extends Service {
     private static final long SERVICE_RETRY_MS = 250;
     private static final long GESTURE_RETRY_MS = 10;
     private static final long DISPLAY_UPDATE_MS = 50;
+    private static final long DASHBOARD_UPDATE_MS = 250;
 
     private static final int PANEL_BACKGROUND =
             Color.rgb(20, 30, 42);
@@ -83,7 +84,6 @@ public class FloatingService extends Service {
     private WindowManager windowManager;
 
     private LinearLayout panel;
-
     private TextView markerView;
 
     private TextView selectedTimeView;
@@ -126,9 +126,6 @@ public class FloatingService extends Service {
     private long clickCount;
     private long clickNumber;
 
-    private long successAtStart;
-    private long failedAtStart;
-
     private boolean cycleYellow;
     private boolean cycleIntervalViolation;
     private boolean cycleDeadlineSkipped;
@@ -154,6 +151,15 @@ public class FloatingService extends Service {
     private int markerStartY;
 
     // ---------------------------------------------------------
+    // Clock source
+    // ---------------------------------------------------------
+
+    private static final String CLOCK_PHONE = "phone";
+    private static final String CLOCK_INTERNET = "internet";
+
+    private String clockSource = CLOCK_PHONE;
+
+    // ---------------------------------------------------------
     // Floating start-time settings
     // ---------------------------------------------------------
 
@@ -163,6 +169,32 @@ public class FloatingService extends Service {
     private int floatingStartMinute;
     private int floatingStartSecond;
     private int floatingStartMillis;
+
+    // ---------------------------------------------------------
+    // Live dashboard
+    // ---------------------------------------------------------
+
+    private Dialog dashboardDialog;
+
+    private TextView dashboardStateView;
+    private TextView dashboardCycleView;
+    private TextView dashboardSuccessView;
+    private TextView dashboardFailureView;
+    private TextView dashboardDispatchedView;
+    private TextView dashboardTargetView;
+    private TextView dashboardErrorView;
+    private TextView dashboardClockView;
+    private TextView dashboardReportsView;
+
+    private Runnable dashboardUpdateRunnable;
+
+    private long completedSuccessfulClicks;
+    private long completedFailedClicks;
+    private long completedDispatchedClicks;
+
+    private boolean currentCycleStatsFinalized;
+
+    private final List<String> liveErrors = new ArrayList<>();
 
     public static FloatingService getInstance() {
         return instance;
@@ -356,18 +388,10 @@ public class FloatingService extends Service {
         panel = new LinearLayout(this);
 
         panel.setOrientation(LinearLayout.VERTICAL);
-        panel.setPadding(
-                dp(7),
-                dp(6),
-                dp(7),
-                dp(6)
-        );
+        panel.setPadding(dp(7), dp(6), dp(7), dp(6));
 
         panel.setBackground(
-                makeBackground(
-                        PANEL_BACKGROUND,
-                        dp(11)
-                )
+                makeBackground(PANEL_BACKGROUND, dp(11))
         );
 
         panel.setClickable(true);
@@ -399,15 +423,11 @@ public class FloatingService extends Service {
                         Color.rgb(75, 75, 85)
                 );
 
-        TextView timeButton =
-                createTimePickerButton();
+        TextView timeButton = createTimePickerButton();
 
         startButton.setOnClickListener(v -> openMainForStart());
-
         stopButton.setOnClickListener(v -> stopLoop());
-
         shutdownButton.setOnClickListener(v -> shutdownService());
-
         timeButton.setOnClickListener(v -> showStartTimePicker());
 
         buttonsRow.addView(startButton);
@@ -438,14 +458,10 @@ public class FloatingService extends Service {
                 case MotionEvent.ACTION_MOVE:
 
                     panelParams.x = panelStartX
-                            + (int) (
-                            event.getRawX() - panelTouchRawX
-                    );
+                            + (int) (event.getRawX() - panelTouchRawX);
 
                     panelParams.y = panelStartY
-                            + (int) (
-                            event.getRawY() - panelTouchRawY
-                    );
+                            + (int) (event.getRawY() - panelTouchRawY);
 
                     updateViewLayout(panel, panelParams);
 
@@ -469,18 +485,13 @@ public class FloatingService extends Service {
                 PixelFormat.TRANSLUCENT
         );
 
-        panelParams.gravity =
-                Gravity.TOP | Gravity.START;
-
+        panelParams.gravity = Gravity.TOP | Gravity.START;
         panelParams.x = dp(12);
         panelParams.y = dp(120);
 
         try {
-
             windowManager.addView(panel, panelParams);
-
         } catch (Exception e) {
-
             panel = null;
             panelParams = null;
         }
@@ -498,34 +509,16 @@ public class FloatingService extends Service {
         button.setTextSize(11);
         button.setTypeface(null, Typeface.BOLD);
         button.setGravity(Gravity.CENTER);
-
-        button.setPadding(
-                dp(5),
-                dp(5),
-                dp(5),
-                dp(5)
-        );
+        button.setPadding(dp(5), dp(5), dp(5), dp(5));
 
         button.setBackground(
-                makeBackground(
-                        backgroundColor,
-                        dp(7)
-                )
+                makeBackground(backgroundColor, dp(7))
         );
 
         LinearLayout.LayoutParams params =
-                new LinearLayout.LayoutParams(
-                        0,
-                        dp(32),
-                        1f
-                );
+                new LinearLayout.LayoutParams(0, dp(32), 1f);
 
-        params.setMargins(
-                dp(2),
-                0,
-                dp(2),
-                0
-        );
+        params.setMargins(dp(2), 0, dp(2), 0);
 
         button.setLayoutParams(params);
         button.setClickable(true);
@@ -544,24 +537,13 @@ public class FloatingService extends Service {
         button.setGravity(Gravity.CENTER);
 
         button.setBackground(
-                makeBackground(
-                        Color.rgb(55, 85, 110),
-                        dp(7)
-                )
+                makeBackground(Color.rgb(55, 85, 110), dp(7))
         );
 
         LinearLayout.LayoutParams params =
-                new LinearLayout.LayoutParams(
-                        dp(34),
-                        dp(32)
-                );
+                new LinearLayout.LayoutParams(dp(34), dp(32));
 
-        params.setMargins(
-                dp(2),
-                0,
-                dp(2),
-                0
-        );
+        params.setMargins(dp(2), 0, dp(2), 0);
 
         button.setLayoutParams(params);
         button.setClickable(true);
@@ -586,17 +568,10 @@ public class FloatingService extends Service {
                     TimeZone.getTimeZone("Asia/Tehran")
             );
 
-            floatingStartHour =
-                    calendar.get(Calendar.HOUR_OF_DAY);
-
-            floatingStartMinute =
-                    calendar.get(Calendar.MINUTE);
-
-            floatingStartSecond =
-                    calendar.get(Calendar.SECOND);
-
-            floatingStartMillis =
-                    calendar.get(Calendar.MILLISECOND);
+            floatingStartHour = calendar.get(Calendar.HOUR_OF_DAY);
+            floatingStartMinute = calendar.get(Calendar.MINUTE);
+            floatingStartSecond = calendar.get(Calendar.SECOND);
+            floatingStartMillis = calendar.get(Calendar.MILLISECOND);
         }
 
         Dialog dialog = new Dialog(
@@ -605,39 +580,20 @@ public class FloatingService extends Service {
         );
 
         LinearLayout root = new LinearLayout(this);
-
         root.setOrientation(LinearLayout.VERTICAL);
-
-        root.setPadding(
-                dp(12),
-                dp(12),
-                dp(12),
-                dp(10)
-        );
-
-        // فقط پس‌زمینه پنجره تنظیم ساعت سفید شده است.
-        root.setBackground(
-                makeBackground(
-                        Color.WHITE,
-                        dp(12)
-                )
-        );
+        root.setPadding(dp(12), dp(12), dp(12), dp(10));
+        root.setBackground(makeBackground(Color.WHITE, dp(12)));
 
         TextView title = new TextView(this);
-
         title.setText("تنظیم زمان شروع");
         title.setTextColor(TITLE_COLOR);
         title.setTextSize(16);
         title.setTypeface(null, Typeface.BOLD);
         title.setGravity(Gravity.CENTER);
-
         title.setPadding(0, 0, 0, dp(8));
-
         root.addView(title);
 
-        LinearLayout pickersRow =
-                new LinearLayout(this);
-
+        LinearLayout pickersRow = new LinearLayout(this);
         pickersRow.setOrientation(LinearLayout.HORIZONTAL);
         pickersRow.setGravity(Gravity.CENTER);
 
@@ -664,28 +620,19 @@ public class FloatingService extends Service {
 
         root.addView(pickersRow);
 
-        LinearLayout buttons =
-                new LinearLayout(this);
-
+        LinearLayout buttons = new LinearLayout(this);
         buttons.setOrientation(LinearLayout.HORIZONTAL);
         buttons.setGravity(Gravity.CENTER);
         buttons.setPadding(0, dp(8), 0, 0);
 
         TextView cancelButton =
-                createDialogButton(
-                        "انصراف",
-                        Color.rgb(90, 90, 100)
-                );
+                createDialogButton("انصراف", Color.rgb(90, 90, 100));
 
         TextView confirmButton =
-                createDialogButton(
-                        "تأیید",
-                        Color.rgb(20, 125, 75)
-                );
+                createDialogButton("تأیید", Color.rgb(20, 125, 75));
 
         buttons.addView(cancelButton);
         buttons.addView(confirmButton);
-
         root.addView(buttons);
 
         dialog.setContentView(root);
@@ -696,22 +643,12 @@ public class FloatingService extends Service {
         if (window != null) {
 
             window.setType(getOverlayType());
+            window.setBackgroundDrawableResource(android.R.color.transparent);
+            window.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
 
-            window.setBackgroundDrawableResource(
-                    android.R.color.transparent
-            );
-
-            window.addFlags(
-                    WindowManager.LayoutParams.FLAG_DIM_BEHIND
-            );
-
-            WindowManager.LayoutParams params =
-                    window.getAttributes();
-
+            WindowManager.LayoutParams params = window.getAttributes();
             params.width = dp(340);
-            params.height =
-                    WindowManager.LayoutParams.WRAP_CONTENT;
-
+            params.height = WindowManager.LayoutParams.WRAP_CONTENT;
             params.gravity = Gravity.CENTER;
             params.dimAmount = 0.35f;
 
@@ -730,7 +667,6 @@ public class FloatingService extends Service {
             floatingTimeConfigured = true;
 
             updateCountdownDisplay();
-
             updateCountdownStatus("زمان شروع انتخاب شد");
 
             dialog.dismiss();
@@ -741,7 +677,6 @@ public class FloatingService extends Service {
             dialog.show();
 
             if (window != null) {
-
                 window.setLayout(
                         dp(340),
                         WindowManager.LayoutParams.WRAP_CONTENT
@@ -749,7 +684,6 @@ public class FloatingService extends Service {
             }
 
         } catch (Exception e) {
-
             updateCountdownStatus("باز کردن انتخاب‌گر زمان ناموفق بود");
         }
     }
@@ -780,7 +714,6 @@ public class FloatingService extends Service {
                 )
         );
 
-        // رنگ متن عدد انتخاب‌شده
         try {
 
             Field inputField =
@@ -788,8 +721,7 @@ public class FloatingService extends Service {
 
             inputField.setAccessible(true);
 
-            EditText input =
-                    (EditText) inputField.get(picker);
+            EditText input = (EditText) inputField.get(picker);
 
             if (input != null) {
                 input.setTextColor(Color.BLACK);
@@ -799,7 +731,6 @@ public class FloatingService extends Service {
         } catch (Exception ignored) {
         }
 
-        // رنگ متن اعداد چرخ انتخاب‌گر
         try {
 
             Field paintField =
@@ -809,8 +740,7 @@ public class FloatingService extends Service {
 
             paintField.setAccessible(true);
 
-            Paint paint =
-                    (Paint) paintField.get(picker);
+            Paint paint = (Paint) paintField.get(picker);
 
             if (paint != null) {
                 paint.setColor(Color.BLACK);
@@ -834,12 +764,8 @@ public class FloatingService extends Service {
         column.setGravity(Gravity.CENTER);
 
         TextView title = new TextView(this);
-
         title.setText(label);
-
-        // عنوان ستون‌ها مشکی برای خوانایی روی زمینه سفید
         title.setTextColor(Color.BLACK);
-
         title.setTextSize(10);
         title.setGravity(Gravity.CENTER);
 
@@ -854,7 +780,6 @@ public class FloatingService extends Service {
                 );
 
         column.setLayoutParams(params);
-
         parent.addView(column);
     }
 
@@ -870,27 +795,13 @@ public class FloatingService extends Service {
         button.setTextSize(12);
         button.setTypeface(null, Typeface.BOLD);
         button.setGravity(Gravity.CENTER);
-
-        button.setPadding(
-                dp(18),
-                dp(8),
-                dp(18),
-                dp(8)
-        );
-
-        button.setBackground(
-                makeBackground(color, dp(7))
-        );
+        button.setPadding(dp(18), dp(8), dp(18), dp(8));
+        button.setBackground(makeBackground(color, dp(7)));
 
         LinearLayout.LayoutParams params =
-                new LinearLayout.LayoutParams(
-                        0,
-                        dp(38),
-                        1f
-                );
+                new LinearLayout.LayoutParams(0, dp(38), 1f);
 
         params.setMargins(dp(4), 0, dp(4), 0);
-
         button.setLayoutParams(params);
 
         return button;
@@ -910,37 +821,18 @@ public class FloatingService extends Service {
 
     private void openMainForStart() {
 
-        Intent intent =
-                new Intent(this, MainActivity.class);
-
+        Intent intent = new Intent(this, MainActivity.class);
         intent.setAction(ACTION_START_FROM_FLOATING);
+
+        intent.putExtra("clock_source", clockSource);
 
         if (floatingTimeConfigured) {
 
-            intent.putExtra(
-                    "floating_start_time_configured",
-                    true
-            );
-
-            intent.putExtra(
-                    "floating_start_hour",
-                    floatingStartHour
-            );
-
-            intent.putExtra(
-                    "floating_start_minute",
-                    floatingStartMinute
-            );
-
-            intent.putExtra(
-                    "floating_start_second",
-                    floatingStartSecond
-            );
-
-            intent.putExtra(
-                    "floating_start_millis",
-                    floatingStartMillis
-            );
+            intent.putExtra("floating_start_time_configured", true);
+            intent.putExtra("floating_start_hour", floatingStartHour);
+            intent.putExtra("floating_start_minute", floatingStartMinute);
+            intent.putExtra("floating_start_second", floatingStartSecond);
+            intent.putExtra("floating_start_millis", floatingStartMillis);
         }
 
         intent.addFlags(
@@ -950,9 +842,7 @@ public class FloatingService extends Service {
         );
 
         try {
-
             startActivity(intent);
-
         } catch (Exception e) {
             updateCountdownStatus("باز کردن صفحه اصلی ناموفق بود");
         }
@@ -961,6 +851,7 @@ public class FloatingService extends Service {
     private void shutdownService() {
 
         stopLoop();
+        closeDashboard();
         removeFloatingViews();
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -978,25 +869,12 @@ public class FloatingService extends Service {
 
     private void createCountdownSection() {
 
-        LinearLayout countdownContainer =
-                new LinearLayout(this);
-
-        countdownContainer.setOrientation(
-                LinearLayout.VERTICAL
-        );
-
-        countdownContainer.setPadding(
-                dp(6),
-                dp(5),
-                dp(6),
-                dp(5)
-        );
+        LinearLayout countdownContainer = new LinearLayout(this);
+        countdownContainer.setOrientation(LinearLayout.VERTICAL);
+        countdownContainer.setPadding(dp(6), dp(5), dp(6), dp(5));
 
         countdownContainer.setBackground(
-                makeBackground(
-                        Color.rgb(13, 25, 36),
-                        dp(8)
-                )
+                makeBackground(Color.rgb(13, 25, 36), dp(8))
         );
 
         LinearLayout.LayoutParams containerParams =
@@ -1005,17 +883,10 @@ public class FloatingService extends Service {
                         LinearLayout.LayoutParams.WRAP_CONTENT
                 );
 
-        containerParams.setMargins(
-                0,
-                0,
-                0,
-                dp(3)
-        );
-
+        containerParams.setMargins(0, 0, 0, dp(3));
         countdownContainer.setLayoutParams(containerParams);
 
         TextView heading = new TextView(this);
-
         heading.setText("شمارش معکوس");
         heading.setTextColor(TITLE_COLOR);
         heading.setTextSize(12);
@@ -1023,64 +894,36 @@ public class FloatingService extends Service {
         heading.setGravity(Gravity.CENTER);
 
         selectedTimeView = new TextView(this);
-
-        selectedTimeView.setText(
-                "ساعت: --:--:--.---"
-        );
-
+        selectedTimeView.setText("ساعت: --:--:--.---");
         selectedTimeView.setTextColor(Color.WHITE);
         selectedTimeView.setTextSize(9);
         selectedTimeView.setGravity(Gravity.CENTER);
         selectedTimeView.setSingleLine(true);
-        selectedTimeView.setPadding(
-                0,
-                dp(3),
-                0,
-                dp(2)
-        );
+        selectedTimeView.setPadding(0, dp(3), 0, dp(2));
 
         countdownStatusView = new TextView(this);
-
         countdownStatusView.setText("آماده");
-        countdownStatusView.setTextColor(
-                Color.rgb(180, 190, 205)
-        );
-
+        countdownStatusView.setTextColor(Color.rgb(180, 190, 205));
         countdownStatusView.setTextSize(9);
         countdownStatusView.setGravity(Gravity.CENTER);
+        countdownStatusView.setPadding(0, dp(1), 0, dp(3));
 
-        countdownStatusView.setPadding(
-                0,
-                dp(1),
-                0,
-                dp(3)
-        );
-
-        LinearLayout digits =
-                new LinearLayout(this);
-
-        digits.setOrientation(
-                LinearLayout.HORIZONTAL
-        );
-
+        LinearLayout digits = new LinearLayout(this);
+        digits.setOrientation(LinearLayout.HORIZONTAL);
         digits.setGravity(Gravity.CENTER);
 
         countdownHour = createCountdownDigit("00");
         countdownMinute = createCountdownDigit("00");
         countdownSecond = createCountdownDigit("00");
         countdownMillis = createCountdownDigit("000");
-
         countdownMillis.setTextSize(15);
 
         digits.addView(countdownHour);
         digits.addView(createCountdownSeparator(":"));
-
         digits.addView(countdownMinute);
         digits.addView(createCountdownSeparator(":"));
-
         digits.addView(countdownSecond);
         digits.addView(createCountdownSeparator("."));
-
         digits.addView(countdownMillis);
 
         countdownContainer.addView(heading);
@@ -1093,6 +936,7 @@ public class FloatingService extends Service {
 
         LinearLayout.LayoutParams digitsParams =
                 new LinearLayout.LayoutParams(0, dp(32), 1f);
+
         digits.setLayoutParams(digitsParams);
         digitsAndReports.addView(digits);
 
@@ -1101,16 +945,19 @@ public class FloatingService extends Service {
         reportsButton.setTextColor(Color.WHITE);
         reportsButton.setTextSize(19);
         reportsButton.setGravity(Gravity.CENTER);
-        reportsButton.setBackground(makeBackground(
-                Color.rgb(55, 85, 110), dp(6)));
+        reportsButton.setBackground(
+                makeBackground(Color.rgb(55, 85, 110), dp(6))
+        );
+
         LinearLayout.LayoutParams reportsParams =
                 new LinearLayout.LayoutParams(dp(34), dp(32));
+
         reportsParams.setMargins(dp(4), 0, 0, 0);
         reportsButton.setLayoutParams(reportsParams);
-        reportsButton.setContentDescription("گزارش چرخه‌ها");
-        reportsButton.setOnClickListener(v -> showFloatingReports());
-        digitsAndReports.addView(reportsButton);
+        reportsButton.setContentDescription("داشبورد زنده");
+        reportsButton.setOnClickListener(v -> showLiveDashboard());
 
+        digitsAndReports.addView(reportsButton);
         countdownContainer.addView(digitsAndReports);
         panel.addView(countdownContainer);
     }
@@ -1126,10 +973,7 @@ public class FloatingService extends Service {
         tv.setGravity(Gravity.CENTER);
 
         tv.setBackground(
-                makeBackground(
-                        Color.rgb(25, 42, 55),
-                        dp(5)
-                )
+                makeBackground(Color.rgb(25, 42, 55), dp(5))
         );
 
         LinearLayout.LayoutParams params =
@@ -1139,13 +983,7 @@ public class FloatingService extends Service {
                         value.length() == 3 ? 1.35f : 1f
                 );
 
-        params.setMargins(
-                dp(1),
-                0,
-                dp(1),
-                0
-        );
-
+        params.setMargins(dp(1), 0, dp(1), 0);
         tv.setLayoutParams(params);
 
         return tv;
@@ -1161,13 +999,9 @@ public class FloatingService extends Service {
         tv.setTypeface(null, Typeface.BOLD);
         tv.setGravity(Gravity.CENTER);
 
-        LinearLayout.LayoutParams params =
-                new LinearLayout.LayoutParams(
-                        dp(9),
-                        dp(32)
-                );
-
-        tv.setLayoutParams(params);
+        tv.setLayoutParams(
+                new LinearLayout.LayoutParams(dp(9), dp(32))
+        );
 
         return tv;
     }
@@ -1182,14 +1016,9 @@ public class FloatingService extends Service {
         }
 
         SimpleDateFormat format =
-                new SimpleDateFormat(
-                        "HH:mm:ss.SSS",
-                        Locale.US
-                );
+                new SimpleDateFormat("HH:mm:ss.SSS", Locale.US);
 
-        format.setTimeZone(
-                TimeZone.getTimeZone("Asia/Tehran")
-        );
+        format.setTimeZone(TimeZone.getTimeZone("Asia/Tehran"));
 
         if (selectedTimeView != null) {
 
@@ -1197,19 +1026,20 @@ public class FloatingService extends Service {
                     new Date(System.currentTimeMillis())
             );
 
-            String displayText = "ساعت: " + currentTime;
+            String sourceLabel = CLOCK_INTERNET.equals(clockSource)
+                    ? "اینترنت ایران"
+                    : "ساعت گوشی";
+
+            String displayText = sourceLabel + ": " + currentTime;
 
             if (selectedStartEpochMs > 0) {
 
                 displayText += " | شروع: "
-                        + format.format(
-                        new Date(selectedStartEpochMs)
-                );
+                        + format.format(new Date(selectedStartEpochMs));
 
             } else if (floatingTimeConfigured) {
 
-                displayText += " | شروع: "
-                        + formatFloatingStartTime();
+                displayText += " | شروع: " + formatFloatingStartTime();
             }
 
             selectedTimeView.setText(displayText);
@@ -1218,7 +1048,6 @@ public class FloatingService extends Service {
         long remaining = 0;
 
         if (running && !cycleActive) {
-
             remaining = Math.max(
                     0,
                     anchorElapsedMs - SystemClock.elapsedRealtime()
@@ -1230,36 +1059,18 @@ public class FloatingService extends Service {
         long seconds = (remaining % 60000L) / 1000L;
         long millis = remaining % 1000L;
 
-        countdownHour.setText(
-                String.format(Locale.US, "%02d", hours)
-        );
-
-        countdownMinute.setText(
-                String.format(Locale.US, "%02d", minutes)
-        );
-
-        countdownSecond.setText(
-                String.format(Locale.US, "%02d", seconds)
-        );
-
-        countdownMillis.setText(
-                String.format(Locale.US, "%03d", millis)
-        );
+        countdownHour.setText(String.format(Locale.US, "%02d", hours));
+        countdownMinute.setText(String.format(Locale.US, "%02d", minutes));
+        countdownSecond.setText(String.format(Locale.US, "%02d", seconds));
+        countdownMillis.setText(String.format(Locale.US, "%03d", millis));
 
         if (!running) {
-
             updateCountdownStatus("آماده شروع");
-
         } else if (cycleActive) {
-
             updateCountdownStatus("چرخه در حال اجرا است");
-
         } else if (remaining == 0) {
-
             updateCountdownStatus("در حال شروع کلیک‌ها...");
-
         } else {
-
             updateCountdownStatus("زمان باقی‌مانده تا شروع");
         }
     }
@@ -1269,98 +1080,388 @@ public class FloatingService extends Service {
         if (countdownStatusView != null) {
             countdownStatusView.setText(message);
         }
+
+        if (dashboardStateView != null) {
+            dashboardStateView.setText("وضعیت: " + message);
+        }
     }
 
-    private void showFloatingReports() {
+    // ---------------------------------------------------------
+    // Live dashboard
+    // ---------------------------------------------------------
 
-        List<String> reports = CycleReportStore.getFloatingReports(this);
+    private void showLiveDashboard() {
+
+        if (dashboardDialog != null && dashboardDialog.isShowing()) {
+            dashboardDialog.dismiss();
+            return;
+        }
 
         Dialog dialog = new Dialog(
                 this,
-                android.R.style.Theme_Material_Light_Dialog_Alert
+                android.R.style.Theme_Material_Dialog_Alert
         );
+
+        dashboardDialog = dialog;
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(dp(14), dp(12), dp(14), dp(12));
-        root.setBackground(makeBackground(Color.WHITE, dp(12)));
+        root.setBackground(
+                makeBackground(Color.rgb(20, 30, 42), dp(12))
+        );
 
         TextView title = new TextView(this);
-        title.setText("۱۰ چرخهٔ اخیر");
+        title.setText("داشبورد زنده اجرا");
         title.setTextColor(TITLE_COLOR);
-        title.setTextSize(16);
+        title.setTextSize(17);
         title.setTypeface(null, Typeface.BOLD);
         title.setGravity(Gravity.CENTER);
-        title.setPadding(0, 0, 0, dp(8));
+        title.setPadding(0, 0, 0, dp(10));
         root.addView(title);
+
+        dashboardStateView = createDashboardText();
+        dashboardCycleView = createDashboardText();
+        dashboardSuccessView = createDashboardText();
+        dashboardFailureView = createDashboardText();
+        dashboardDispatchedView = createDashboardText();
+        dashboardTargetView = createDashboardText();
+        dashboardClockView = createDashboardText();
+        dashboardErrorView = createDashboardText();
+
+        root.addView(dashboardStateView);
+        root.addView(dashboardCycleView);
+        root.addView(dashboardSuccessView);
+        root.addView(dashboardFailureView);
+        root.addView(dashboardDispatchedView);
+        root.addView(dashboardTargetView);
+        root.addView(dashboardClockView);
+        root.addView(dashboardErrorView);
+
+        TextView reportsTitle = new TextView(this);
+        reportsTitle.setText("گزارش چرخه‌های تکمیل‌شده");
+        reportsTitle.setTextColor(TITLE_COLOR);
+        reportsTitle.setTextSize(14);
+        reportsTitle.setTypeface(null, Typeface.BOLD);
+        reportsTitle.setPadding(0, dp(10), 0, dp(6));
+        root.addView(reportsTitle);
 
         ScrollView scrollView = new ScrollView(this);
         scrollView.setFillViewport(true);
-        LinearLayout rows = new LinearLayout(this);
-        rows.setOrientation(LinearLayout.VERTICAL);
 
-        if (reports == null || reports.isEmpty()) {
-            TextView empty = new TextView(this);
-            empty.setText("هنوز گزارشی ثبت نشده است");
-            empty.setTextColor(Color.DKGRAY);
-            empty.setTextSize(13);
-            empty.setGravity(Gravity.CENTER);
-            empty.setPadding(dp(8), dp(18), dp(8), dp(18));
-            rows.addView(empty);
-        } else {
-            for (String report : reports) {
-                TextView row = new TextView(this);
-                row.setText(report == null ? "" : report);
-                row.setTextColor(Color.rgb(35, 45, 55));
-                row.setTextSize(12);
-                row.setGravity(Gravity.CENTER_VERTICAL);
-                row.setPadding(dp(9), dp(9), dp(9), dp(9));
-                row.setBackground(makeBackground(
-                        Color.rgb(242, 245, 248), dp(6)));
-                LinearLayout.LayoutParams rowParams =
-                        new LinearLayout.LayoutParams(
-                                LinearLayout.LayoutParams.MATCH_PARENT,
-                                LinearLayout.LayoutParams.WRAP_CONTENT);
-                rowParams.setMargins(0, 0, 0, dp(5));
-                row.setLayoutParams(rowParams);
-                rows.addView(row);
-            }
-        }
+        dashboardReportsView = new TextView(this);
+        dashboardReportsView.setTextColor(Color.WHITE);
+        dashboardReportsView.setTextSize(12);
+        dashboardReportsView.setPadding(dp(8), dp(8), dp(8), dp(8));
+        dashboardReportsView.setBackground(
+                makeBackground(Color.rgb(30, 43, 57), dp(7))
+        );
 
-        scrollView.addView(rows);
+        scrollView.addView(dashboardReportsView);
+
         LinearLayout.LayoutParams scrollParams =
                 new LinearLayout.LayoutParams(
-                        LinearLayout.LayoutParams.MATCH_PARENT, dp(300));
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        dp(210)
+                );
+
         root.addView(scrollView, scrollParams);
 
-        TextView close = createDialogButton("بستن", Color.rgb(65, 85, 105));
+        TextView close = createDialogButton(
+                "بستن داشبورد",
+                Color.rgb(65, 85, 105)
+        );
+
         LinearLayout.LayoutParams closeParams =
                 new LinearLayout.LayoutParams(
-                        LinearLayout.LayoutParams.MATCH_PARENT, dp(40));
-        closeParams.setMargins(0, dp(8), 0, 0);
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        dp(40)
+                );
+
+        closeParams.setMargins(0, dp(10), 0, 0);
         close.setLayoutParams(closeParams);
         close.setOnClickListener(v -> dialog.dismiss());
+
         root.addView(close);
 
         dialog.setContentView(root);
         dialog.setCancelable(true);
+
         Window window = dialog.getWindow();
+
         if (window != null) {
+
             window.setType(getOverlayType());
-            window.setBackgroundDrawableResource(android.R.color.transparent);
+            window.setBackgroundDrawableResource(
+                    android.R.color.transparent
+            );
+
             WindowManager.LayoutParams params = window.getAttributes();
-            params.width = dp(320);
+            params.width = dp(330);
             params.height = WindowManager.LayoutParams.WRAP_CONTENT;
             params.gravity = Gravity.CENTER;
+
             window.setAttributes(params);
         }
-        try {
-            dialog.show();
-            if (window != null) {
-                window.setLayout(dp(320), WindowManager.LayoutParams.WRAP_CONTENT);
+
+        dialog.setOnDismissListener(d -> {
+
+            stopDashboardUpdates();
+
+            if (dashboardDialog == dialog) {
+                dashboardDialog = null;
             }
+
+            dashboardStateView = null;
+            dashboardCycleView = null;
+            dashboardSuccessView = null;
+            dashboardFailureView = null;
+            dashboardDispatchedView = null;
+            dashboardTargetView = null;
+            dashboardClockView = null;
+            dashboardErrorView = null;
+            dashboardReportsView = null;
+        });
+
+        try {
+
+            dialog.show();
+
+            if (window != null) {
+                window.setLayout(
+                        dp(330),
+                        WindowManager.LayoutParams.WRAP_CONTENT
+                );
+            }
+
+            updateLiveDashboard();
+
+            startDashboardUpdates();
+
         } catch (Exception e) {
-            updateCountdownStatus("نمایش گزارش‌ها ممکن نشد");
+
+            dashboardDialog = null;
+            updateCountdownStatus("نمایش داشبورد ممکن نشد");
+        }
+    }
+
+    private TextView createDashboardText() {
+
+        TextView view = new TextView(this);
+
+        view.setTextColor(Color.WHITE);
+        view.setTextSize(12);
+        view.setPadding(dp(8), dp(5), dp(8), dp(5));
+        view.setGravity(Gravity.CENTER_VERTICAL);
+
+        return view;
+    }
+
+    private void startDashboardUpdates() {
+
+        stopDashboardUpdates();
+
+        dashboardUpdateRunnable = new Runnable() {
+            @Override
+            public void run() {
+
+                if (dashboardDialog == null
+                        || !dashboardDialog.isShowing()) {
+                    return;
+                }
+
+                updateLiveDashboard();
+
+                handler.postDelayed(
+                        this,
+                        DASHBOARD_UPDATE_MS
+                );
+            }
+        };
+
+        handler.post(dashboardUpdateRunnable);
+    }
+
+    private void stopDashboardUpdates() {
+
+        if (dashboardUpdateRunnable != null) {
+            handler.removeCallbacks(dashboardUpdateRunnable);
+            dashboardUpdateRunnable = null;
+        }
+    }
+
+    private void closeDashboard() {
+
+        stopDashboardUpdates();
+
+        if (dashboardDialog != null) {
+
+            try {
+                dashboardDialog.dismiss();
+            } catch (Exception ignored) {
+            }
+
+            dashboardDialog = null;
+        }
+    }
+
+    private void updateLiveDashboard() {
+
+        if (dashboardDialog == null
+                || !dashboardDialog.isShowing()) {
+            return;
+        }
+
+        AutoClickService service = AutoClickService.getInstance();
+
+        long currentSuccess = 0;
+        long currentFailure = 0;
+        long currentDispatched = 0;
+
+        if (service != null) {
+
+            if (!currentCycleStatsFinalized) {
+                currentSuccess = service.getSuccessfulClicks();
+                currentFailure = service.getFailedClicks();
+                currentDispatched = service.getDispatchedClicks();
+            }
+        }
+
+        long totalSuccess =
+                completedSuccessfulClicks + currentSuccess;
+
+        long totalFailure =
+                completedFailedClicks + currentFailure;
+
+        long totalDispatched =
+                completedDispatchedClicks + currentDispatched;
+
+        if (dashboardStateView != null) {
+
+            String state;
+
+            if (running && cycleActive) {
+                state = "در حال اجرای چرخه";
+            } else if (running) {
+                state = "در انتظار چرخه بعدی یا زمان شروع";
+            } else {
+                state = "متوقف یا آماده";
+            }
+
+            dashboardStateView.setText("وضعیت: " + state);
+        }
+
+        if (dashboardCycleView != null) {
+
+            long shownCycle = cycleActive
+                    ? cycleIndex + 1
+                    : Math.min(cycleIndex, totalCycleCount);
+
+            dashboardCycleView.setText(
+                    "چرخه: " + shownCycle + " از " + totalCycleCount
+            );
+        }
+
+        if (dashboardSuccessView != null) {
+            dashboardSuccessView.setText(
+                    "کلیک‌های موفق: " + totalSuccess
+            );
+        }
+
+        if (dashboardFailureView != null) {
+            dashboardFailureView.setText(
+                    "کلیک‌های ناموفق: " + totalFailure
+            );
+        }
+
+        if (dashboardDispatchedView != null) {
+            dashboardDispatchedView.setText(
+                    "کلیک‌های ارسال‌شده: " + totalDispatched
+            );
+        }
+
+        if (dashboardTargetView != null) {
+
+            dashboardTargetView.setText(
+                    "کلیک‌های پذیرفته‌شده در چرخه فعلی: "
+                            + clickNumber + " از " + clickCount
+            );
+        }
+
+        if (dashboardClockView != null) {
+
+            String source = CLOCK_INTERNET.equals(clockSource)
+                    ? "ساعت اینترنتی ایران"
+                    : "ساعت گوشی";
+
+            dashboardClockView.setText(
+                    "مبنای ساعت شروع: " + source
+            );
+        }
+
+        if (dashboardErrorView != null) {
+
+            String error = service == null
+                    ? "سرویس دسترسی‌پذیری متصل نیست"
+                    : service.getLastError();
+
+            if (error == null || error.trim().isEmpty()) {
+                error = "خطای ثبت‌شده‌ای وجود ندارد";
+            }
+
+            dashboardErrorView.setText("آخرین خطا: " + error);
+        }
+
+        updateDashboardReports();
+    }
+
+    private void updateDashboardReports() {
+
+        if (dashboardReportsView == null) {
+            return;
+        }
+
+        List<String> reports =
+                CycleReportStore.getFloatingReports(this);
+
+        StringBuilder builder = new StringBuilder();
+
+        if (reports == null || reports.isEmpty()) {
+
+            builder.append("هنوز گزارشی ثبت نشده است");
+
+        } else {
+
+            for (String report : reports) {
+
+                if (report != null) {
+                    builder.append(report)
+                            .append("\n\n");
+                }
+            }
+        }
+
+        if (cycleActive) {
+
+            builder.insert(
+                    0,
+                    "چرخه فعلی هنوز تکمیل نشده است.\n\n"
+            );
+        }
+
+        dashboardReportsView.setText(builder.toString());
+    }
+
+    private void addLiveError(String error) {
+
+        if (error == null || error.trim().isEmpty()) {
+            return;
+        }
+
+        liveErrors.add(0, error);
+
+        while (liveErrors.size() > 10) {
+            liveErrors.remove(liveErrors.size() - 1);
         }
     }
 
@@ -1405,14 +1506,10 @@ public class FloatingService extends Service {
                 case MotionEvent.ACTION_MOVE:
 
                     markerParams.x = markerStartX
-                            + (int) (
-                            event.getRawX() - markerTouchRawX
-                    );
+                            + (int) (event.getRawX() - markerTouchRawX);
 
                     markerParams.y = markerStartY
-                            + (int) (
-                            event.getRawY() - markerTouchRawY
-                    );
+                            + (int) (event.getRawY() - markerTouchRawY);
 
                     updateViewLayout(markerView, markerParams);
                     updateTarget();
@@ -1422,7 +1519,6 @@ public class FloatingService extends Service {
                 case MotionEvent.ACTION_UP:
 
                     updateTarget();
-
                     return true;
             }
 
@@ -1438,26 +1534,17 @@ public class FloatingService extends Service {
                 PixelFormat.TRANSLUCENT
         );
 
-        markerParams.gravity =
-                Gravity.TOP | Gravity.START;
-
+        markerParams.gravity = Gravity.TOP | Gravity.START;
         markerParams.x = dp(120);
         markerParams.y = dp(350);
 
         try {
-
             windowManager.addView(markerView, markerParams);
-
         } catch (Exception e) {
-
             markerView = null;
             markerParams = null;
         }
     }
-
-    // ---------------------------------------------------------
-    // Marker touch control
-    // ---------------------------------------------------------
 
     private void setMarkerTouchable(boolean touchable) {
 
@@ -1470,9 +1557,7 @@ public class FloatingService extends Service {
                         | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN;
 
         if (!touchable) {
-
-            flags |=
-                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
+            flags |= WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
         }
 
         if (markerParams.flags == flags) {
@@ -1480,11 +1565,7 @@ public class FloatingService extends Service {
         }
 
         markerParams.flags = flags;
-
-        updateViewLayout(
-                markerView,
-                markerParams
-        );
+        updateViewLayout(markerView, markerParams);
     }
 
     private GradientDrawable makeBackground(
@@ -1492,8 +1573,7 @@ public class FloatingService extends Service {
             int radius
     ) {
 
-        GradientDrawable drawable =
-                new GradientDrawable();
+        GradientDrawable drawable = new GradientDrawable();
 
         drawable.setColor(color);
         drawable.setCornerRadius(radius);
@@ -1530,8 +1610,7 @@ public class FloatingService extends Service {
         targetX = markerParams.x + markerSize / 2;
         targetY = markerParams.y + markerSize / 2;
 
-        AutoClickService service =
-                AutoClickService.getInstance();
+        AutoClickService service = AutoClickService.getInstance();
 
         if (service != null) {
             service.setTarget(targetX, targetY);
@@ -1567,9 +1646,7 @@ public class FloatingService extends Service {
 
         try {
 
-            if (markerView != null
-                    && markerView.getParent() != null) {
-
+            if (markerView != null && markerView.getParent() != null) {
                 windowManager.removeView(markerView);
             }
 
@@ -1589,6 +1666,7 @@ public class FloatingService extends Service {
         countdownMinute = null;
         countdownSecond = null;
         countdownMillis = null;
+        reportsButton = null;
     }
 
     public static void setOverlaysHidden(boolean hidden) {
@@ -1602,14 +1680,12 @@ public class FloatingService extends Service {
         service.handler.post(() -> {
 
             if (service.panel != null) {
-
                 service.panel.setVisibility(
                         hidden ? View.INVISIBLE : View.VISIBLE
                 );
             }
 
             if (service.markerView != null) {
-
                 service.markerView.setVisibility(
                         hidden ? View.INVISIBLE : View.VISIBLE
                 );
@@ -1630,6 +1706,12 @@ public class FloatingService extends Service {
             return;
         }
 
+        clockSource = config.getStringExtra("clock_source");
+
+        if (!CLOCK_INTERNET.equals(clockSource)) {
+            clockSource = CLOCK_PHONE;
+        }
+
         cycleDurationMs =
                 config.getLongExtra("cycle_duration_ms", 1000);
 
@@ -1642,7 +1724,8 @@ public class FloatingService extends Service {
         clickCount =
                 config.getLongExtra("click_count", 1);
 
-        totalCycleCount = config.getLongExtra("cycle_total_count", 1);
+        totalCycleCount =
+                config.getLongExtra("cycle_total_count", 1);
 
         if (cycleDurationMs <= 0
                 || pauseDurationMs < 0
@@ -1658,10 +1741,7 @@ public class FloatingService extends Service {
 
         if (config.hasExtra("start_delay_ms")) {
 
-            delayMs = config.getLongExtra(
-                    "start_delay_ms",
-                    -1
-            );
+            delayMs = config.getLongExtra("start_delay_ms", -1);
 
         } else {
 
@@ -1706,15 +1786,23 @@ public class FloatingService extends Service {
         running = true;
         cycleActive = false;
 
-        setMarkerTouchable(false);
-
         cycleIndex = 0;
         clickNumber = 0;
         lastBatchCount = 0;
+
+        completedSuccessfulClicks = 0;
+        completedFailedClicks = 0;
+        completedDispatchedClicks = 0;
+
+        currentCycleStatsFinalized = false;
+        liveErrors.clear();
+
         cycleYellow = false;
         cycleIntervalViolation = false;
         cycleDeadlineSkipped = false;
         cycleOtherFailure = false;
+
+        setMarkerTouchable(false);
 
         showFloatingViews();
         updateTarget();
@@ -1731,10 +1819,7 @@ public class FloatingService extends Service {
             }
         };
 
-        postAtElapsedTime(
-                cycleStartRunnable,
-                anchorElapsedMs
-        );
+        postAtElapsedTime(cycleStartRunnable, anchorElapsedMs);
 
         updateCountdownStatus(
                 delayMs == 0
@@ -1744,7 +1829,6 @@ public class FloatingService extends Service {
     }
 
     private boolean isCurrentRun(long generation) {
-
         return running && generation == runGeneration;
     }
 
@@ -1777,7 +1861,6 @@ public class FloatingService extends Service {
         if (period == Long.MAX_VALUE
                 || (index > 0
                 && period > (Long.MAX_VALUE - anchorElapsedMs) / index)) {
-
             return Long.MAX_VALUE;
         }
 
@@ -1790,8 +1873,7 @@ public class FloatingService extends Service {
 
     private AutoClickService getReadyAccessibility() {
 
-        AutoClickService service =
-                AutoClickService.getInstance();
+        AutoClickService service = AutoClickService.getInstance();
 
         if (service == null || !service.isServiceReady()) {
             return null;
@@ -1834,10 +1916,7 @@ public class FloatingService extends Service {
             }
         };
 
-        handler.postDelayed(
-                cycleStartRunnable,
-                SERVICE_RETRY_MS
-        );
+        handler.postDelayed(cycleStartRunnable, SERVICE_RETRY_MS);
     }
 
     // ---------------------------------------------------------
@@ -1866,11 +1945,7 @@ public class FloatingService extends Service {
                 }
             };
 
-            handler.postDelayed(
-                    cycleStartRunnable,
-                    GESTURE_RETRY_MS
-            );
-
+            handler.postDelayed(cycleStartRunnable, GESTURE_RETRY_MS);
             return;
         }
 
@@ -1878,32 +1953,23 @@ public class FloatingService extends Service {
 
         clickNumber = 0;
         lastBatchCount = 0;
+
         cycleYellow = false;
         cycleIntervalViolation = false;
         cycleDeadlineSkipped = false;
         cycleOtherFailure = false;
 
-        cycleStartElapsedMs =
-                SystemClock.elapsedRealtime();
-
-        cycleDeadlineElapsedMs =
-                cycleStartElapsedMs + cycleDurationMs;
-
-        cycleStartWallMs =
-                System.currentTimeMillis();
+        cycleStartElapsedMs = SystemClock.elapsedRealtime();
+        cycleDeadlineElapsedMs = cycleStartElapsedMs + cycleDurationMs;
+        cycleStartWallMs = System.currentTimeMillis();
 
         accessibility.resetClickCounters();
 
-        successAtStart =
-                accessibility.getSuccessfulClicks();
-
-        failedAtStart =
-                accessibility.getFailedClicks();
+        currentCycleStatsFinalized = false;
 
         accessibility.setTarget(targetX, targetY);
 
         scheduleNextClick(generation);
-
         updateDisplay();
     }
 
@@ -1919,6 +1985,7 @@ public class FloatingService extends Service {
         }
 
         long now = SystemClock.elapsedRealtime();
+
         if (now >= cycleDeadlineElapsedMs) {
             cycleYellow = true;
             cycleDeadlineSkipped = true;
@@ -1927,6 +1994,7 @@ public class FloatingService extends Service {
         }
 
         accessibility = getReadyAccessibility();
+
         if (accessibility == null) {
             waitForAccessibility(generation);
             return;
@@ -1938,20 +2006,29 @@ public class FloatingService extends Service {
         );
 
         long targetElapsed;
+
         if (clickNumber == 0 || lastBatchCount <= 0) {
+
             targetElapsed = now;
+
         } else {
+
             if (lastBatchCount > Long.MAX_VALUE / effectiveInterval) {
                 cycleOtherFailure = true;
+                addLiveError("محاسبه فاصله کلیک‌ها از محدوده مجاز خارج شد");
                 waitForCycleEnd(generation);
                 return;
             }
+
             long offset = lastBatchCount * effectiveInterval;
+
             if (lastClickDispatchElapsedMs > Long.MAX_VALUE - offset) {
                 cycleOtherFailure = true;
+                addLiveError("محاسبه زمان کلیک بعدی نامعتبر شد");
                 waitForCycleEnd(generation);
                 return;
             }
+
             targetElapsed = lastClickDispatchElapsedMs + offset;
         }
 
@@ -1963,10 +2040,12 @@ public class FloatingService extends Service {
         }
 
         nextClickRunnable = () -> {
+
             if (isCurrentRun(generation) && cycleActive) {
                 dispatchNextClick(generation);
             }
         };
+
         postAtElapsedTime(nextClickRunnable, targetElapsed);
     }
 
@@ -1976,9 +2055,8 @@ public class FloatingService extends Service {
             return;
         }
 
-        // Deadline check precedes service lookup/retry: no new Gesture may
-        // be queued once the cycle has ended.
         long now = SystemClock.elapsedRealtime();
+
         if (now >= cycleDeadlineElapsedMs) {
             cycleYellow = true;
             cycleDeadlineSkipped = true;
@@ -1987,34 +2065,47 @@ public class FloatingService extends Service {
         }
 
         accessibility = getReadyAccessibility();
+
         if (accessibility == null) {
+
             updateCountdownStatus("اتصال سرویس کلیک قطع شده؛ تلاش مجدد");
+
             nextClickRunnable = () -> {
+
                 if (isCurrentRun(generation) && cycleActive) {
                     dispatchNextClick(generation);
                 }
             };
+
             handler.postDelayed(nextClickRunnable, SERVICE_RETRY_MS);
             return;
         }
 
         if (accessibility.isGestureInProgress()) {
+
             nextClickRunnable = () -> {
+
                 if (isCurrentRun(generation) && cycleActive) {
                     dispatchNextClick(generation);
                 }
             };
+
             handler.postDelayed(nextClickRunnable, GESTURE_RETRY_MS);
             return;
         }
 
         accessibility.setTarget(targetX, targetY);
+
         final AutoClickService clickService = accessibility;
 
         long remainingClicks = clickCount - clickNumber;
-        int maxBatchCount = clickService.getMaxBatchClickCount(clickIntervalMs);
+
+        int maxBatchCount =
+                clickService.getMaxBatchClickCount(clickIntervalMs);
+
         if (maxBatchCount <= 0) {
             cycleOtherFailure = true;
+            addLiveError("تعداد مجاز کلیک در بسته صفر شد");
             waitForCycleEnd(generation);
             return;
         }
@@ -2023,13 +2114,17 @@ public class FloatingService extends Service {
                 remainingClicks,
                 (long) maxBatchCount
         );
+
         if (requestedBatchCount <= 0) {
             waitForCycleEnd(generation);
             return;
         }
 
         final long callbackGeneration = generation;
-        final long dispatchElapsed = SystemClock.elapsedRealtime();
+
+        final long dispatchElapsed =
+                SystemClock.elapsedRealtime();
+
         if (dispatchElapsed >= cycleDeadlineElapsedMs) {
             cycleYellow = true;
             cycleDeadlineSkipped = true;
@@ -2045,48 +2140,91 @@ public class FloatingService extends Service {
                 clickIntervalMs,
                 cycleDeadlineElapsedMs,
                 () -> handler.post(() -> {
+
                     if (!isCurrentRun(callbackGeneration) || !cycleActive) {
                         return;
                     }
 
                     if (clickService.wasLastBatchRejectedForInterval()) {
+
                         cycleYellow = true;
                         cycleIntervalViolation = true;
+
+                        addLiveError(
+                                "بسته کلیک به علت رعایت نشدن فاصله زمانی رد شد"
+                        );
                     }
+
                     if (clickService.getLastBatchSkippedByDeadline() > 0) {
+
                         cycleYellow = true;
                         cycleDeadlineSkipped = true;
+
+                        addLiveError(
+                                "بخشی از کلیک‌ها به علت پایان مهلت ارسال نشد"
+                        );
                     }
+
                     if (clickService.getFailedClicks() > 0) {
+
                         cycleOtherFailure = true;
+
+                        String error = clickService.getLastError();
+
+                        addLiveError(
+                                error == null || error.trim().isEmpty()
+                                        ? "خطا در اجرای ژست لمس"
+                                        : error
+                        );
                     }
 
                     if (SystemClock.elapsedRealtime() >= cycleDeadlineElapsedMs
                             || clickNumber >= clickCount
                             || cycleIntervalViolation
                             || cycleOtherFailure) {
+
                         waitForCycleEnd(callbackGeneration);
+
                     } else {
+
                         scheduleNextClick(callbackGeneration);
                     }
+
                     updateDisplay();
                 })
         );
 
-        // AutoClickService returns the number of Stroke objects accepted
-        // for dispatch. Rejected interval/deadline batches are not retried:
-        // retrying could conceal a real interval violation.
         if (acceptedCount <= 0) {
+
             if (clickService.wasLastBatchRejectedForInterval()) {
+
                 cycleYellow = true;
                 cycleIntervalViolation = true;
+
+                addLiveError("ارسال کلیک به علت فاصله زمانی زودهنگام رد شد");
+
             } else if (clickService.getLastBatchSkippedByDeadline() > 0) {
+
                 cycleYellow = true;
                 cycleDeadlineSkipped = true;
+
+                addLiveError("مهلت چرخه پیش از ارسال بسته کلیک پایان یافت");
+
             } else {
+
                 cycleOtherFailure = true;
+
+                String error = clickService.getLastError();
+
+                addLiveError(
+                        error == null || error.trim().isEmpty()
+                                ? "ارسال بسته کلیک ناموفق بود"
+                                : error
+                );
             }
+
             lastBatchCount = 0;
+
             waitForCycleEnd(generation);
             updateDisplay();
             return;
@@ -2096,11 +2234,15 @@ public class FloatingService extends Service {
         clickNumber += acceptedCount;
 
         if (acceptedCount < requestedBatchCount) {
+
             cycleYellow = true;
             cycleDeadlineSkipped = true;
+
+            addLiveError("همه کلیک‌های درخواستی در مهلت چرخه ارسال نشدند");
         }
 
         if (clickService.getLastBatchSkippedByDeadline() > 0) {
+
             cycleYellow = true;
             cycleDeadlineSkipped = true;
         }
@@ -2115,7 +2257,6 @@ public class FloatingService extends Service {
         }
 
         if (nextClickRunnable != null) {
-
             handler.removeCallbacks(nextClickRunnable);
             nextClickRunnable = null;
         }
@@ -2126,7 +2267,9 @@ public class FloatingService extends Service {
         }
 
         cycleFinishRunnable = () -> {
+
             cycleFinishRunnable = null;
+
             if (isCurrentRun(generation) && cycleActive) {
                 finishCycle(generation);
             }
@@ -2147,12 +2290,16 @@ public class FloatingService extends Service {
         cycleFinishRunnable = null;
 
         accessibility = getReadyAccessibility();
+
         if (accessibility != null && accessibility.isGestureInProgress()) {
+
             cycleFinishRunnable = () -> {
+
                 if (isCurrentRun(generation)) {
                     finishCycle(generation);
                 }
             };
+
             handler.postDelayed(cycleFinishRunnable, GESTURE_RETRY_MS);
             return;
         }
@@ -2160,26 +2307,55 @@ public class FloatingService extends Service {
         cycleActive = false;
 
         long successes = accessibility == null
-                ? 0L : accessibility.getSuccessfulClicks();
+                ? 0L
+                : accessibility.getSuccessfulClicks();
+
         long failures = accessibility == null
-                ? 1L : accessibility.getFailedClicks();
+                ? 1L
+                : accessibility.getFailedClicks();
+
+        long dispatched = accessibility == null
+                ? 0L
+                : accessibility.getDispatchedClicks();
 
         if (accessibility == null) {
             cycleOtherFailure = true;
+            addLiveError("سرویس دسترسی‌پذیری هنگام پایان چرخه متصل نبود");
+        }
+
+        // آمار این چرخه فقط یک بار به مجموع اجرا اضافه می‌شود.
+        if (!currentCycleStatsFinalized) {
+
+            completedSuccessfulClicks += successes;
+            completedFailedClicks += failures;
+            completedDispatchedClicks += dispatched;
+
+            currentCycleStatsFinalized = true;
         }
 
         boolean incomplete = successes < clickCount;
-        if (incomplete && SystemClock.elapsedRealtime() >= cycleDeadlineElapsedMs) {
+
+        if (incomplete
+                && SystemClock.elapsedRealtime() >= cycleDeadlineElapsedMs) {
+
             cycleYellow = true;
             cycleDeadlineSkipped = true;
         }
 
         final String status;
+
         if (cycleIntervalViolation || cycleDeadlineSkipped) {
+
             status = CycleReportStore.STATUS_YELLOW;
-        } else if (!cycleOtherFailure && failures == 0 && successes >= clickCount) {
+
+        } else if (!cycleOtherFailure
+                && failures == 0
+                && successes >= clickCount) {
+
             status = CycleReportStore.STATUS_GREEN;
+
         } else {
+
             status = CycleReportStore.STATUS_RED;
         }
 
@@ -2193,26 +2369,39 @@ public class FloatingService extends Service {
 
         cycleIndex++;
 
+        updateDisplay();
+
         if (cycleIndex >= totalCycleCount) {
+
             stopLoop();
+
             updateCountdownStatus("همهٔ چرخه‌ها به پایان رسیدند");
             updateDisplay();
+
             return;
         }
 
         long nextTarget = getCycleTargetElapsed(cycleIndex);
+
         if (nextTarget == Long.MAX_VALUE) {
+
             stopLoop();
+
             updateCountdownStatus("محدودیت زمان‌بندی چرخه");
+            addLiveError("زمان‌بندی چرخه بعدی از محدوده مجاز خارج شد");
+
             return;
         }
 
         cycleStartRunnable = () -> {
+
             if (isCurrentRun(generation)) {
                 startCycle(generation);
             }
         };
+
         postAtElapsedTime(cycleStartRunnable, nextTarget);
+
         updateDisplay();
     }
 
@@ -2234,25 +2423,23 @@ public class FloatingService extends Service {
         if (countdownStatusView != null) {
             updateCountdownStatus("متوقف شد");
         }
+
         updateDisplay();
     }
 
     private void removeScheduledCallbacks() {
 
         if (cycleStartRunnable != null) {
-
             handler.removeCallbacks(cycleStartRunnable);
             cycleStartRunnable = null;
         }
 
         if (nextClickRunnable != null) {
-
             handler.removeCallbacks(nextClickRunnable);
             nextClickRunnable = null;
         }
 
         if (cycleFinishRunnable != null) {
-
             handler.removeCallbacks(cycleFinishRunnable);
             cycleFinishRunnable = null;
         }
@@ -2261,6 +2448,7 @@ public class FloatingService extends Service {
     private void updateDisplay() {
 
         updateCountdownDisplay();
+        updateLiveDashboard();
     }
 
     private int dp(float value) {
@@ -2275,6 +2463,7 @@ public class FloatingService extends Service {
     public void onDestroy() {
 
         stopLoop();
+        closeDashboard();
 
         if (displayRunnable != null) {
             handler.removeCallbacks(displayRunnable);
