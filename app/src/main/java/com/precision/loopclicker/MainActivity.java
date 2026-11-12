@@ -13,6 +13,7 @@ import android.provider.Settings;
 import android.provider.Settings.Secure;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.RadioButton;
 import android.widget.RadioGroup;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -36,20 +37,17 @@ public class MainActivity extends Activity {
 
     private static final ZoneId IRAN_ZONE = ZoneId.of("Asia/Tehran");
 
-    // تنظیمات مشترک مبنای ساعت بین صفحه اصلی و FloatingService
-    public static final String CLOCK_PREFS = "precision_loop_clock_settings";
-    public static final String CLOCK_SOURCE_KEY = "clock_source";
-    public static final String CLOCK_SOURCE_PHONE = "phone";
-    public static final String CLOCK_SOURCE_INTERNET = "internet";
-
-    // کلید انتقال مبنای ساعت به سرویس شناور
-    public static final String EXTRA_CLOCK_SOURCE = "clock_source";
-
     private static final String[] NTP_SERVERS = {
             "time.google.com",
             "time.cloudflare.com",
             "pool.ntp.org"
     };
+
+    private static final String PREF_NAME = "precision_loop_settings";
+    private static final String PREF_CLOCK_SOURCE = "clock_source";
+
+    private static final String CLOCK_PHONE = "phone";
+    private static final String CLOCK_INTERNET = "internet";
 
     private static final long NTP_EPOCH_OFFSET = 2208988800L;
     private static final int NTP_PORT = 123;
@@ -102,6 +100,9 @@ public class MainActivity extends Activity {
     private Button clearReportsButton;
     private Button shutdownButton;
 
+    private SharedPreferences preferences;
+
+    // زمان مرجع اینترنتی در لحظه دریافت پاسخ NTP
     private volatile long trustedEpochAtSync = 0;
     private volatile long elapsedAtSync = 0;
 
@@ -140,8 +141,15 @@ public class MainActivity extends Activity {
 
         setContentView(R.layout.activity_main);
 
+        preferences = getSharedPreferences(
+                PREF_NAME,
+                MODE_PRIVATE
+        );
+
         bindViews();
-        restoreClockSource();
+
+        restoreClockSourceSelection();
+
         setupButtons();
 
         refreshReports();
@@ -166,48 +174,87 @@ public class MainActivity extends Activity {
     // ذخیره و بازیابی مبنای ساعت
     // ---------------------------------------------------------
 
-    private SharedPreferences getClockPreferences() {
-        return getSharedPreferences(CLOCK_PREFS, MODE_PRIVATE);
+    private String getSavedClockSource() {
+
+        return preferences.getString(
+                PREF_CLOCK_SOURCE,
+                CLOCK_PHONE
+        );
     }
 
-    private String getSelectedClockSource() {
+    private void saveClockSource(String source) {
 
-        if (clockSourceGroup != null
-                && clockSourceGroup.getCheckedRadioButtonId()
-                == R.id.radioInternetClock) {
-
-            return CLOCK_SOURCE_INTERNET;
-        }
-
-        return CLOCK_SOURCE_PHONE;
-    }
-
-    private void saveClockSource() {
-
-        String source = getSelectedClockSource();
-
-        getClockPreferences()
-                .edit()
-                .putString(CLOCK_SOURCE_KEY, source)
+        preferences.edit()
+                .putString(PREF_CLOCK_SOURCE, source)
                 .apply();
     }
 
-    private void restoreClockSource() {
+    private void restoreClockSourceSelection() {
 
         if (clockSourceGroup == null) {
             return;
         }
 
-        String savedSource = getClockPreferences().getString(
-                CLOCK_SOURCE_KEY,
-                CLOCK_SOURCE_PHONE
-        );
+        String source = getSavedClockSource();
 
-        if (CLOCK_SOURCE_INTERNET.equals(savedSource)) {
-            clockSourceGroup.check(R.id.radioInternetClock);
-        } else {
-            clockSourceGroup.check(R.id.radioPhoneClock);
+        boolean useInternetClock =
+                CLOCK_INTERNET.equals(source);
+
+        setClockSourceSelection(useInternetClock);
+    }
+
+    private void setClockSourceSelection(boolean useInternetClock) {
+
+        if (clockSourceGroup == null) {
+            return;
         }
+
+        if (useInternetClock) {
+
+            clockSourceGroup.check(R.id.radioInternetClock);
+
+        } else {
+
+            int phoneRadioId = findPhoneClockRadioId();
+
+            if (phoneRadioId != -1) {
+                clockSourceGroup.check(phoneRadioId);
+            }
+        }
+
+        saveClockSource(
+                useInternetClock ? CLOCK_INTERNET : CLOCK_PHONE
+        );
+    }
+
+    private int findPhoneClockRadioId() {
+
+        if (clockSourceGroup == null) {
+            return -1;
+        }
+
+        for (int i = 0; i < clockSourceGroup.getChildCount(); i++) {
+
+            android.view.View child =
+                    clockSourceGroup.getChildAt(i);
+
+            if (child instanceof RadioButton) {
+
+                RadioButton radioButton = (RadioButton) child;
+
+                if (radioButton.getId() != R.id.radioInternetClock) {
+                    return radioButton.getId();
+                }
+            }
+        }
+
+        return -1;
+    }
+
+    private boolean isInternetClockSelected() {
+
+        return clockSourceGroup.getCheckedRadioButtonId()
+                == R.id.radioInternetClock;
     }
 
     // ---------------------------------------------------------
@@ -244,6 +291,10 @@ public class MainActivity extends Activity {
         int floatingMillis =
                 intent.getIntExtra("floating_start_millis", 0);
 
+        String floatingClockSource =
+                intent.getStringExtra("clock_source");
+
+        // جلوگیری از اجرای مجدد فرمان
         intent.setAction(null);
 
         if (startButton == null
@@ -260,6 +311,16 @@ public class MainActivity extends Activity {
             ).show();
 
             return;
+        }
+
+        // هماهنگ کردن مبنای ساعت با پنل شناور
+        if (CLOCK_INTERNET.equals(floatingClockSource)) {
+
+            setClockSourceSelection(true);
+
+        } else if (CLOCK_PHONE.equals(floatingClockSource)) {
+
+            setClockSourceSelection(false);
         }
 
         if (floatingTimeConfigured) {
@@ -373,9 +434,18 @@ public class MainActivity extends Activity {
 
         shutdownButton.setOnClickListener(v -> shutdownApplication());
 
-        // هر تغییری در انتخاب ساعت بلافاصله ذخیره می‌شود.
         clockSourceGroup.setOnCheckedChangeListener(
-                (group, checkedId) -> saveClockSource()
+                (group, checkedId) -> {
+
+                    if (checkedId == R.id.radioInternetClock) {
+
+                        saveClockSource(CLOCK_INTERNET);
+
+                    } else if (checkedId != -1) {
+
+                        saveClockSource(CLOCK_PHONE);
+                    }
+                }
         );
     }
 
@@ -461,7 +531,7 @@ public class MainActivity extends Activity {
     }
 
     // ---------------------------------------------------------
-    // همگام‌سازی NTP
+    // همگام‌سازی NTP با محاسبه offset استاندارد
     // ---------------------------------------------------------
 
     private void syncInternetTime() {
@@ -562,6 +632,7 @@ public class MainActivity extends Activity {
 
             byte[] request = new byte[NTP_PACKET_SIZE];
 
+            // LI=0, VN=4, Mode=3 (client)
             request[0] = 0x23;
 
             long sendWallEpochMs = System.currentTimeMillis();
@@ -773,13 +844,13 @@ public class MainActivity extends Activity {
             return;
         }
 
-        String clockSource = getSelectedClockSource();
+        boolean useInternetClock = isInternetClockSelected();
 
-        boolean useInternetClock =
-                CLOCK_SOURCE_INTERNET.equals(clockSource);
+        String selectedClockSource = useInternetClock
+                ? CLOCK_INTERNET
+                : CLOCK_PHONE;
 
-        // انتخاب ساعت همیشه ذخیره می‌شود.
-        saveClockSource();
+        saveClockSource(selectedClockSource);
 
         if (useInternetClock && !timeSynced) {
 
@@ -921,6 +992,8 @@ public class MainActivity extends Activity {
 
             serviceIntent.setAction(FloatingService.ACTION_START);
 
+            // زمان دیواری فقط برای نمایش و گزارش است.
+            // زمان‌بندی واقعی سرویس با start_delay_ms انجام می‌شود.
             serviceIntent.putExtra(
                     "start_time_epoch_ms",
                     System.currentTimeMillis() + startDelay
@@ -961,16 +1034,10 @@ public class MainActivity extends Activity {
                     intervalDuration
             );
 
-            // انتقال صریح مبنای ساعت به FloatingService
+            // انتقال مبنای ساعت به FloatingService
             serviceIntent.putExtra(
-                    EXTRA_CLOCK_SOURCE,
-                    clockSource
-            );
-
-            // نسخه بولی برای سازگاری آسان‌تر با منطق سرویس
-            serviceIntent.putExtra(
-                    "schedule_uses_internet_clock",
-                    useInternetClock
+                    "clock_source",
+                    selectedClockSource
             );
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
