@@ -7,7 +7,10 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.ServiceInfo;
 import android.graphics.Color;
 import android.graphics.Paint;
@@ -75,6 +78,12 @@ public class FloatingService extends Service {
 
     private static final int TITLE_COLOR =
             Color.rgb(255, 152, 0);
+
+    private static final String PREF_NAME =
+            "precision_loop_settings";
+
+    private static final String PREF_CLOCK_SOURCE =
+            "clock_source";
 
     private static volatile FloatingService instance;
 
@@ -160,6 +169,117 @@ public class FloatingService extends Service {
     private String clockSource = CLOCK_PHONE;
 
     // ---------------------------------------------------------
+    // Dynamic clock source receiver
+    // ---------------------------------------------------------
+
+    private static final String ACTION_CLOCK_SOURCE_CHANGED =
+            "com.precision.loopclicker.ACTION_CLOCK_SOURCE_CHANGED";
+
+    private boolean clockSourceReceiverRegistered = false;
+
+    private final BroadcastReceiver clockSourceReceiver =
+            new BroadcastReceiver() {
+
+        @Override
+        public void onReceive(Context context, Intent intent) {
+
+            if (intent == null
+                    || !ACTION_CLOCK_SOURCE_CHANGED.equals(
+                            intent.getAction()
+                    )) {
+                return;
+            }
+
+            String newSource =
+                    intent.getStringExtra("clock_source");
+
+            if (!CLOCK_PHONE.equals(newSource)
+                    && !CLOCK_INTERNET.equals(newSource)) {
+                return;
+            }
+
+            // فقط منبع نمایش و انتخاب بعدی به‌روزرسانی می‌شود.
+            // زمان‌بندی چرخه‌ای که قبلاً شروع شده تغییر نمی‌کند.
+            clockSource = newSource;
+
+            updateCountdownDisplay();
+            updateLiveDashboard();
+        }
+    };
+
+    private void registerClockSourceReceiver() {
+
+        if (clockSourceReceiverRegistered) {
+            return;
+        }
+
+        IntentFilter filter = new IntentFilter(
+                ACTION_CLOCK_SOURCE_CHANGED
+        );
+
+        try {
+
+            if (Build.VERSION.SDK_INT >= 33) {
+
+                registerReceiver(
+                        clockSourceReceiver,
+                        filter,
+                        Context.RECEIVER_NOT_EXPORTED
+                );
+
+            } else {
+
+                registerReceiver(
+                        clockSourceReceiver,
+                        filter
+                );
+            }
+
+            clockSourceReceiverRegistered = true;
+
+        } catch (Exception e) {
+
+            clockSourceReceiverRegistered = false;
+        }
+    }
+
+    private void unregisterClockSourceReceiver() {
+
+        if (!clockSourceReceiverRegistered) {
+            return;
+        }
+
+        try {
+            unregisterReceiver(clockSourceReceiver);
+        } catch (Exception ignored) {
+        }
+
+        clockSourceReceiverRegistered = false;
+    }
+
+    private void loadSavedClockSource() {
+
+        try {
+
+            String savedSource = getSharedPreferences(
+                    PREF_NAME,
+                    MODE_PRIVATE
+            ).getString(
+                    PREF_CLOCK_SOURCE,
+                    CLOCK_PHONE
+            );
+
+            clockSource = CLOCK_INTERNET.equals(savedSource)
+                    ? CLOCK_INTERNET
+                    : CLOCK_PHONE;
+
+        } catch (Exception ignored) {
+
+            clockSource = CLOCK_PHONE;
+        }
+    }
+
+    // ---------------------------------------------------------
     // Floating start-time settings
     // ---------------------------------------------------------
 
@@ -210,6 +330,12 @@ public class FloatingService extends Service {
                 getSystemService(WINDOW_SERVICE);
 
         markerSize = dp(56);
+
+        // بازیابی انتخاب ساعت ذخیره‌شده
+        loadSavedClockSource();
+
+        // دریافت تغییرات انتخاب ساعت از داشبورد
+        registerClockSourceReceiver();
 
         createNotificationChannel();
         startForegroundCompat();
@@ -2468,6 +2594,8 @@ public class FloatingService extends Service {
         if (displayRunnable != null) {
             handler.removeCallbacks(displayRunnable);
         }
+
+        unregisterClockSourceReceiver();
 
         removeFloatingViews();
 
