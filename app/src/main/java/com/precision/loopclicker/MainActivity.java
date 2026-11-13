@@ -35,6 +35,15 @@ public class MainActivity extends Activity {
     private static final String PREF_NAME = "precision_loop_settings";
     private static final String PREF_CLOCK_SOURCE = "clock_source";
 
+    private static final String PREF_INTERNET_EPOCH =
+            "internet_epoch_at_sync_ms";
+
+    private static final String PREF_INTERNET_ELAPSED =
+            "internet_elapsed_at_sync_ms";
+
+    private static final String PREF_INTERNET_SAVED_WALL =
+            "internet_anchor_saved_wall_ms";
+
     private static final String CLOCK_PHONE = "phone";
     private static final String CLOCK_INTERNET = "internet";
 
@@ -186,6 +195,68 @@ public class MainActivity extends Activity {
                 .apply();
     }
 
+    private void saveInternetTimeAnchor(long epochMs, long elapsedMs) {
+
+        if (epochMs <= 0 || elapsedMs <= 0) {
+            return;
+        }
+
+        long savedWallTime = System.currentTimeMillis();
+
+        preferences.edit()
+                .putLong(PREF_INTERNET_EPOCH, epochMs)
+                .putLong(PREF_INTERNET_ELAPSED, elapsedMs)
+                .putLong(PREF_INTERNET_SAVED_WALL, savedWallTime)
+                .apply();
+    }
+
+    private boolean loadSavedInternetTimeAnchor() {
+
+        if (preferences == null) {
+            return false;
+        }
+
+        long epoch = preferences.getLong(
+                PREF_INTERNET_EPOCH,
+                0
+        );
+
+        long elapsed = preferences.getLong(
+                PREF_INTERNET_ELAPSED,
+                0
+        );
+
+        long savedWall = preferences.getLong(
+                PREF_INTERNET_SAVED_WALL,
+                0
+        );
+
+        if (epoch <= 0 || elapsed <= 0 || savedWall <= 0) {
+            return false;
+        }
+
+        long currentElapsed = SystemClock.elapsedRealtime();
+        long currentWall = System.currentTimeMillis();
+
+        if (currentElapsed < elapsed || currentWall < savedWall) {
+            return false;
+        }
+
+        long elapsedDifference = currentElapsed - elapsed;
+        long wallDifference = currentWall - savedWall;
+
+        // تشخیص احتمال راه‌اندازی مجدد دستگاه یا نامعتبر شدن
+        // مرجع monotonic ذخیره‌شده.
+        long differenceBetweenClocks =
+                Math.abs(wallDifference - elapsedDifference);
+
+        if (differenceBetweenClocks > 120000L) {
+            return false;
+        }
+
+        return true;
+    }
+
     private void restoreClockSourceSelection() {
 
         if (clockSourceGroup == null) {
@@ -265,6 +336,53 @@ public class MainActivity extends Activity {
         intent.setPackage(getPackageName());
 
         intent.putExtra("clock_source", source);
+
+        if (CLOCK_INTERNET.equals(source)) {
+
+            long epochAnchor = trustedEpochAtSync;
+            long elapsedAnchor = elapsedAtSync;
+
+            boolean anchorAvailable =
+                    timeSynced
+                            && epochAnchor > 0
+                            && elapsedAnchor > 0;
+
+            // اگر هنوز در حافظه مرجع نداریم، مرجع ذخیره‌شده
+            // را فقط در صورت معتبر بودن بازیابی می‌کنیم.
+            if (!anchorAvailable && loadSavedInternetTimeAnchor()) {
+
+                epochAnchor = preferences.getLong(
+                        PREF_INTERNET_EPOCH,
+                        0
+                );
+
+                elapsedAnchor = preferences.getLong(
+                        PREF_INTERNET_ELAPSED,
+                        0
+                );
+
+                anchorAvailable =
+                        epochAnchor > 0 && elapsedAnchor > 0;
+            }
+
+            intent.putExtra(
+                    "internet_anchor_available",
+                    anchorAvailable
+            );
+
+            if (anchorAvailable) {
+
+                intent.putExtra(
+                        "internet_epoch_at_sync_ms",
+                        epochAnchor
+                );
+
+                intent.putExtra(
+                        "internet_elapsed_at_sync_ms",
+                        elapsedAnchor
+                );
+            }
+        }
 
         sendBroadcast(intent);
     }
@@ -649,6 +767,22 @@ public class MainActivity extends Activity {
                             finalResult.receivedElapsedRealtimeMs;
 
                     timeSynced = true;
+
+                    // ذخیره مرجع جدید برای استفاده پنل شناور
+                    // و بازیابی در صورت بازسازی سرویس.
+                    saveInternetTimeAnchor(
+                            trustedEpochAtSync,
+                            elapsedAtSync
+                    );
+
+                    // اگر ساعت اینترنتی انتخاب شده باشد،
+                    // مرجع تازه فوراً به FloatingService می‌رسد.
+                    if (CLOCK_INTERNET.equals(getSavedClockSource())) {
+
+                        notifyFloatingClockSourceChanged(
+                                CLOCK_INTERNET
+                        );
+                    }
 
                 } else {
 
