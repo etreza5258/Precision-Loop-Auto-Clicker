@@ -1,4 +1,3 @@
-
 package com.precision.loopclicker;
 
 import android.app.Dialog;
@@ -85,6 +84,12 @@ public class FloatingService extends Service {
     private static final String PREF_CLOCK_SOURCE =
             "clock_source";
 
+    private static final String PREF_INTERNET_EPOCH =
+            "internet_epoch_at_sync_ms";
+
+    private static final String PREF_INTERNET_ELAPSED =
+            "internet_elapsed_at_sync_ms";
+
     private static volatile FloatingService instance;
 
     private final Handler handler =
@@ -153,6 +158,7 @@ public class FloatingService extends Service {
 
     private long clickCount;
     private long clickNumber;
+
     // شماره جایگاه کلیک بعدی در چرخه؛ هر جایگاه فقط یک‌بار بررسی می‌شود.
     private long nextClickIndex;
 
@@ -212,10 +218,62 @@ public class FloatingService extends Service {
             }
 
             /*
+             * اگر MainActivity مرجع جدید اینترنت را فرستاده باشد،
+             * همان مرجع را دریافت و ذخیره می‌کنیم.
+             *
+             * هر دو مقدار باید متعلق به یک لحظه همگام‌سازی باشند.
+             */
+            boolean hasInternetAnchor =
+                    intent.hasExtra("internet_epoch_at_sync_ms")
+                            && intent.hasExtra("internet_elapsed_at_sync_ms");
+
+            if (hasInternetAnchor) {
+
+                long newEpoch = intent.getLongExtra(
+                        "internet_epoch_at_sync_ms",
+                        0L
+                );
+
+                long newElapsed = intent.getLongExtra(
+                        "internet_elapsed_at_sync_ms",
+                        0L
+                );
+
+                long currentElapsed = SystemClock.elapsedRealtime();
+
+                boolean validAnchor =
+                        newEpoch > 0
+                                && newElapsed > 0
+                                && newElapsed <= currentElapsed;
+
+                if (validAnchor) {
+
+                    internetEpochAtSyncMs = newEpoch;
+                    internetElapsedAtSyncMs = newElapsed;
+                    internetTimeAnchorAvailable = true;
+
+                    getSharedPreferences(
+                            PREF_NAME,
+                            MODE_PRIVATE
+                    ).edit()
+                            .putLong(PREF_INTERNET_EPOCH, newEpoch)
+                            .putLong(PREF_INTERNET_ELAPSED, newElapsed)
+                            .apply();
+                }
+            }
+
+            /*
              * تغییر منبع فقط روی نمایش ساعت و انتخاب‌گر اثر دارد.
              * anchorElapsedMs و زمان‌بندی چرخه جاری تغییر نمی‌کنند.
              */
             clockSource = newSource;
+
+            getSharedPreferences(
+                    PREF_NAME,
+                    MODE_PRIVATE
+            ).edit()
+                    .putString(PREF_CLOCK_SOURCE, clockSource)
+                    .apply();
 
             updateCountdownDisplay();
             updateLiveDashboard();
@@ -272,14 +330,23 @@ public class FloatingService extends Service {
         clockSourceReceiverRegistered = false;
     }
 
+    /*
+     * منبع ساعت و مرجع اینترنتی ذخیره‌شده را بازیابی می‌کند.
+     *
+     * اگر مرجع اینترنتی معتبر باشد، زمان فعلی اینترنت از آن
+     * و elapsedRealtime محاسبه خواهد شد.
+     */
     private void loadSavedClockSource() {
 
         try {
 
-            String savedSource = getSharedPreferences(
-                    PREF_NAME,
-                    MODE_PRIVATE
-            ).getString(
+            android.content.SharedPreferences preferences =
+                    getSharedPreferences(
+                            PREF_NAME,
+                            MODE_PRIVATE
+                    );
+
+            String savedSource = preferences.getString(
                     PREF_CLOCK_SOURCE,
                     CLOCK_PHONE
             );
@@ -288,36 +355,66 @@ public class FloatingService extends Service {
                     ? CLOCK_INTERNET
                     : CLOCK_PHONE;
 
+            internetEpochAtSyncMs = preferences.getLong(
+                    PREF_INTERNET_EPOCH,
+                    0L
+            );
+
+            internetElapsedAtSyncMs = preferences.getLong(
+                    PREF_INTERNET_ELAPSED,
+                    0L
+            );
+
+            long currentElapsed = SystemClock.elapsedRealtime();
+
+            internetTimeAnchorAvailable =
+                    internetEpochAtSyncMs > 0
+                            && internetElapsedAtSyncMs > 0
+                            && internetElapsedAtSyncMs <= currentElapsed;
+
         } catch (Exception ignored) {
 
             clockSource = CLOCK_PHONE;
+
+            internetEpochAtSyncMs = 0L;
+            internetElapsedAtSyncMs = 0L;
+            internetTimeAnchorAvailable = false;
         }
     }
 
     /*
      * ساعت فعلی بر اساس منبع انتخاب‌شده.
      *
-     * در حالت اینترنتی، اگر مرجع اینترنتی موجود باشد،
-     * زمان با elapsedRealtime محاسبه می‌شود.
+     * در حالت اینترنتی، فقط از مرجع اینترنتی و elapsedRealtime
+     * استفاده می‌شود.
+     *
+     * اگر مرجع اینترنتی موجود نباشد، صفر برمی‌گرداند تا ساعت گوشی
+     * به‌اشتباه به‌عنوان ساعت اینترنتی نمایش داده نشود.
      *
      * این تابع هیچ درخواست شبکه‌ای انجام نمی‌دهد.
      */
     private long getCurrentClockEpochMs() {
 
-        if (CLOCK_INTERNET.equals(clockSource)
-                && internetTimeAnchorAvailable) {
+        if (CLOCK_INTERNET.equals(clockSource)) {
+
+            if (!internetTimeAnchorAvailable) {
+                return 0L;
+            }
 
             long elapsedNow = SystemClock.elapsedRealtime();
 
             long elapsedDifference =
                     elapsedNow - internetElapsedAtSyncMs;
 
-            if (elapsedDifference >= 0
-                    && internetEpochAtSyncMs
-                    <= Long.MAX_VALUE - elapsedDifference) {
+            if (elapsedDifference < 0
+                    || internetEpochAtSyncMs <= 0
+                    || internetEpochAtSyncMs
+                    > Long.MAX_VALUE - elapsedDifference) {
 
-                return internetEpochAtSyncMs + elapsedDifference;
+                return 0L;
             }
+
+            return internetEpochAtSyncMs + elapsedDifference;
         }
 
         return System.currentTimeMillis();
@@ -709,13 +806,38 @@ public class FloatingService extends Service {
             return;
         }
 
+        /*
+         * در حالت اینترنتی، بدون مرجع معتبر نباید زمان گوشی
+         * به‌عنوان ساعت اینترنتی وارد انتخاب‌گر شود.
+         */
+        if (CLOCK_INTERNET.equals(clockSource)
+                && !internetTimeAnchorAvailable) {
+
+            updateCountdownStatus(
+                    "مرجع ساعت اینترنتی هنوز دریافت نشده است"
+            );
+
+            return;
+        }
+
         if (!floatingTimeConfigured) {
+
+            long currentEpoch = getCurrentClockEpochMs();
+
+            if (currentEpoch <= 0) {
+
+                updateCountdownStatus(
+                        "زمان مرجع ساعت هنوز در دسترس نیست"
+                );
+
+                return;
+            }
 
             Calendar calendar = Calendar.getInstance(
                     TimeZone.getTimeZone("Asia/Tehran")
             );
 
-            calendar.setTimeInMillis(getCurrentClockEpochMs());
+            calendar.setTimeInMillis(currentEpoch);
 
             floatingStartHour = calendar.get(Calendar.HOUR_OF_DAY);
             floatingStartMinute = calendar.get(Calendar.MINUTE);
@@ -1169,9 +1291,18 @@ public class FloatingService extends Service {
 
             long currentEpoch = getCurrentClockEpochMs();
 
-            String currentTime = format.format(
-                    new Date(currentEpoch)
-            );
+            String currentTime;
+
+            if (currentEpoch > 0) {
+
+                currentTime = format.format(
+                        new Date(currentEpoch)
+                );
+
+            } else {
+
+                currentTime = "در انتظار همگام‌سازی";
+            }
 
             String sourceLabel;
 
@@ -1475,7 +1606,8 @@ public class FloatingService extends Service {
             if (!currentCycleStatsFinalized) {
                 currentSuccess = service.getSuccessfulClicks();
                 currentFailure = service.getFailedClicks();
-                currentDispatched = service.getSuccessfulClicks() + service.getFailedClicks();
+                currentDispatched = service.getSuccessfulClicks()
+                        + service.getFailedClicks();
             }
         }
 
@@ -1862,10 +1994,13 @@ public class FloatingService extends Service {
 
         /*
          * دریافت مرجع ساعت اینترنتی از MainActivity.
-         * این دو مقدار باید متعلق به یک لحظه همگام‌سازی باشند.
+         *
+         * اگر مرجع جدید همراه فرمان شروع ارسال شده باشد،
+         * جایگزین مرجع قبلی می‌شود.
+         *
+         * اگر extras مرجع ارسال نشده باشند، مرجع معتبر بازیابی‌شده
+         * از SharedPreferences حفظ می‌شود.
          */
-        internetTimeAnchorAvailable = false;
-
         if (config.hasExtra("internet_epoch_at_sync_ms")
                 && config.hasExtra("internet_elapsed_at_sync_ms")) {
 
@@ -1879,9 +2014,29 @@ public class FloatingService extends Service {
                     0L
             );
 
+            long currentElapsed = SystemClock.elapsedRealtime();
+
             internetTimeAnchorAvailable =
                     internetEpochAtSyncMs > 0
-                            && internetElapsedAtSyncMs > 0;
+                            && internetElapsedAtSyncMs > 0
+                            && internetElapsedAtSyncMs <= currentElapsed;
+
+            if (internetTimeAnchorAvailable) {
+
+                getSharedPreferences(
+                        PREF_NAME,
+                        MODE_PRIVATE
+                ).edit()
+                        .putLong(
+                                PREF_INTERNET_EPOCH,
+                                internetEpochAtSyncMs
+                        )
+                        .putLong(
+                                PREF_INTERNET_ELAPSED,
+                                internetElapsedAtSyncMs
+                        )
+                        .apply();
+            }
         }
 
         cycleDurationMs =
@@ -1980,12 +2135,13 @@ public class FloatingService extends Service {
 
             selectedStartEpochMs = config.getLongExtra(
                     "start_time_epoch_ms",
-                    nowWall + delayMs
+                    nowWall > 0 ? nowWall + delayMs : 0L
             );
 
         } else {
 
-            selectedStartEpochMs = nowWall + delayMs;
+            selectedStartEpochMs =
+                    nowWall > 0 ? nowWall + delayMs : 0L;
         }
 
         accessibility = AutoClickService.getInstance();
@@ -2199,9 +2355,13 @@ public class FloatingService extends Service {
         long cycleOffset = cycleStartElapsedMs - anchorElapsedMs;
 
         if (cycleOffset >= 0
+                && selectedStartEpochMs > 0
                 && selectedStartEpochMs <= Long.MAX_VALUE - cycleOffset) {
+
             cycleStartWallMs = selectedStartEpochMs + cycleOffset;
+
         } else {
+
             cycleStartWallMs = System.currentTimeMillis()
                     - Math.max(0L,
                     SystemClock.elapsedRealtime() - cycleStartElapsedMs);
@@ -2318,6 +2478,7 @@ public class FloatingService extends Service {
 
         final long cycleStartNanos =
                 elapsedMsToNanos(cycleStartElapsedMs);
+
         final long cycleDeadlineNanos =
                 elapsedMsToNanos(cycleDeadlineElapsedMs);
 
@@ -2327,6 +2488,7 @@ public class FloatingService extends Service {
             markDeadlineSkipped(
                     "زمان چرخه پیش از رسیدن به کلیک بعدی پایان یافت"
             );
+
             waitForCycleEnd(generation);
             return;
         }
@@ -2344,6 +2506,7 @@ public class FloatingService extends Service {
                     scheduleNextClick(generation);
                 }
             };
+
             handler.postDelayed(nextClickRunnable, GESTURE_RETRY_MS);
             return;
         }
@@ -2363,14 +2526,17 @@ public class FloatingService extends Service {
         long intervalNanos = effectiveIntervalMs * 1_000_000L;
 
         if (nextClickIndex > 0
-                && intervalNanos > (Long.MAX_VALUE - cycleStartNanos) / nextClickIndex) {
+                && intervalNanos
+                > (Long.MAX_VALUE - cycleStartNanos) / nextClickIndex) {
+
             cycleOtherFailure = true;
             addLiveError("محاسبه زمان هدف کلیک از محدوده مجاز خارج شد");
             waitForCycleEnd(generation);
             return;
         }
 
-        long targetNanos = cycleStartNanos + nextClickIndex * intervalNanos;
+        long targetNanos =
+                cycleStartNanos + nextClickIndex * intervalNanos;
 
         // پایان چرخه exclusive است؛ کلیک باید کاملاً قبل از deadline تمام شود.
         if (targetNanos >= cycleDeadlineNanos
@@ -2380,6 +2546,7 @@ public class FloatingService extends Service {
             markDeadlineSkipped(
                     "جایگاه‌های باقی‌مانده کلیک در محدوده زمانی چرخه جا نمی‌شوند"
             );
+
             waitForCycleEnd(generation);
             return;
         }
@@ -2388,6 +2555,7 @@ public class FloatingService extends Service {
 
         nextClickRunnable = () -> {
             nextClickRunnable = null;
+
             if (isCurrentRun(generation) && cycleActive) {
                 dispatchNextClick(generation, targetForThisClick);
             }
@@ -2407,14 +2575,19 @@ public class FloatingService extends Service {
             return;
         }
 
-        long cycleStartNanos = elapsedMsToNanos(cycleStartElapsedMs);
-        long cycleDeadlineNanos = elapsedMsToNanos(cycleDeadlineElapsedMs);
+        long cycleStartNanos =
+                elapsedMsToNanos(cycleStartElapsedMs);
+
+        long cycleDeadlineNanos =
+                elapsedMsToNanos(cycleDeadlineElapsedMs);
+
         long nowNanos = SystemClock.elapsedRealtimeNanos();
 
         if (nowNanos >= cycleDeadlineNanos) {
             markDeadlineSkipped(
                     "زمان چرخه پیش از ارسال کلیک هدف پایان یافت"
             );
+
             waitForCycleEnd(generation);
             return;
         }
@@ -2424,9 +2597,13 @@ public class FloatingService extends Service {
         if (accessibility == null) {
             nextClickRunnable = () -> {
                 if (isCurrentRun(generation) && cycleActive) {
-                    dispatchNextClick(generation, targetElapsedRealtimeNanos);
+                    dispatchNextClick(
+                            generation,
+                            targetElapsedRealtimeNanos
+                    );
                 }
             };
+
             handler.postDelayed(nextClickRunnable, SERVICE_RETRY_MS);
             return;
         }
@@ -2434,9 +2611,13 @@ public class FloatingService extends Service {
         if (accessibility.isGestureInProgress()) {
             nextClickRunnable = () -> {
                 if (isCurrentRun(generation) && cycleActive) {
-                    dispatchNextClick(generation, targetElapsedRealtimeNanos);
+                    dispatchNextClick(
+                            generation,
+                            targetElapsedRealtimeNanos
+                    );
                 }
             };
+
             handler.postDelayed(nextClickRunnable, GESTURE_RETRY_MS);
             return;
         }
@@ -2445,8 +2626,12 @@ public class FloatingService extends Service {
 
         final AutoClickService clickService = accessibility;
         final long callbackGeneration = generation;
-        final long successesBefore = clickService.getSuccessfulClicks();
-        final long failuresBefore = clickService.getFailedClicks();
+
+        final long successesBefore =
+                clickService.getSuccessfulClicks();
+
+        final long failuresBefore =
+                clickService.getFailedClicks();
 
         boolean accepted = clickService.performClickAtTarget(
                 targetElapsedRealtimeNanos,
@@ -2462,18 +2647,26 @@ public class FloatingService extends Service {
                     // مصرف می‌شود؛ کلیک ازدست‌رفته هرگز به چرخه بعد منتقل نمی‌شود.
                     nextClickIndex++;
 
-                    long successesAfter = clickService.getSuccessfulClicks();
-                    long failuresAfter = clickService.getFailedClicks();
+                    long successesAfter =
+                            clickService.getSuccessfulClicks();
+
+                    long failuresAfter =
+                            clickService.getFailedClicks();
 
                     if (clickService.getLastBatchSkippedByDeadline() > 0) {
+
                         markDeadlineSkipped(clickService.getLastError());
 
                         // فقط همین جایگاه از دست می‌رود؛ جایگاه بعدی با زمان هدف
                         // اصلی خودش بررسی می‌شود و به زمان فعلی منتقل نمی‌شود.
                         if (nextClickIndex < clickCount
-                                && SystemClock.elapsedRealtimeNanos() < cycleDeadlineNanos) {
+                                && SystemClock.elapsedRealtimeNanos()
+                                < cycleDeadlineNanos) {
+
                             scheduleNextClick(callbackGeneration);
+
                         } else {
+
                             waitForCycleEnd(callbackGeneration);
                         }
 
@@ -2486,6 +2679,7 @@ public class FloatingService extends Service {
 
                         cycleOtherFailure = true;
                         addLiveError(clickService.getLastError());
+
                         waitForCycleEnd(callbackGeneration);
                         updateDisplay();
                         return;
@@ -2496,20 +2690,26 @@ public class FloatingService extends Service {
 
                         // درخواست پذیرفته شده اما Gesture نتیجه موفق ثبت نکرده است.
                         cycleOtherFailure = true;
+
                         addLiveError(
                                 clickService.getLastError() == null
                                         ? "نتیجه کلیک از سرویس دریافت نشد"
                                         : clickService.getLastError()
                         );
+
                         waitForCycleEnd(callbackGeneration);
                         updateDisplay();
                         return;
                     }
 
-                    if (SystemClock.elapsedRealtimeNanos() >= cycleDeadlineNanos
+                    if (SystemClock.elapsedRealtimeNanos()
+                            >= cycleDeadlineNanos
                             || nextClickIndex >= clickCount) {
+
                         waitForCycleEnd(callbackGeneration);
+
                     } else {
+
                         scheduleNextClick(callbackGeneration);
                     }
 
@@ -2518,11 +2718,17 @@ public class FloatingService extends Service {
         );
 
         if (accepted) {
+
             clickNumber++;
-            lastClickDispatchElapsedMs = SystemClock.elapsedRealtime();
+            lastClickDispatchElapsedMs =
+                    SystemClock.elapsedRealtime();
+
             lastBatchCount = 1;
+
             updateDisplay();
+
         } else {
+
             // callback سرویس در شاخه رد درخواست نیز فراخوانی می‌شود؛
             // برای جلوگیری از دوباره‌شماری، اینجا شمارنده را جلو نمی‌بریم.
             updateDisplay();
@@ -2570,7 +2776,8 @@ public class FloatingService extends Service {
 
         accessibility = getReadyAccessibility();
 
-        if (accessibility != null && accessibility.isGestureInProgress()) {
+        if (accessibility != null
+                && accessibility.isGestureInProgress()) {
 
             cycleFinishRunnable = () -> {
 
@@ -2579,7 +2786,11 @@ public class FloatingService extends Service {
                 }
             };
 
-            handler.postDelayed(cycleFinishRunnable, GESTURE_RETRY_MS);
+            handler.postDelayed(
+                    cycleFinishRunnable,
+                    GESTURE_RETRY_MS
+            );
+
             return;
         }
 
@@ -2604,7 +2815,9 @@ public class FloatingService extends Service {
 
         if (accessibility == null) {
             cycleOtherFailure = true;
-            addLiveError("سرویس دسترسی‌پذیری هنگام پایان چرخه متصل نبود");
+            addLiveError(
+                    "سرویس دسترسی‌پذیری هنگام پایان چرخه متصل نبود"
+            );
         }
 
         if (!currentCycleStatsFinalized) {
@@ -2671,7 +2884,9 @@ public class FloatingService extends Service {
             stopLoop();
 
             updateCountdownStatus("محدودیت زمان‌بندی چرخه");
-            addLiveError("زمان‌بندی چرخه بعدی از محدوده مجاز خارج شد");
+            addLiveError(
+                    "زمان‌بندی چرخه بعدی از محدوده مجاز خارج شد"
+            );
 
             return;
         }
@@ -2697,7 +2912,9 @@ public class FloatingService extends Service {
 
         removeScheduledCallbacks();
 
-        AutoClickService activeService = AutoClickService.getInstance();
+        AutoClickService activeService =
+                AutoClickService.getInstance();
+
         if (activeService != null) {
             activeService.cancelPendingScheduledClick();
         }
