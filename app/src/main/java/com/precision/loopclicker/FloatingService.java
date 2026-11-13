@@ -70,13 +70,6 @@ public class FloatingService extends Service {
     private static final long DISPLAY_UPDATE_MS = 50;
     private static final long DASHBOARD_UPDATE_MS = 250;
 
-    /*
-     * حاشیه امن برای شروع بسته کلیک قبل از پایان چرخه.
-     * این مقدار برای جلوگیری از ارسال بسته‌ای است که احتمالاً
-     * در انتهای چرخه فرصت اجرای امن ندارد.
-     */
-    private static final long DEADLINE_GUARD_MS = 50L;
-
     private static final int PANEL_BACKGROUND =
             Color.rgb(20, 30, 42);
 
@@ -144,6 +137,8 @@ public class FloatingService extends Service {
 
     private long clickCount;
     private long clickNumber;
+    // شماره جایگاه کلیک بعدی در چرخه؛ هر جایگاه فقط یک‌بار بررسی می‌شود.
+    private long nextClickIndex;
 
     private boolean cycleYellow;
     private boolean cycleIntervalViolation;
@@ -1418,7 +1413,7 @@ public class FloatingService extends Service {
             if (!currentCycleStatsFinalized) {
                 currentSuccess = service.getSuccessfulClicks();
                 currentFailure = service.getFailedClicks();
-                currentDispatched = service.getDispatchedClicks();
+                currentDispatched = service.getSuccessfulClicks() + service.getFailedClicks();
             }
         }
 
@@ -1879,6 +1874,7 @@ public class FloatingService extends Service {
 
         cycleIndex = 0;
         clickNumber = 0;
+        nextClickIndex = 0;
         lastBatchCount = 0;
         lastClickDispatchElapsedMs = 0;
 
@@ -2056,6 +2052,7 @@ public class FloatingService extends Service {
         cycleActive = true;
 
         clickNumber = 0;
+        nextClickIndex = 0;
         lastBatchCount = 0;
         lastClickDispatchElapsedMs = 0;
 
@@ -2156,32 +2153,20 @@ public class FloatingService extends Service {
     }
 
     /*
-     * زمان مجاز کلیک بعدی را از خود AutoClickService می‌گیریم.
-     * این کار مانع می‌شود Callback با تأخیر باعث ارسال زودهنگام
-     * بسته بعدی و رد شدن آن به علت interval شود.
+     * تبدیل زمان elapsedRealtime برحسب میلی‌ثانیه به نانوثانیه با
+     * جلوگیری از overflow. هر دو زمان از یک ساعت monotonic می‌آیند.
      */
-    private long getNextAllowedElapsedMs(
-            AutoClickService service
-    ) {
+    private long elapsedMsToNanos(long elapsedMs) {
 
-        if (service == null) {
-            return SystemClock.elapsedRealtime();
+        if (elapsedMs <= 0) {
+            return 0L;
         }
 
-        return service.getNextAllowedClickElapsedRealtimeMs();
-    }
-
-    /*
-     * آخرین زمانی که شروع یک بسته هنوز از حاشیه امن چرخه
-     * عبور نکرده است.
-     */
-    private long getLatestSafeStartElapsedMs() {
-
-        if (cycleDeadlineElapsedMs == Long.MAX_VALUE) {
+        if (elapsedMs > Long.MAX_VALUE / 1_000_000L) {
             return Long.MAX_VALUE;
         }
 
-        return cycleDeadlineElapsedMs - DEADLINE_GUARD_MS;
+        return elapsedMs * 1_000_000L;
     }
 
     private void markDeadlineSkipped(String message) {
@@ -2194,22 +2179,32 @@ public class FloatingService extends Service {
         }
     }
 
+    /**
+     * برای هر جایگاه کلیک، timestamp مطلق مستقل می‌سازیم:
+     * cycleStart + index * interval.
+     * AutoClickService خودش درخواست را با lead تطبیقی پیش‌ارسال می‌کند.
+     */
     private void scheduleNextClick(long generation) {
 
         if (!isCurrentRun(generation) || !cycleActive) {
             return;
         }
 
-        if (clickNumber >= clickCount) {
+        if (nextClickIndex >= clickCount) {
             waitForCycleEnd(generation);
             return;
         }
 
-        long now = SystemClock.elapsedRealtime();
+        final long cycleStartNanos =
+                elapsedMsToNanos(cycleStartElapsedMs);
+        final long cycleDeadlineNanos =
+                elapsedMsToNanos(cycleDeadlineElapsedMs);
 
-        if (now >= cycleDeadlineElapsedMs) {
+        if (cycleDeadlineNanos <= cycleStartNanos
+                || SystemClock.elapsedRealtimeNanos() >= cycleDeadlineNanos) {
+
             markDeadlineSkipped(
-                    "زمان چرخه پیش از ارسال کلیک بعدی پایان یافت"
+                    "زمان چرخه پیش از رسیدن به کلیک بعدی پایان یافت"
             );
             waitForCycleEnd(generation);
             return;
@@ -2222,88 +2217,83 @@ public class FloatingService extends Service {
             return;
         }
 
-        long effectiveInterval = Math.max(
+        if (accessibility.isGestureInProgress()) {
+            nextClickRunnable = () -> {
+                if (isCurrentRun(generation) && cycleActive) {
+                    scheduleNextClick(generation);
+                }
+            };
+            handler.postDelayed(nextClickRunnable, GESTURE_RETRY_MS);
+            return;
+        }
+
+        long effectiveIntervalMs = Math.max(
                 1L,
                 accessibility.getEffectiveClickIntervalMs(clickIntervalMs)
         );
 
-        long targetElapsed;
-
-        if (clickNumber == 0 || lastBatchCount <= 0) {
-
-            // هدف کلیک اول، نقطه صفر چرخه است؛ اگر دیر رسیده‌ایم فوراً dispatch می‌کنیم.
-            targetElapsed = cycleStartElapsedMs;
-
-        } else {
-
-            if (lastBatchCount > Long.MAX_VALUE / effectiveInterval) {
-                cycleOtherFailure = true;
-                addLiveError("محاسبه فاصله کلیک‌ها از محدوده مجاز خارج شد");
-                waitForCycleEnd(generation);
-                return;
-            }
-
-            long offset = lastBatchCount * effectiveInterval;
-
-            if (lastClickDispatchElapsedMs > Long.MAX_VALUE - offset) {
-                cycleOtherFailure = true;
-                addLiveError("محاسبه زمان کلیک بعدی نامعتبر شد");
-                waitForCycleEnd(generation);
-                return;
-            }
-
-            targetElapsed = lastClickDispatchElapsedMs + offset;
-        }
-
-        /*
-         * زمان مجاز اعلام‌شده از AutoClickService نیز بررسی می‌شود.
-         * بنابراین اگر Callback دیر برسد، هدف زمان‌بندی در گذشته
-         * باقی نمی‌ماند و بسته زودهنگام رد نمی‌شود.
-         */
-        long nextAllowedElapsed = getNextAllowedElapsedMs(accessibility);
-
-        targetElapsed = Math.max(targetElapsed, nextAllowedElapsed);
-
-        long latestSafeStart = getLatestSafeStartElapsedMs();
-
-        /*
-         * اگر زمان مجاز کلیک بعدی از آخرین زمان امن شروع بسته
-         * عبور کرده باشد، دیگر هیچ کلیکی برای این چرخه ارسال نمی‌شود.
-         */
-        if (targetElapsed > latestSafeStart) {
-
-            markDeadlineSkipped(
-                    "برای ارسال کلیک بعدی فرصت امن کافی تا پایان چرخه باقی نمانده است"
-            );
-
+        if (effectiveIntervalMs > Long.MAX_VALUE / 1_000_000L) {
+            cycleOtherFailure = true;
+            addLiveError("فاصله کلیک از محدوده زمان‌بندی مجاز خارج شد");
             waitForCycleEnd(generation);
             return;
         }
 
-        nextClickRunnable = () -> {
+        long intervalNanos = effectiveIntervalMs * 1_000_000L;
 
+        if (nextClickIndex > 0
+                && intervalNanos > (Long.MAX_VALUE - cycleStartNanos) / nextClickIndex) {
+            cycleOtherFailure = true;
+            addLiveError("محاسبه زمان هدف کلیک از محدوده مجاز خارج شد");
+            waitForCycleEnd(generation);
+            return;
+        }
+
+        long targetNanos = cycleStartNanos + nextClickIndex * intervalNanos;
+
+        // پایان چرخه exclusive است؛ کلیک باید کاملاً قبل از deadline تمام شود.
+        if (targetNanos >= cycleDeadlineNanos
+                || targetNanos > Long.MAX_VALUE - 1_000_000L
+                || targetNanos + 1_000_000L > cycleDeadlineNanos) {
+
+            markDeadlineSkipped(
+                    "جایگاه‌های باقی‌مانده کلیک در محدوده زمانی چرخه جا نمی‌شوند"
+            );
+            waitForCycleEnd(generation);
+            return;
+        }
+
+        final long targetForThisClick = targetNanos;
+
+        nextClickRunnable = () -> {
+            nextClickRunnable = null;
             if (isCurrentRun(generation) && cycleActive) {
-                dispatchNextClick(generation);
+                dispatchNextClick(generation, targetForThisClick);
             }
         };
 
-        postAtElapsedTime(nextClickRunnable, targetElapsed);
+        // این فراخوانی زودتر از زمان هدف مجاز است؛ سرویس خودش زمان پیش‌ارسال
+        // را با lead تطبیقی تعیین می‌کند و کلیک اول را قبل از شروع چرخه نمی‌فرستد.
+        nextClickRunnable.run();
     }
 
-    private void dispatchNextClick(long generation) {
+    private void dispatchNextClick(
+            long generation,
+            long targetElapsedRealtimeNanos
+    ) {
 
         if (!isCurrentRun(generation) || !cycleActive) {
             return;
         }
 
-        long now = SystemClock.elapsedRealtime();
+        long cycleStartNanos = elapsedMsToNanos(cycleStartElapsedMs);
+        long cycleDeadlineNanos = elapsedMsToNanos(cycleDeadlineElapsedMs);
+        long nowNanos = SystemClock.elapsedRealtimeNanos();
 
-        if (now >= cycleDeadlineElapsedMs) {
-
+        if (nowNanos >= cycleDeadlineNanos) {
             markDeadlineSkipped(
-                    "زمان چرخه پیش از ارسال بسته کلیک پایان یافت"
+                    "زمان چرخه پیش از ارسال کلیک هدف پایان یافت"
             );
-
             waitForCycleEnd(generation);
             return;
         }
@@ -2311,29 +2301,21 @@ public class FloatingService extends Service {
         accessibility = getReadyAccessibility();
 
         if (accessibility == null) {
-
-            updateCountdownStatus("اتصال سرویس کلیک قطع شده؛ تلاش مجدد");
-
             nextClickRunnable = () -> {
-
                 if (isCurrentRun(generation) && cycleActive) {
-                    dispatchNextClick(generation);
+                    dispatchNextClick(generation, targetElapsedRealtimeNanos);
                 }
             };
-
             handler.postDelayed(nextClickRunnable, SERVICE_RETRY_MS);
             return;
         }
 
         if (accessibility.isGestureInProgress()) {
-
             nextClickRunnable = () -> {
-
                 if (isCurrentRun(generation) && cycleActive) {
-                    dispatchNextClick(generation);
+                    dispatchNextClick(generation, targetElapsedRealtimeNanos);
                 }
             };
-
             handler.postDelayed(nextClickRunnable, GESTURE_RETRY_MS);
             return;
         }
@@ -2341,191 +2323,72 @@ public class FloatingService extends Service {
         accessibility.setTarget(targetX, targetY);
 
         final AutoClickService clickService = accessibility;
-
-        /*
-         * پیش از ارسال بسته، زمان مجاز دوباره بررسی می‌شود.
-         */
-        long allowedElapsed = getNextAllowedElapsedMs(clickService);
-        long currentElapsed = SystemClock.elapsedRealtime();
-
-        if (currentElapsed < allowedElapsed) {
-
-            long latestSafeStart = getLatestSafeStartElapsedMs();
-
-            if (allowedElapsed > latestSafeStart) {
-
-                markDeadlineSkipped(
-                        "زمان مجاز کلیک بعدی از محدوده امن چرخه عبور کرد"
-                );
-
-                waitForCycleEnd(generation);
-                return;
-            }
-
-            nextClickRunnable = () -> {
-
-                if (isCurrentRun(generation) && cycleActive) {
-                    dispatchNextClick(generation);
-                }
-            };
-
-            postAtElapsedTime(nextClickRunnable, allowedElapsed);
-            return;
-        }
-
-        /*
-         * حتی اگر زمان مجاز رسیده باشد، شروع بسته باید
-         * داخل محدوده امن چرخه قرار داشته باشد.
-         */
-        long latestSafeStart = getLatestSafeStartElapsedMs();
-
-        if (currentElapsed > latestSafeStart) {
-
-            markDeadlineSkipped(
-                    "شروع بسته کلیک به محدوده پایانی چرخه رسید"
-            );
-
-            waitForCycleEnd(generation);
-            return;
-        }
-
-        long remainingClicks = clickCount - clickNumber;
-
-        int maxBatchCount =
-                clickService.getMaxBatchClickCount(clickIntervalMs);
-
-        if (maxBatchCount <= 0) {
-
-            cycleOtherFailure = true;
-            addLiveError("تعداد مجاز کلیک در بسته صفر شد");
-
-            waitForCycleEnd(generation);
-            return;
-        }
-
-        int requestedBatchCount = (int) Math.min(
-                remainingClicks,
-                (long) maxBatchCount
-        );
-
-        if (requestedBatchCount <= 0) {
-            waitForCycleEnd(generation);
-            return;
-        }
-
         final long callbackGeneration = generation;
+        final long successesBefore = clickService.getSuccessfulClicks();
+        final long failuresBefore = clickService.getFailedClicks();
 
-        long dispatchElapsed = SystemClock.elapsedRealtime();
-
-        if (dispatchElapsed > latestSafeStart) {
-
-            markDeadlineSkipped(
-                    "مهلت امن ارسال بسته پیش از Dispatch به پایان رسید"
-            );
-
-            waitForCycleEnd(generation);
-            return;
-        }
-
-        lastClickDispatchElapsedMs = dispatchElapsed;
-        lastBatchCount = 0;
-
-        int acceptedCount = clickService.performClickBatch(
-                requestedBatchCount,
-                clickIntervalMs,
-                cycleDeadlineElapsedMs,
+        boolean accepted = clickService.performClickAtTarget(
+                targetElapsedRealtimeNanos,
+                cycleStartNanos,
+                cycleDeadlineNanos,
                 () -> handler.post(() -> {
 
                     if (!isCurrentRun(callbackGeneration) || !cycleActive) {
                         return;
                     }
 
-                    /*
-                     * رد شدن موقت به علت interval به‌تنهایی
-                     * خطای چرخه نیست. در صورت وجود فرصت امن،
-                     * بسته در اولین زمان مجاز دوباره تلاش می‌شود.
-                     */
-                    if (clickService.wasLastBatchRejectedForInterval()) {
+                    // callback هر جایگاه، چه موفق و چه ازدست‌رفته، فقط یک‌بار
+                    // مصرف می‌شود؛ کلیک ازدست‌رفته هرگز به چرخه بعد منتقل نمی‌شود.
+                    nextClickIndex++;
 
-                        long retryElapsed =
-                                getNextAllowedElapsedMs(clickService);
-
-                        long callbackNow =
-                                SystemClock.elapsedRealtime();
-
-                        if (retryElapsed <= callbackNow) {
-                            retryElapsed = callbackNow + 2L;
-                        }
-
-                        long retryLatestSafeStart =
-                                getLatestSafeStartElapsedMs();
-
-                        if (retryElapsed <= retryLatestSafeStart) {
-
-                            nextClickRunnable = () -> {
-
-                                if (isCurrentRun(callbackGeneration)
-                                        && cycleActive) {
-
-                                    dispatchNextClick(callbackGeneration);
-                                }
-                            };
-
-                            postAtElapsedTime(
-                                    nextClickRunnable,
-                                    retryElapsed
-                            );
-
-                            updateDisplay();
-                            return;
-
-                        } else {
-
-                            cycleYellow = true;
-                            cycleDeadlineSkipped = true;
-
-                            addLiveError(
-                                    "پس از رد موقت بسته، فرصت امن برای تلاش مجدد باقی نماند"
-                            );
-
-                            waitForCycleEnd(callbackGeneration);
-                            updateDisplay();
-                            return;
-                        }
-                    }
+                    long successesAfter = clickService.getSuccessfulClicks();
+                    long failuresAfter = clickService.getFailedClicks();
 
                     if (clickService.getLastBatchSkippedByDeadline() > 0) {
+                        markDeadlineSkipped(clickService.getLastError());
 
-                        cycleYellow = true;
-                        cycleDeadlineSkipped = true;
+                        // فقط همین جایگاه از دست می‌رود؛ جایگاه بعدی با زمان هدف
+                        // اصلی خودش بررسی می‌شود و به زمان فعلی منتقل نمی‌شود.
+                        if (nextClickIndex < clickCount
+                                && SystemClock.elapsedRealtimeNanos() < cycleDeadlineNanos) {
+                            scheduleNextClick(callbackGeneration);
+                        } else {
+                            waitForCycleEnd(callbackGeneration);
+                        }
 
-                        addLiveError(
-                                "بخشی از کلیک‌ها به علت پایان مهلت ارسال نشد"
-                        );
+                        updateDisplay();
+                        return;
                     }
 
-                    if (clickService.getFailedClicks() > 0) {
+                    if (successesAfter <= successesBefore
+                            && failuresAfter > failuresBefore) {
 
                         cycleOtherFailure = true;
-
-                        String error = clickService.getLastError();
-
-                        addLiveError(
-                                error == null || error.trim().isEmpty()
-                                        ? "خطا در اجرای ژست لمس"
-                                        : error
-                        );
+                        addLiveError(clickService.getLastError());
+                        waitForCycleEnd(callbackGeneration);
+                        updateDisplay();
+                        return;
                     }
 
-                    if (SystemClock.elapsedRealtime() >= cycleDeadlineElapsedMs
-                            || clickNumber >= clickCount
-                            || cycleDeadlineSkipped
-                            || cycleOtherFailure) {
+                    if (successesAfter <= successesBefore
+                            && failuresAfter <= failuresBefore) {
 
+                        // درخواست پذیرفته شده اما Gesture نتیجه موفق ثبت نکرده است.
+                        cycleOtherFailure = true;
+                        addLiveError(
+                                clickService.getLastError() == null
+                                        ? "نتیجه کلیک از سرویس دریافت نشد"
+                                        : clickService.getLastError()
+                        );
                         waitForCycleEnd(callbackGeneration);
+                        updateDisplay();
+                        return;
+                    }
 
+                    if (SystemClock.elapsedRealtimeNanos() >= cycleDeadlineNanos
+                            || nextClickIndex >= clickCount) {
+                        waitForCycleEnd(callbackGeneration);
                     } else {
-
                         scheduleNextClick(callbackGeneration);
                     }
 
@@ -2533,78 +2396,16 @@ public class FloatingService extends Service {
                 })
         );
 
-        if (acceptedCount <= 0) {
-
-            /*
-             * در صورت رد شدن به علت interval، Callback بالا
-             * خودش زمان تلاش مجدد را برنامه‌ریزی می‌کند.
-             * در این شاخه نباید چرخه را متوقف یا زرد کنیم.
-             */
-            if (clickService.wasLastBatchRejectedForInterval()) {
-
-                updateDisplay();
-                return;
-
-            } else if (clickService.getLastBatchSkippedByDeadline() > 0) {
-
-                cycleYellow = true;
-                cycleDeadlineSkipped = true;
-
-                addLiveError(
-                        "مهلت چرخه پیش از ارسال بسته کلیک پایان یافت"
-                );
-
-            } else {
-
-                cycleOtherFailure = true;
-
-                String error = clickService.getLastError();
-
-                addLiveError(
-                        error == null || error.trim().isEmpty()
-                                ? "ارسال بسته کلیک ناموفق بود"
-                                : error
-                );
-            }
-
-            lastBatchCount = 0;
-
-            waitForCycleEnd(generation);
+        if (accepted) {
+            clickNumber++;
+            lastClickDispatchElapsedMs = SystemClock.elapsedRealtime();
+            lastBatchCount = 1;
             updateDisplay();
-            return;
+        } else {
+            // callback سرویس در شاخه رد درخواست نیز فراخوانی می‌شود؛
+            // برای جلوگیری از دوباره‌شماری، اینجا شمارنده را جلو نمی‌بریم.
+            updateDisplay();
         }
-
-        /*
-         * زمان واقعی Dispatch را از AutoClickService می‌خوانیم.
-         * زمان ثبت‌شده قبل از فراخوانی فقط مقدار موقت بود.
-         */
-        long actualDispatchElapsed =
-                clickService.getLastDispatchElapsedRealtimeMs();
-
-        if (actualDispatchElapsed > 0) {
-            lastClickDispatchElapsedMs = actualDispatchElapsed;
-        }
-
-        lastBatchCount = acceptedCount;
-        clickNumber += acceptedCount;
-
-        if (acceptedCount < requestedBatchCount) {
-
-            cycleYellow = true;
-            cycleDeadlineSkipped = true;
-
-            addLiveError(
-                    "همه کلیک‌های درخواستی در مهلت چرخه ارسال نشدند"
-            );
-        }
-
-        if (clickService.getLastBatchSkippedByDeadline() > 0) {
-
-            cycleYellow = true;
-            cycleDeadlineSkipped = true;
-        }
-
-        updateDisplay();
     }
 
     private void waitForCycleEnd(long generation) {
@@ -2661,6 +2462,10 @@ public class FloatingService extends Service {
             return;
         }
 
+        if (accessibility != null) {
+            accessibility.cancelPendingScheduledClick();
+        }
+
         cycleActive = false;
 
         long successes = accessibility == null
@@ -2673,7 +2478,8 @@ public class FloatingService extends Service {
 
         long dispatched = accessibility == null
                 ? 0L
-                : accessibility.getDispatchedClicks();
+                : accessibility.getSuccessfulClicks()
+                        + accessibility.getFailedClicks();
 
         if (accessibility == null) {
             cycleOtherFailure = true;
@@ -2769,6 +2575,11 @@ public class FloatingService extends Service {
         runGeneration++;
 
         removeScheduledCallbacks();
+
+        AutoClickService activeService = AutoClickService.getInstance();
+        if (activeService != null) {
+            activeService.cancelPendingScheduledClick();
+        }
 
         setMarkerTouchable(true);
 
