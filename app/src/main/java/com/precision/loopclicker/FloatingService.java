@@ -1,3 +1,4 @@
+
 package com.precision.loopclicker;
 
 import android.app.Dialog;
@@ -2037,6 +2038,28 @@ public class FloatingService extends Service {
                         )
                         .apply();
             }
+        }
+
+        /*
+         * محافظ جدید:
+         * اگر ساعت اینترنتی انتخاب شده اما هیچ مرجع معتبر اینترنتی
+         * در دسترس نیست، اجرای چرخه مجاز نیست.
+         *
+         * این شرط فقط از شروع با ساعت نامعتبر جلوگیری می‌کند؛
+         * هیچ محدودیت ۵۰ میلی‌ثانیه‌ای روی کلیک‌ها اعمال نمی‌کند.
+         */
+        if (CLOCK_INTERNET.equals(clockSource)
+                && !internetTimeAnchorAvailable) {
+
+            running = false;
+            cycleActive = false;
+
+            updateCountdownStatus(
+                    "مرجع ساعت اینترنتی هنوز دریافت نشده است"
+            );
+
+            updateDisplay();
+            return;
         }
 
         cycleDurationMs =
