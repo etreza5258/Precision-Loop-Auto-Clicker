@@ -89,14 +89,14 @@ public class MainActivity extends Activity {
 
     private SharedPreferences preferences;
 
-    // زمان مرجع اینترنتی در لحظه دریافت پاسخ NTP
+    // مرجع ساعت اینترنتی در لحظه دریافت پاسخ NTP
     private volatile long trustedEpochAtSync = 0;
     private volatile long elapsedAtSync = 0;
 
     private volatile boolean timeSynced = false;
     private volatile boolean syncInProgress = false;
 
-    // اطلاعات کیفیت ساعت؛ صرفاً برای گزارش و نمایش هستند.
+    // اطلاعات کیفیت ساعت فقط برای گزارش و نمایش هستند.
     // این مقادیر هیچ نقشی در اجازه یا جلوگیری از کلیک ندارند.
     private volatile long syncUncertaintyMs = 0;
     private volatile long syncRoundTripMs = 0;
@@ -704,11 +704,8 @@ public class MainActivity extends Activity {
 
         saveClockSource(selectedClockSource);
 
-        // تنها شرط مربوط به همگام‌سازی:
-        // باید حداقل یک زمان اینترنتی معتبر دریافت شده باشد.
-        //
-        // هیچ محدودیت ۵۰ میلی‌ثانیه‌ای برای شروع کلیک وجود ندارد.
-        // عدم‌قطعیت بالا فقط در بخش گزارش نمایش داده می‌شود.
+        // برای ساعت اینترنتی فقط دریافت حداقل یک زمان معتبر لازم است.
+        // عدم‌قطعیت بالاتر از ۵۰ میلی‌ثانیه مانع شروع کلیک نیست.
         if (useInternetClock && !timeSynced) {
 
             Toast.makeText(
@@ -795,9 +792,45 @@ public class MainActivity extends Activity {
                 return;
             }
 
-            long sourceNow = useInternetClock
-                    ? getTrustedNow()
-                    : System.currentTimeMillis();
+            /*
+             * ساخت زمان هدف بر اساس ساعت انتخاب‌شده.
+             *
+             * در حالت اینترنت:
+             * از جفت epoch و elapsed دریافت‌شده از NTP استفاده می‌کنیم.
+             *
+             * در حالت گوشی:
+             * یک جفت زمان دیواری و elapsed در همین لحظه می‌سازیم.
+             */
+
+            long sourceNow;
+            long anchorEpoch;
+            long anchorElapsed;
+            long scheduledStartEpoch;
+            long scheduledStartElapsed;
+
+            if (useInternetClock) {
+
+                if (!timeSynced
+                        || trustedEpochAtSync <= 0
+                        || elapsedAtSync <= 0) {
+
+                    showError("مرجع ساعت اینترنتی معتبر نیست.");
+                    return;
+                }
+
+                anchorEpoch = trustedEpochAtSync;
+                anchorElapsed = elapsedAtSync;
+
+                sourceNow = getTrustedNow();
+
+            } else {
+
+                // نمونه‌برداری نزدیک از دو ساعت برای ساخت مرجع مشترک
+                anchorElapsed = SystemClock.elapsedRealtime();
+                anchorEpoch = System.currentTimeMillis();
+
+                sourceNow = anchorEpoch;
+            }
 
             if (sourceNow <= 0) {
                 showError("زمان مبنا معتبر نیست.");
@@ -816,15 +849,13 @@ public class MainActivity extends Activity {
                             .withSecond(second)
                             .withNano(millis * 1000000);
 
-            long scheduledStartEpoch =
+            scheduledStartEpoch =
                     requestedIranTime
                             .atZone(IRAN_ZONE)
                             .toInstant()
                             .toEpochMilli();
 
-            long startDelay = scheduledStartEpoch - sourceNow;
-
-            if (startDelay <= 0) {
+            if (scheduledStartEpoch <= sourceNow) {
 
                 showError(
                         "زمان شروع باید از زمان فعلی "
@@ -834,14 +865,46 @@ public class MainActivity extends Activity {
                 return;
             }
 
+            /*
+             * تبدیل زمان مطلق انتخاب‌شده به زمان monotonic.
+             *
+             * این تبدیل فقط یک بار در MainActivity انجام می‌شود.
+             * سرویس باید همان start_elapsed_realtime_ms را استفاده کند
+             * و زمان هدف را از روی تأخیر نسبی دوباره نسازد.
+             */
+
+            long epochDifference =
+                    Math.subtractExact(
+                            scheduledStartEpoch,
+                            anchorEpoch
+                    );
+
+            scheduledStartElapsed =
+                    Math.addExact(
+                            anchorElapsed,
+                            epochDifference
+                    );
+
             long nowElapsed = SystemClock.elapsedRealtime();
 
-            if (startDelay > Long.MAX_VALUE - nowElapsed) {
-                showError("فاصله زمانی شروع بیش از حد بزرگ است.");
+            long startDelay =
+                    Math.subtractExact(
+                            scheduledStartElapsed,
+                            nowElapsed
+                    );
+
+            // اگر هنگام محاسبه یا آماده‌سازی فرمان، زمان هدف گذشته باشد،
+            // آن را به زمان فعلی منتقل نمی‌کنیم.
+            if (startDelay <= 0) {
+
+                showError(
+                        "زمان هدف هنگام آماده‌سازی فرمان سپری شده است. "
+                                + "لطفاً زمان شروع کمی جلوتر انتخاب کن."
+                );
+
                 return;
             }
 
-            scheduledStartElapsed = nowElapsed + startDelay;
             countdownActive = true;
 
             Intent serviceIntent =
@@ -849,17 +912,38 @@ public class MainActivity extends Activity {
 
             serviceIntent.setAction(FloatingService.ACTION_START);
 
-            // زمان دیواری فقط برای نمایش و گزارش است.
-            // زمان‌بندی واقعی سرویس با start_delay_ms انجام می‌شود.
+            // زمان مطلق هدف بر اساس ساعت انتخاب‌شده؛
+            // برای نمایش و گزارش در سرویس.
             serviceIntent.putExtra(
                     "start_time_epoch_ms",
-                    System.currentTimeMillis() + startDelay
+                    scheduledStartEpoch
             );
 
+            // زمان مطلق monotonic؛ مرجع اصلی اجرای زمان شروع.
+            serviceIntent.putExtra(
+                    "start_elapsed_realtime_ms",
+                    scheduledStartElapsed
+            );
+
+            // تأخیر باقی‌مانده برای سازگاری با نسخه‌های قبلی سرویس.
             serviceIntent.putExtra(
                     "start_delay_ms",
                     startDelay
             );
+
+            // ارسال جفت مرجع ساعت اینترنتی برای پنل شناور.
+            if (useInternetClock) {
+
+                serviceIntent.putExtra(
+                        "internet_epoch_at_sync_ms",
+                        trustedEpochAtSync
+                );
+
+                serviceIntent.putExtra(
+                        "internet_elapsed_at_sync_ms",
+                        elapsedAtSync
+                );
+            }
 
             serviceIntent.putExtra(
                     "cycle_duration_ms",
