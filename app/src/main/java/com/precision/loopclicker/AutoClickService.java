@@ -815,6 +815,11 @@ public class AutoClickService extends AccessibilityService {
             return true;
         }
 
+        // نتیجه هر جایگاه مستقل است؛ نتیجه کلیک قبلی نباید به بعدی نشت کند.
+        lastBatchSkippedByDeadline = 0;
+        lastBatchRejectedForInterval = false;
+        lastBatchRejectedClickCount = 0;
+
         if (!serviceReady) {
             lastError = "سرویس دسترسی‌پذیری آماده نیست";
             if (completion != null) completion.run();
@@ -1055,7 +1060,7 @@ public class AutoClickService extends AccessibilityService {
         lastGestureLatencyNanos = latency;
         measuredGestures++;
 
-        if (activeIsScheduledSingleClick) {
+        if (activeIsScheduledSingleClick && success) {
             updateAdaptiveTimingEstimate(latency);
         }
 
