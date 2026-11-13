@@ -122,6 +122,22 @@ public class FloatingService extends Service {
     private long anchorElapsedMs;
     private long selectedStartEpochMs;
 
+    /*
+     * مرجع ساعت اینترنتی:
+     *
+     * internetEpochAtSyncMs:
+     * زمان Epoch اینترنت در لحظه همگام‌سازی
+     *
+     * internetElapsedAtSyncMs:
+     * زمان elapsedRealtime در همان لحظه
+     *
+     * ساعت فعلی اینترنت از اختلاف elapsedRealtime محاسبه می‌شود.
+     * در نتیجه تغییر ساعت گوشی روی آن اثر نمی‌گذارد.
+     */
+    private long internetEpochAtSyncMs;
+    private long internetElapsedAtSyncMs;
+    private boolean internetTimeAnchorAvailable;
+
     private long cycleDurationMs;
     private long pauseDurationMs;
     private long clickIntervalMs;
@@ -195,6 +211,10 @@ public class FloatingService extends Service {
                 return;
             }
 
+            /*
+             * تغییر منبع فقط روی نمایش ساعت و انتخاب‌گر اثر دارد.
+             * anchorElapsedMs و زمان‌بندی چرخه جاری تغییر نمی‌کنند.
+             */
             clockSource = newSource;
 
             updateCountdownDisplay();
@@ -272,6 +292,35 @@ public class FloatingService extends Service {
 
             clockSource = CLOCK_PHONE;
         }
+    }
+
+    /*
+     * ساعت فعلی بر اساس منبع انتخاب‌شده.
+     *
+     * در حالت اینترنتی، اگر مرجع اینترنتی موجود باشد،
+     * زمان با elapsedRealtime محاسبه می‌شود.
+     *
+     * این تابع هیچ درخواست شبکه‌ای انجام نمی‌دهد.
+     */
+    private long getCurrentClockEpochMs() {
+
+        if (CLOCK_INTERNET.equals(clockSource)
+                && internetTimeAnchorAvailable) {
+
+            long elapsedNow = SystemClock.elapsedRealtime();
+
+            long elapsedDifference =
+                    elapsedNow - internetElapsedAtSyncMs;
+
+            if (elapsedDifference >= 0
+                    && internetEpochAtSyncMs
+                    <= Long.MAX_VALUE - elapsedDifference) {
+
+                return internetEpochAtSyncMs + elapsedDifference;
+            }
+        }
+
+        return System.currentTimeMillis();
     }
 
     private boolean floatingTimeConfigured;
@@ -665,6 +714,8 @@ public class FloatingService extends Service {
             Calendar calendar = Calendar.getInstance(
                     TimeZone.getTimeZone("Asia/Tehran")
             );
+
+            calendar.setTimeInMillis(getCurrentClockEpochMs());
 
             floatingStartHour = calendar.get(Calendar.HOUR_OF_DAY);
             floatingStartMinute = calendar.get(Calendar.MINUTE);
@@ -1116,13 +1167,24 @@ public class FloatingService extends Service {
 
         if (selectedTimeView != null) {
 
+            long currentEpoch = getCurrentClockEpochMs();
+
             String currentTime = format.format(
-                    new Date(System.currentTimeMillis())
+                    new Date(currentEpoch)
             );
 
-            String sourceLabel = CLOCK_INTERNET.equals(clockSource)
-                    ? "اینترنت ایران"
-                    : "ساعت گوشی";
+            String sourceLabel;
+
+            if (CLOCK_INTERNET.equals(clockSource)) {
+
+                sourceLabel = internetTimeAnchorAvailable
+                        ? "اینترنت ایران"
+                        : "اینترنت ایران (مرجع در دسترس نیست)";
+
+            } else {
+
+                sourceLabel = "ساعت گوشی";
+            }
 
             String displayText = sourceLabel + ": " + currentTime;
 
@@ -1798,6 +1860,30 @@ public class FloatingService extends Service {
             clockSource = CLOCK_PHONE;
         }
 
+        /*
+         * دریافت مرجع ساعت اینترنتی از MainActivity.
+         * این دو مقدار باید متعلق به یک لحظه همگام‌سازی باشند.
+         */
+        internetTimeAnchorAvailable = false;
+
+        if (config.hasExtra("internet_epoch_at_sync_ms")
+                && config.hasExtra("internet_elapsed_at_sync_ms")) {
+
+            internetEpochAtSyncMs = config.getLongExtra(
+                    "internet_epoch_at_sync_ms",
+                    0L
+            );
+
+            internetElapsedAtSyncMs = config.getLongExtra(
+                    "internet_elapsed_at_sync_ms",
+                    0L
+            );
+
+            internetTimeAnchorAvailable =
+                    internetEpochAtSyncMs > 0
+                            && internetElapsedAtSyncMs > 0;
+        }
+
         cycleDurationMs =
                 config.getLongExtra("cycle_duration_ms", 1000);
 
@@ -1823,28 +1909,72 @@ public class FloatingService extends Service {
             return;
         }
 
+        long nowElapsed = SystemClock.elapsedRealtime();
         long delayMs;
 
-        if (config.hasExtra("start_delay_ms")) {
+        /*
+         * مسیر جدید:
+         * زمان شروع مطلق monotonic مستقیماً از MainActivity دریافت می‌شود.
+         * در این حالت دیگر زمان هدف را از روی start_delay_ms بازسازی نمی‌کنیم.
+         */
+        if (config.hasExtra("start_elapsed_realtime_ms")) {
 
-            delayMs = config.getLongExtra("start_delay_ms", -1);
+            anchorElapsedMs = config.getLongExtra(
+                    "start_elapsed_realtime_ms",
+                    -1L
+            );
+
+            if (anchorElapsedMs < 0) {
+                updateCountdownStatus("زمان monotonic شروع معتبر نیست");
+                return;
+            }
+
+            if (anchorElapsedMs < nowElapsed) {
+                updateCountdownStatus(
+                        "زمان هدف هنگام دریافت فرمان گذشته است؛ زمان هدف تغییر نکرد"
+                );
+                return;
+            }
+
+            delayMs = anchorElapsedMs - nowElapsed;
 
         } else {
 
-            long startTime = config.getLongExtra(
-                    "start_time_epoch_ms",
-                    System.currentTimeMillis()
-            );
+            /*
+             * سازگاری با نسخه قبلی:
+             * اگر extra جدید موجود نباشد، روش قبلی استفاده می‌شود.
+             */
+            if (config.hasExtra("start_delay_ms")) {
 
-            delayMs = startTime - System.currentTimeMillis();
+                delayMs = config.getLongExtra(
+                        "start_delay_ms",
+                        -1L
+                );
+
+            } else {
+
+                long startTime = config.getLongExtra(
+                        "start_time_epoch_ms",
+                        System.currentTimeMillis()
+                );
+
+                delayMs = startTime - System.currentTimeMillis();
+            }
+
+            if (delayMs < 0) {
+                updateCountdownStatus("زمان شروع گذشته است");
+                return;
+            }
+
+            if (delayMs > Long.MAX_VALUE - nowElapsed) {
+                updateCountdownStatus("زمان شروع بیش از حد بزرگ است");
+                return;
+            }
+
+            anchorElapsedMs = nowElapsed + delayMs;
         }
 
-        if (delayMs < 0) {
-            updateCountdownStatus("زمان شروع گذشته است");
-            return;
-        }
-
-        long nowWall = System.currentTimeMillis();
+        long nowWall = getCurrentClockEpochMs();
 
         if (config.hasExtra("start_time_epoch_ms")) {
 
@@ -1857,15 +1987,6 @@ public class FloatingService extends Service {
 
             selectedStartEpochMs = nowWall + delayMs;
         }
-
-        long nowElapsed = SystemClock.elapsedRealtime();
-
-        if (delayMs > Long.MAX_VALUE - nowElapsed) {
-            updateCountdownStatus("زمان شروع بیش از حد بزرگ است");
-            return;
-        }
-
-        anchorElapsedMs = nowElapsed + delayMs;
 
         accessibility = AutoClickService.getInstance();
 
