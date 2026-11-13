@@ -2490,32 +2490,46 @@ public class FloatingService extends Service {
      */
     private void scheduleNextClick(long generation) {
 
-        if (!isCurrentRun(generation) || !cycleActive) {
-            return;
-        }
+    if (!isCurrentRun(generation) || !cycleActive) {
+        return;
+    }
 
-        if (nextClickIndex >= clickCount) {
-            waitForCycleEnd(generation);
-            return;
-        }
+    if (cycleFinishRunnable != null) {
+        handler.removeCallbacks(cycleFinishRunnable);
+        cycleFinishRunnable = null;
+    }
 
-        final long cycleStartNanos =
-                elapsedMsToNanos(cycleStartElapsedMs);
+    accessibility = getReadyAccessibility();
 
-        final long cycleDeadlineNanos =
-                elapsedMsToNanos(cycleDeadlineElapsedMs);
+    if (accessibility == null) {
+        waitForAccessibility(generation);
+        return;
+    }
 
-        if (cycleDeadlineNanos <= cycleStartNanos
-                || SystemClock.elapsedRealtimeNanos() >= cycleDeadlineNanos) {
+    if (accessibility.isGestureInProgress()) {
+        nextClickRunnable = () -> {
+            nextClickRunnable = null;
 
-            markDeadlineSkipped(
-                    "زمان چرخه پیش از رسیدن به کلیک بعدی پایان یافت"
-            );
+            if (isCurrentRun(generation) && cycleActive) {
+                scheduleNextClick(generation);
+            }
+        };
 
-            waitForCycleEnd(generation);
-            return;
-        }
+        handler.postDelayed(nextClickRunnable, GESTURE_RETRY_MS);
+        return;
+    }
 
+    /*
+     * تمام کلیک‌های چرخه در یک Gesture ارسال می‌شوند.
+     * فاصله بین Strokeها از همان clickIntervalMs گرفته می‌شود.
+     * دیگر برای ارسال کلیک بعدی منتظر callback کلیک قبلی نمی‌مانیم.
+     */
+
+    dispatchNextClick(
+            generation,
+            elapsedMsToNanos(cycleStartElapsedMs)
+    );
+}
         accessibility = getReadyAccessibility();
 
         if (accessibility == null) {
