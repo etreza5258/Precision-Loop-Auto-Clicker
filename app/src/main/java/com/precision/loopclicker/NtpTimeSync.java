@@ -7,12 +7,10 @@ import java.io.IOException;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
-import java.net.SocketTimeoutException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
-import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -228,25 +226,28 @@ public final class NtpTimeSync {
         // LI=0, VN=4, Mode=3
         request[0] = 0x23;
 
-        long t1Wall = System.currentTimeMillis();
-        long t1Nanos = SystemClock.elapsedRealtimeNanos();
-
-        writeTimestamp(request, 40, t1Wall);
-
-        byte[] clientTransmit = new byte[8];
-
-        System.arraycopy(
-                request,
-                40,
-                clientTransmit,
-                0,
-                8
-        );
-
         try (DatagramSocket socket = new DatagramSocket()) {
 
             socket.setSoTimeout(TIMEOUT_MS);
+
+            // اتصال سوکت قبل از شروع اندازه‌گیری زمان
             socket.connect(address, NTP_PORT);
+
+            // ثبت زمان دقیق کلاینت درست پیش از ارسال
+            long t1Wall = System.currentTimeMillis();
+            long t1Nanos = SystemClock.elapsedRealtimeNanos();
+
+            writeTimestamp(request, 40, t1Wall);
+
+            byte[] clientTransmit = new byte[8];
+
+            System.arraycopy(
+                    request,
+                    40,
+                    clientTransmit,
+                    0,
+                    8
+            );
 
             DatagramPacket outgoing = new DatagramPacket(
                     request,
@@ -264,6 +265,7 @@ public final class NtpTimeSync {
 
             socket.receive(incoming);
 
+            // ثبت زمان دریافت بلافاصله پس از دریافت پاسخ
             long t4Nanos = SystemClock.elapsedRealtimeNanos();
 
             if (incoming.getLength() < PACKET_SIZE) {
