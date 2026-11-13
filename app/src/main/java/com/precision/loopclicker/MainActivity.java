@@ -1,3 +1,4 @@
+
 package com.precision.loopclicker;
 
 import android.app.Activity;
@@ -17,15 +18,10 @@ import android.widget.RadioGroup;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import java.io.IOException;
-import java.net.DatagramPacket;
-import java.net.DatagramSocket;
-import java.net.InetAddress;
 import java.text.SimpleDateFormat;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
-import java.util.Arrays;
 import java.util.Date;
 import java.util.Locale;
 import java.util.TimeZone;
@@ -36,26 +32,14 @@ public class MainActivity extends Activity {
 
     private static final ZoneId IRAN_ZONE = ZoneId.of("Asia/Tehran");
 
-    private static final String[] NTP_SERVERS = {
-            "time.google.com",
-            "time.cloudflare.com",
-            "pool.ntp.org"
-    };
-
     private static final String PREF_NAME = "precision_loop_settings";
     private static final String PREF_CLOCK_SOURCE = "clock_source";
 
     private static final String CLOCK_PHONE = "phone";
     private static final String CLOCK_INTERNET = "internet";
 
-    // اطلاع‌رسانی تغییر مبنای ساعت به FloatingService
     private static final String ACTION_CLOCK_SOURCE_CHANGED =
             "com.precision.loopclicker.ACTION_CLOCK_SOURCE_CHANGED";
-
-    private static final long NTP_EPOCH_OFFSET = 2208988800L;
-    private static final int NTP_PORT = 123;
-    private static final int NTP_TIMEOUT_MS = 1800;
-    private static final int NTP_PACKET_SIZE = 48;
 
     private final android.os.Handler handler =
             new android.os.Handler(android.os.Looper.getMainLooper());
@@ -112,7 +96,17 @@ public class MainActivity extends Activity {
     private volatile boolean timeSynced = false;
     private volatile boolean syncInProgress = false;
 
+    // اطلاعات کیفیت ساعت؛ صرفاً برای گزارش و نمایش هستند.
+    // این مقادیر هیچ نقشی در اجازه یا جلوگیری از کلیک ندارند.
     private volatile long syncUncertaintyMs = 0;
+    private volatile long syncRoundTripMs = 0;
+    private volatile long syncSpreadMs = 0;
+    private volatile int syncServerCount = 0;
+    private volatile int syncSampleCount = 0;
+    private volatile String syncServerName = "";
+    private volatile boolean syncCrossChecked = false;
+    private volatile boolean syncWithinTarget50ms = false;
+
     private volatile long lastSyncElapsed = 0;
 
     private boolean countdownActive = false;
@@ -268,7 +262,6 @@ public class MainActivity extends Activity {
 
         Intent intent = new Intent(ACTION_CLOCK_SOURCE_CHANGED);
 
-        // فقط گیرنده‌های داخل همین برنامه
         intent.setPackage(getPackageName());
 
         intent.putExtra("clock_source", source);
@@ -508,10 +501,32 @@ public class MainActivity extends Activity {
                             + String.format(Locale.US, "%+d ms", difference)
             );
 
+            String qualityText;
+
+            if (syncWithinTarget50ms) {
+                qualityText = "کیفیت اندازه‌گیری: در محدوده ۵۰ ms";
+            } else {
+                qualityText = "کیفیت اندازه‌گیری: خارج از محدوده ۵۰ ms";
+            }
+
             syncStatus.setText(
-                    "همگام‌سازی موفق | عدم‌قطعیت تقریبی: ±"
+                    "همگام‌سازی موفق از "
+                            + syncServerName
+                            + "\nعدم‌قطعیت تخمینی: ±"
                             + syncUncertaintyMs
                             + " ms"
+                            + "\nرفت‌وبرگشت شبکه: "
+                            + syncRoundTripMs
+                            + " ms"
+                            + "\nاختلاف نمونه‌ها: "
+                            + syncSpreadMs
+                            + " ms"
+                            + "\nسرورهای مستقل: "
+                            + syncServerCount
+                            + " | نمونه‌ها: "
+                            + syncSampleCount
+                            + "\n"
+                            + qualityText
             );
 
         } else {
@@ -558,7 +573,7 @@ public class MainActivity extends Activity {
     }
 
     // ---------------------------------------------------------
-    // همگام‌سازی NTP با محاسبه offset استاندارد
+    // همگام‌سازی با موتور دقیق‌تر NTP
     // ---------------------------------------------------------
 
     private void syncInternetTime() {
@@ -572,27 +587,15 @@ public class MainActivity extends Activity {
 
         networkExecutor.execute(() -> {
 
-            NtpResult bestResult = null;
+            NtpTimeSync.Result result = null;
 
-            for (String server : NTP_SERVERS) {
-
-                try {
-
-                    NtpResult result = queryNtpServer(server);
-
-                    if (result != null
-                            && (bestResult == null
-                            || result.roundTripMs < bestResult.roundTripMs)) {
-
-                        bestResult = result;
-                    }
-
-                } catch (Exception ignored) {
-                    // تلاش با سرور بعدی
-                }
+            try {
+                result = NtpTimeSync.synchronize();
+            } catch (Exception ignored) {
+                // در صورت خطا، زمان معتبر قبلی حفظ می‌شود.
             }
 
-            final NtpResult finalResult = bestResult;
+            final NtpTimeSync.Result finalResult = result;
 
             runOnUiThread(() -> {
 
@@ -604,27 +607,45 @@ public class MainActivity extends Activity {
 
                 if (finalResult != null) {
 
-                    trustedEpochAtSync = finalResult.estimatedEpochMs;
-                    elapsedAtSync = finalResult.receivedElapsedMs;
+                    trustedEpochAtSync =
+                            finalResult.estimatedEpochAtReceiveMs;
 
-                    syncUncertaintyMs = Math.max(
-                            1,
-                            (finalResult.roundTripMs + 1) / 2
-                    );
+                    elapsedAtSync =
+                            finalResult.receivedElapsedRealtimeMs;
 
-                    lastSyncElapsed = finalResult.receivedElapsedMs;
+                    syncUncertaintyMs =
+                            finalResult.uncertaintyEstimateMs;
+
+                    syncRoundTripMs =
+                            finalResult.networkRoundTripMs;
+
+                    syncSpreadMs =
+                            finalResult.maxOffsetSpreadMs;
+
+                    syncServerCount =
+                            finalResult.independentServerCount;
+
+                    syncSampleCount =
+                            finalResult.sampleCount;
+
+                    syncServerName =
+                            finalResult.server;
+
+                    syncCrossChecked =
+                            finalResult.isCrossChecked;
+
+                    syncWithinTarget50ms =
+                            finalResult.withinTarget50ms;
+
+                    lastSyncElapsed =
+                            finalResult.receivedElapsedRealtimeMs;
+
                     timeSynced = true;
-
-                    syncStatus.setText(
-                            "همگام‌سازی موفق از "
-                                    + finalResult.server
-                                    + " | عدم‌قطعیت تقریبی: ±"
-                                    + syncUncertaintyMs
-                                    + " ms"
-                    );
 
                 } else {
 
+                    // اگر همگام‌سازی جدید ناموفق بود،
+                    // آخرین زمان معتبر قبلی را نگه می‌داریم.
                     if (!timeSynced) {
 
                         syncStatus.setText(
@@ -636,7 +657,7 @@ public class MainActivity extends Activity {
 
                         syncStatus.setText(
                                 "اتصال مجدد ناموفق؛ "
-                                        + "آخرین زمان دریافت‌شده استفاده می‌شود."
+                                        + "آخرین زمان معتبر استفاده می‌شود."
                         );
                     }
                 }
@@ -644,202 +665,6 @@ public class MainActivity extends Activity {
                 updateClocks();
             });
         });
-    }
-
-    private NtpResult queryNtpServer(String server)
-            throws IOException {
-
-        DatagramSocket socket = new DatagramSocket();
-
-        try {
-
-            socket.setSoTimeout(NTP_TIMEOUT_MS);
-
-            InetAddress address = InetAddress.getByName(server);
-
-            byte[] request = new byte[NTP_PACKET_SIZE];
-
-            // LI=0, VN=4, Mode=3 (client)
-            request[0] = 0x23;
-
-            long sendWallEpochMs = System.currentTimeMillis();
-            long sendElapsed = SystemClock.elapsedRealtime();
-
-            writeNtpTimestamp(request, 40, sendWallEpochMs);
-
-            byte[] clientTransmitTimestamp =
-                    Arrays.copyOfRange(request, 40, 48);
-
-            DatagramPacket requestPacket = new DatagramPacket(
-                    request,
-                    request.length,
-                    address,
-                    NTP_PORT
-            );
-
-            socket.send(requestPacket);
-
-            byte[] response = new byte[NTP_PACKET_SIZE];
-
-            DatagramPacket responsePacket = new DatagramPacket(
-                    response,
-                    response.length
-            );
-
-            socket.receive(responsePacket);
-
-            long receiveElapsed = SystemClock.elapsedRealtime();
-            long receiveWallEpochMs = System.currentTimeMillis();
-
-            if (responsePacket.getLength() < NTP_PACKET_SIZE) {
-                return null;
-            }
-
-            int leapIndicator = (response[0] >> 6) & 0x03;
-            int version = (response[0] >> 3) & 0x07;
-            int mode = response[0] & 0x07;
-            int stratum = response[1] & 0xFF;
-
-            if (leapIndicator == 3
-                    || (version != 3 && version != 4)
-                    || mode != 4
-                    || stratum < 1
-                    || stratum > 15) {
-
-                return null;
-            }
-
-            byte[] originateTimestamp =
-                    Arrays.copyOfRange(response, 24, 32);
-
-            if (!Arrays.equals(
-                    clientTransmitTimestamp,
-                    originateTimestamp
-            )) {
-                return null;
-            }
-
-            long serverReceiveEpochMs =
-                    readNtpTimestamp(response, 32);
-
-            long serverTransmitEpochMs =
-                    readNtpTimestamp(response, 40);
-
-            if (serverReceiveEpochMs <= 0
-                    || serverTransmitEpochMs <= 0
-                    || serverTransmitEpochMs < serverReceiveEpochMs) {
-
-                return null;
-            }
-
-            long t1 = sendWallEpochMs;
-            long t2 = serverReceiveEpochMs;
-            long t3 = serverTransmitEpochMs;
-            long t4 = receiveWallEpochMs;
-
-            double offset =
-                    ((double) (t2 - t1) + (double) (t3 - t4)) / 2.0;
-
-            long estimatedEpochAtReceive =
-                    t4 + Math.round(offset);
-
-            long elapsedRoundTrip = Math.max(
-                    0,
-                    receiveElapsed - sendElapsed
-            );
-
-            long serverProcessingMs = Math.max(
-                    0,
-                    t3 - t2
-            );
-
-            long networkRoundTrip = Math.max(
-                    0,
-                    elapsedRoundTrip - serverProcessingMs
-            );
-
-            if (estimatedEpochAtReceive < 1577836800000L
-                    || estimatedEpochAtReceive > 4102444800000L) {
-                return null;
-            }
-
-            return new NtpResult(
-                    server,
-                    estimatedEpochAtReceive,
-                    receiveElapsed,
-                    networkRoundTrip
-            );
-
-        } finally {
-            socket.close();
-        }
-    }
-
-    private void writeNtpTimestamp(
-            byte[] data,
-            int offset,
-            long unixEpochMillis
-    ) {
-
-        long seconds = unixEpochMillis / 1000L + NTP_EPOCH_OFFSET;
-        long millis = unixEpochMillis % 1000L;
-
-        long fraction = (millis << 32) / 1000L;
-
-        writeUnsignedInt(data, offset, seconds);
-        writeUnsignedInt(data, offset + 4, fraction);
-    }
-
-    private void writeUnsignedInt(
-            byte[] data,
-            int offset,
-            long value
-    ) {
-
-        data[offset] = (byte) (value >>> 24);
-        data[offset + 1] = (byte) (value >>> 16);
-        data[offset + 2] = (byte) (value >>> 8);
-        data[offset + 3] = (byte) value;
-    }
-
-    private long readNtpTimestamp(byte[] data, int offset) {
-
-        long seconds = readUnsignedInt(data, offset);
-        long fraction = readUnsignedInt(data, offset + 4);
-
-        long unixSeconds = seconds - NTP_EPOCH_OFFSET;
-        long fractionMillis = (fraction * 1000L) >>> 32;
-
-        return unixSeconds * 1000L + fractionMillis;
-    }
-
-    private long readUnsignedInt(byte[] data, int offset) {
-
-        return ((long) (data[offset] & 0xFF) << 24)
-                | ((long) (data[offset + 1] & 0xFF) << 16)
-                | ((long) (data[offset + 2] & 0xFF) << 8)
-                | ((long) (data[offset + 3] & 0xFF));
-    }
-
-    private static class NtpResult {
-
-        final String server;
-        final long estimatedEpochMs;
-        final long receivedElapsedMs;
-        final long roundTripMs;
-
-        NtpResult(
-                String server,
-                long estimatedEpochMs,
-                long receivedElapsedMs,
-                long roundTripMs
-        ) {
-
-            this.server = server;
-            this.estimatedEpochMs = estimatedEpochMs;
-            this.receivedElapsedMs = receivedElapsedMs;
-            this.roundTripMs = roundTripMs;
-        }
     }
 
     // ---------------------------------------------------------
@@ -879,12 +704,17 @@ public class MainActivity extends Activity {
 
         saveClockSource(selectedClockSource);
 
+        // تنها شرط مربوط به همگام‌سازی:
+        // باید حداقل یک زمان اینترنتی معتبر دریافت شده باشد.
+        //
+        // هیچ محدودیت ۵۰ میلی‌ثانیه‌ای برای شروع کلیک وجود ندارد.
+        // عدم‌قطعیت بالا فقط در بخش گزارش نمایش داده می‌شود.
         if (useInternetClock && !timeSynced) {
 
             Toast.makeText(
                     this,
-                    "برای استفاده از ساعت اینترنتی، "
-                            + "ابتدا همگام‌سازی موفق لازم است.",
+                    "هنوز زمان اینترنتی معتبری دریافت نشده است. "
+                            + "در حال تلاش برای همگام‌سازی...",
                     Toast.LENGTH_LONG
             ).show();
 
@@ -1061,7 +891,6 @@ public class MainActivity extends Activity {
                     intervalDuration
             );
 
-            // انتقال مبنای ساعت به FloatingService
             serviceIntent.putExtra(
                     "clock_source",
                     selectedClockSource
