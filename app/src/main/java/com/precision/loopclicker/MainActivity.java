@@ -50,6 +50,12 @@ public class MainActivity extends Activity {
     private static final String ACTION_CLOCK_SOURCE_CHANGED =
             "com.precision.loopclicker.ACTION_CLOCK_SOURCE_CHANGED";
 
+    // فاصله همگام‌سازی عادی
+    private static final long SYNC_INTERVAL_MS = 60000L;
+
+    // حداقل فاصله تلاش مجدد پس از شکست
+    private static final long SYNC_RETRY_INTERVAL_MS = 10000L;
+
     private final android.os.Handler handler =
             new android.os.Handler(android.os.Looper.getMainLooper());
 
@@ -118,6 +124,10 @@ public class MainActivity extends Activity {
 
     private volatile long lastSyncElapsed = 0;
 
+    // زمان آخرین تلاش برای همگام‌سازی؛
+    // برای جلوگیری از درخواست‌های مکرر NTP استفاده می‌شود.
+    private volatile long lastSyncAttemptElapsed = 0;
+
     private boolean countdownActive = false;
     private long scheduledStartElapsed = 0;
 
@@ -128,13 +138,27 @@ public class MainActivity extends Activity {
             updateClocks();
             updateCountdown();
 
-            if (!syncInProgress) {
+            long now = SystemClock.elapsedRealtime();
 
-                long now = SystemClock.elapsedRealtime();
+            long sinceLastAttempt =
+                    now - lastSyncAttemptElapsed;
 
-                if (!timeSynced || now - lastSyncElapsed >= 60000L) {
-                    syncInternetTime();
-                }
+            boolean neverAttempted =
+                    lastSyncAttemptElapsed <= 0;
+
+            boolean retryIntervalPassed =
+                    neverAttempted
+                            || sinceLastAttempt >= SYNC_RETRY_INTERVAL_MS;
+
+            boolean normalSyncDue =
+                    !timeSynced
+                            || now - lastSyncElapsed >= SYNC_INTERVAL_MS;
+
+            if (!syncInProgress
+                    && normalSyncDue
+                    && retryIntervalPassed) {
+
+                syncInternetTime();
             }
 
             handler.postDelayed(this, 50);
@@ -778,6 +802,11 @@ public class MainActivity extends Activity {
         if (syncInProgress || isFinishing()) {
             return;
         }
+
+        // ثبت زمان تلاش، پیش از شروع کار شبکه‌ای.
+        // حتی اگر درخواست ناموفق شود، تلاش بعدی زودتر از
+        // SYNC_RETRY_INTERVAL_MS انجام نخواهد شد.
+        lastSyncAttemptElapsed = SystemClock.elapsedRealtime();
 
         syncInProgress = true;
         handler.post(this::updateClocks);
