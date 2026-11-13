@@ -182,13 +182,25 @@ public class MainActivity extends Activity {
 
     private String getSavedClockSource() {
 
-        return preferences.getString(
+        String source = preferences.getString(
                 PREF_CLOCK_SOURCE,
                 CLOCK_PHONE
         );
+
+        if (!CLOCK_INTERNET.equals(source)
+                && !CLOCK_PHONE.equals(source)) {
+            return CLOCK_PHONE;
+        }
+
+        return source;
     }
 
     private void saveClockSource(String source) {
+
+        if (!CLOCK_INTERNET.equals(source)
+                && !CLOCK_PHONE.equals(source)) {
+            source = CLOCK_PHONE;
+        }
 
         preferences.edit()
                 .putString(PREF_CLOCK_SOURCE, source)
@@ -210,6 +222,12 @@ public class MainActivity extends Activity {
                 .apply();
     }
 
+    /**
+     * بررسی و بازیابی مرجع ذخیره‌شده ساعت اینترنتی.
+     *
+     * در صورت معتبر بودن، علاوه بر بررسی، متغیرهای اصلی
+     * trustedEpochAtSync و elapsedAtSync نیز مقداردهی می‌شوند.
+     */
     private boolean loadSavedInternetTimeAnchor() {
 
         if (preferences == null) {
@@ -238,6 +256,8 @@ public class MainActivity extends Activity {
         long currentElapsed = SystemClock.elapsedRealtime();
         long currentWall = System.currentTimeMillis();
 
+        // اگر elapsedRealtime از مقدار ذخیره‌شده کوچک‌تر باشد،
+        // احتمالاً دستگاه مجدداً راه‌اندازی شده است.
         if (currentElapsed < elapsed || currentWall < savedWall) {
             return false;
         }
@@ -254,10 +274,39 @@ public class MainActivity extends Activity {
             return false;
         }
 
+        // بررسی سرریز هنگام محاسبه زمان اینترنتی فعلی
+        if (epoch > Long.MAX_VALUE - elapsedDifference) {
+            return false;
+        }
+
+        // بازیابی واقعی مرجع، نه فقط بررسی اعتبار آن
+        trustedEpochAtSync = epoch;
+        elapsedAtSync = elapsed;
+
+        timeSynced = true;
+
+        // زمان آخرین مرجع برای مدیریت همگام‌سازی دوره‌ای
+        lastSyncElapsed = elapsed;
+
+        // اطلاعات کیفیت نمونه قبلی ذخیره نشده‌اند.
+        // بنابراین فقط مشخص می‌کنیم که مرجع از حافظه بازیابی شده است.
+        syncServerName = "مرجع ذخیره‌شده";
+        syncUncertaintyMs = 0;
+        syncRoundTripMs = 0;
+        syncSpreadMs = 0;
+        syncServerCount = 0;
+        syncSampleCount = 0;
+        syncCrossChecked = false;
+        syncWithinTarget50ms = false;
+
         return true;
     }
 
     private void restoreClockSourceSelection() {
+
+        // ابتدا مرجع ساعت اینترنتی را بازیابی می‌کنیم.
+        // اگر معتبر باشد، حتی در صورت شکست NTP نیز قابل استفاده است.
+        loadSavedInternetTimeAnchor();
 
         if (clockSourceGroup == null) {
             return;
@@ -345,21 +394,15 @@ public class MainActivity extends Activity {
             boolean anchorAvailable =
                     timeSynced
                             && epochAnchor > 0
-                            && elapsedAnchor > 0;
+                            && elapsedAnchor > 0
+                            && SystemClock.elapsedRealtime() >= elapsedAnchor;
 
             // اگر هنوز در حافظه مرجع نداریم، مرجع ذخیره‌شده
             // را فقط در صورت معتبر بودن بازیابی می‌کنیم.
             if (!anchorAvailable && loadSavedInternetTimeAnchor()) {
 
-                epochAnchor = preferences.getLong(
-                        PREF_INTERNET_EPOCH,
-                        0
-                );
-
-                elapsedAnchor = preferences.getLong(
-                        PREF_INTERNET_ELAPSED,
-                        0
-                );
+                epochAnchor = trustedEpochAtSync;
+                elapsedAnchor = elapsedAtSync;
 
                 anchorAvailable =
                         epochAnchor > 0 && elapsedAnchor > 0;
@@ -607,6 +650,24 @@ public class MainActivity extends Activity {
 
             long internetEpoch = getTrustedNow();
 
+            if (internetEpoch <= 0) {
+
+                internetClock.setText(
+                        "ساعت اینترنتی ایران: مرجع نامعتبر"
+                );
+
+                clockDifference.setText(
+                        "اختلاف ساعت گوشی با اینترنت: -- ms"
+                );
+
+                syncStatus.setText(
+                        "مرجع ساعت اینترنتی قابل استفاده نیست؛ "
+                                + "در انتظار همگام‌سازی مجدد"
+                );
+
+                return;
+            }
+
             internetClock.setText(
                     "ساعت اینترنتی ایران: "
                             + formatIranTime(internetEpoch)
@@ -621,9 +682,18 @@ public class MainActivity extends Activity {
 
             String qualityText;
 
-            if (syncWithinTarget50ms) {
+            if (syncServerCount == 0
+                    && "مرجع ذخیره‌شده".equals(syncServerName)) {
+
+                qualityText =
+                        "مرجع قبلی از حافظه بازیابی شده است";
+
+            } else if (syncWithinTarget50ms) {
+
                 qualityText = "کیفیت اندازه‌گیری: در محدوده ۵۰ ms";
+
             } else {
+
                 qualityText = "کیفیت اندازه‌گیری: خارج از محدوده ۵۰ ms";
             }
 
@@ -691,7 +761,8 @@ public class MainActivity extends Activity {
 
         long delta = elapsedNow - elapsedAnchor;
 
-        if (delta < 0 || epochAnchor > Long.MAX_VALUE - delta) {
+        if (delta < 0 || epochAnchor <= 0
+                || epochAnchor > Long.MAX_VALUE - delta) {
             return 0;
         }
 
@@ -848,7 +919,8 @@ public class MainActivity extends Activity {
 
         // فقط دریافت حداقل یک زمان معتبر اینترنتی لازم است.
         // عدم‌قطعیت بیشتر از ۵۰ میلی‌ثانیه مانع کلیک نمی‌شود.
-        if (useInternetClock && !timeSynced) {
+        if (useInternetClock
+                && (!timeSynced || getTrustedNow() <= 0)) {
 
             Toast.makeText(
                     this,
