@@ -2604,173 +2604,173 @@ public class FloatingService extends Service {
     }
 
     private void dispatchNextClick(
-            long generation,
-            long targetElapsedRealtimeNanos
-    ) {
+        long generation,
+        long targetElapsedRealtimeNanos
+) {
 
-        if (!isCurrentRun(generation) || !cycleActive) {
-            return;
-        }
+    if (!isCurrentRun(generation) || !cycleActive) {
+        return;
+    }
 
-        long cycleStartNanos =
-                elapsedMsToNanos(cycleStartElapsedMs);
+    accessibility = getReadyAccessibility();
 
-        long cycleDeadlineNanos =
-                elapsedMsToNanos(cycleDeadlineElapsedMs);
+    if (accessibility == null) {
+        waitForAccessibility(generation);
+        return;
+    }
 
-        long nowNanos = SystemClock.elapsedRealtimeNanos();
+    if (accessibility.isGestureInProgress()) {
 
-        if (nowNanos >= cycleDeadlineNanos) {
-            markDeadlineSkipped(
-                    "زمان چرخه پیش از ارسال کلیک هدف پایان یافت"
-            );
+        nextClickRunnable = () -> {
+            nextClickRunnable = null;
 
-            waitForCycleEnd(generation);
-            return;
-        }
+            if (isCurrentRun(generation) && cycleActive) {
+                dispatchNextClick(
+                        generation,
+                        targetElapsedRealtimeNanos
+                );
+            }
+        };
 
-        accessibility = getReadyAccessibility();
+        handler.postDelayed(nextClickRunnable, GESTURE_RETRY_MS);
+        return;
+    }
 
-        if (accessibility == null) {
-            nextClickRunnable = () -> {
-                if (isCurrentRun(generation) && cycleActive) {
-                    dispatchNextClick(
-                            generation,
-                            targetElapsedRealtimeNanos
-                    );
-                }
-            };
+    final long cycleStartNanos =
+            elapsedMsToNanos(cycleStartElapsedMs);
 
-            handler.postDelayed(nextClickRunnable, SERVICE_RETRY_MS);
-            return;
-        }
+    final long cycleDeadlineNanos =
+            elapsedMsToNanos(cycleDeadlineElapsedMs);
 
-        if (accessibility.isGestureInProgress()) {
-            nextClickRunnable = () -> {
-                if (isCurrentRun(generation) && cycleActive) {
-                    dispatchNextClick(
-                            generation,
-                            targetElapsedRealtimeNanos
-                    );
-                }
-            };
+    final long nowNanos =
+            SystemClock.elapsedRealtimeNanos();
 
-            handler.postDelayed(nextClickRunnable, GESTURE_RETRY_MS);
-            return;
-        }
+    if (nowNanos >= cycleDeadlineNanos) {
 
-        accessibility.setTarget(targetX, targetY);
-
-        final AutoClickService clickService = accessibility;
-        final long callbackGeneration = generation;
-
-        final long successesBefore =
-                clickService.getSuccessfulClicks();
-
-        final long failuresBefore =
-                clickService.getFailedClicks();
-
-        boolean accepted = clickService.performClickAtTarget(
-                targetElapsedRealtimeNanos,
-                cycleStartNanos,
-                cycleDeadlineNanos,
-                () -> handler.post(() -> {
-
-                    if (!isCurrentRun(callbackGeneration) || !cycleActive) {
-                        return;
-                    }
-
-                    // callback هر جایگاه، چه موفق و چه ازدست‌رفته، فقط یک‌بار
-                    // مصرف می‌شود؛ کلیک ازدست‌رفته هرگز به چرخه بعد منتقل نمی‌شود.
-                    nextClickIndex++;
-
-                    long successesAfter =
-                            clickService.getSuccessfulClicks();
-
-                    long failuresAfter =
-                            clickService.getFailedClicks();
-
-                    if (clickService.getLastBatchSkippedByDeadline() > 0) {
-
-                        markDeadlineSkipped(clickService.getLastError());
-
-                        // فقط همین جایگاه از دست می‌رود؛ جایگاه بعدی با زمان هدف
-                        // اصلی خودش بررسی می‌شود و به زمان فعلی منتقل نمی‌شود.
-                        if (nextClickIndex < clickCount
-                                && SystemClock.elapsedRealtimeNanos()
-                                < cycleDeadlineNanos) {
-
-                            scheduleNextClick(callbackGeneration);
-
-                        } else {
-
-                            waitForCycleEnd(callbackGeneration);
-                        }
-
-                        updateDisplay();
-                        return;
-                    }
-
-                    if (successesAfter <= successesBefore
-                            && failuresAfter > failuresBefore) {
-
-                        cycleOtherFailure = true;
-                        addLiveError(clickService.getLastError());
-
-                        waitForCycleEnd(callbackGeneration);
-                        updateDisplay();
-                        return;
-                    }
-
-                    if (successesAfter <= successesBefore
-                            && failuresAfter <= failuresBefore) {
-
-                        // درخواست پذیرفته شده اما Gesture نتیجه موفق ثبت نکرده است.
-                        cycleOtherFailure = true;
-
-                        addLiveError(
-                                clickService.getLastError() == null
-                                        ? "نتیجه کلیک از سرویس دریافت نشد"
-                                        : clickService.getLastError()
-                        );
-
-                        waitForCycleEnd(callbackGeneration);
-                        updateDisplay();
-                        return;
-                    }
-
-                    if (SystemClock.elapsedRealtimeNanos()
-                            >= cycleDeadlineNanos
-                            || nextClickIndex >= clickCount) {
-
-                        waitForCycleEnd(callbackGeneration);
-
-                    } else {
-
-                        scheduleNextClick(callbackGeneration);
-                    }
-
-                    updateDisplay();
-                })
+        markDeadlineSkipped(
+                "زمان چرخه پیش از ارسال دسته کلیک پایان یافت"
         );
 
-        if (accepted) {
-
-            clickNumber++;
-            lastClickDispatchElapsedMs =
-                    SystemClock.elapsedRealtime();
-
-            lastBatchCount = 1;
-
-            updateDisplay();
-
-        } else {
-
-            // callback سرویس در شاخه رد درخواست نیز فراخوانی می‌شود؛
-            // برای جلوگیری از دوباره‌شماری، اینجا شمارنده را جلو نمی‌بریم.
-            updateDisplay();
-        }
+        waitForCycleEnd(generation);
+        return;
     }
+
+    accessibility.setTarget(targetX, targetY);
+
+    final AutoClickService clickService = accessibility;
+
+    final long successesBefore =
+            clickService.getSuccessfulClicks();
+
+    final long failuresBefore =
+            clickService.getFailedClicks();
+
+    final long deadlineElapsedMs =
+            cycleDeadlineElapsedMs;
+
+    /*
+     * درخواست تمام کلیک‌های چرخه به‌صورت یک دسته.
+     * خود AutoClickService تعداد قابل‌اجرا را بر اساس محدودیت
+     * GestureDescription و مهلت پایان چرخه کنترل می‌کند.
+     */
+    final int acceptedCount = clickService.performClickBatch(
+            (int) Math.min(clickCount, Integer.MAX_VALUE),
+            clickIntervalMs,
+            deadlineElapsedMs,
+            () -> handler.post(() -> {
+
+                if (!isCurrentRun(generation) || !cycleActive) {
+                    return;
+                }
+
+                long successesAfter =
+                        clickService.getSuccessfulClicks();
+
+                long failuresAfter =
+                        clickService.getFailedClicks();
+
+                long successfulInThisBatch =
+                        Math.max(0L, successesAfter - successesBefore);
+
+                long failedInThisBatch =
+                        Math.max(0L, failuresAfter - failuresBefore);
+
+                clickNumber = successfulInThisBatch
+                        + failedInThisBatch;
+
+                nextClickIndex = clickNumber;
+
+                if (clickService.getLastBatchSkippedByDeadline() > 0) {
+
+                    markDeadlineSkipped(
+                            clickService.getLastError()
+                    );
+                }
+
+                if (acceptedCount < clickCount) {
+
+                    cycleOtherFailure = true;
+
+                    addLiveError(
+                            "تعداد کلیک‌ها از ظرفیت یک Gesture بیشتر بود؛ "
+                                    + "تمام کلیک‌های درخواستی در یک دسته جا نشدند"
+                    );
+                }
+
+                if (failedInThisBatch > 0) {
+
+                    cycleOtherFailure = true;
+
+                    addLiveError(
+                            clickService.getLastError()
+                    );
+                }
+
+                if (successfulInThisBatch < acceptedCount
+                        && failedInThisBatch == 0) {
+
+                    cycleOtherFailure = true;
+
+                    addLiveError(
+                            "تعداد کلیک موفق کمتر از تعداد کلیک پذیرفته‌شده بود"
+                    );
+                }
+
+                updateDisplay();
+
+                /*
+                 * چرخه در زمان اصلی خودش پایان می‌یابد.
+                 * callback فقط برای ثبت نتیجه است و مبدأ چرخه را تغییر نمی‌دهد.
+                 */
+                waitForCycleEnd(generation);
+            })
+    );
+
+    if (acceptedCount > 0) {
+
+        clickNumber = acceptedCount;
+        nextClickIndex = acceptedCount;
+
+        lastClickDispatchElapsedMs =
+                SystemClock.elapsedRealtime();
+
+        lastBatchCount = acceptedCount;
+
+        updateDisplay();
+
+    } else {
+
+        cycleOtherFailure = true;
+
+        addLiveError(
+                clickService.getLastError() == null
+                        ? "ارسال دسته کلیک ناموفق بود"
+                        : clickService.getLastError()
+        );
+
+        updateDisplay();
+    }
+}
 
     private void waitForCycleEnd(long generation) {
 
