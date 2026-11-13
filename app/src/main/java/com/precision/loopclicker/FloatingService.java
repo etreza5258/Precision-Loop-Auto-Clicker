@@ -1,4 +1,3 @@
-
 package com.precision.loopclicker;
 
 import android.app.Dialog;
@@ -154,13 +153,11 @@ public class FloatingService extends Service {
     private long lastBatchCount;
     private long cycleStartWallMs;
 
-    // تا وقتی سرویس دسترسی‌پذیری آماده نشده، آمار چرخه فقط یک‌بار reset می‌شود.
     private boolean cycleServicePrepared;
 
     private long clickCount;
     private long clickNumber;
 
-    // شماره جایگاه کلیک بعدی در چرخه؛ هر جایگاه فقط یک‌بار بررسی می‌شود.
     private long nextClickIndex;
 
     private boolean cycleYellow;
@@ -218,12 +215,6 @@ public class FloatingService extends Service {
                 return;
             }
 
-            /*
-             * اگر MainActivity مرجع جدید اینترنت را فرستاده باشد،
-             * همان مرجع را دریافت و ذخیره می‌کنیم.
-             *
-             * هر دو مقدار باید متعلق به یک لحظه همگام‌سازی باشند.
-             */
             boolean hasInternetAnchor =
                     intent.hasExtra("internet_epoch_at_sync_ms")
                             && intent.hasExtra("internet_elapsed_at_sync_ms");
@@ -263,10 +254,6 @@ public class FloatingService extends Service {
                 }
             }
 
-            /*
-             * تغییر منبع فقط روی نمایش ساعت و انتخاب‌گر اثر دارد.
-             * anchorElapsedMs و زمان‌بندی چرخه جاری تغییر نمی‌کنند.
-             */
             clockSource = newSource;
 
             getSharedPreferences(
@@ -331,12 +318,6 @@ public class FloatingService extends Service {
         clockSourceReceiverRegistered = false;
     }
 
-    /*
-     * منبع ساعت و مرجع اینترنتی ذخیره‌شده را بازیابی می‌کند.
-     *
-     * اگر مرجع اینترنتی معتبر باشد، زمان فعلی اینترنت از آن
-     * و elapsedRealtime محاسبه خواهد شد.
-     */
     private void loadSavedClockSource() {
 
         try {
@@ -383,17 +364,6 @@ public class FloatingService extends Service {
         }
     }
 
-    /*
-     * ساعت فعلی بر اساس منبع انتخاب‌شده.
-     *
-     * در حالت اینترنتی، فقط از مرجع اینترنتی و elapsedRealtime
-     * استفاده می‌شود.
-     *
-     * اگر مرجع اینترنتی موجود نباشد، صفر برمی‌گرداند تا ساعت گوشی
-     * به‌اشتباه به‌عنوان ساعت اینترنتی نمایش داده نشود.
-     *
-     * این تابع هیچ درخواست شبکه‌ای انجام نمی‌دهد.
-     */
     private long getCurrentClockEpochMs() {
 
         if (CLOCK_INTERNET.equals(clockSource)) {
@@ -807,10 +777,6 @@ public class FloatingService extends Service {
             return;
         }
 
-        /*
-         * در حالت اینترنتی، بدون مرجع معتبر نباید زمان گوشی
-         * به‌عنوان ساعت اینترنتی وارد انتخاب‌گر شود.
-         */
         if (CLOCK_INTERNET.equals(clockSource)
                 && !internetTimeAnchorAvailable) {
 
@@ -1993,15 +1959,6 @@ public class FloatingService extends Service {
             clockSource = CLOCK_PHONE;
         }
 
-        /*
-         * دریافت مرجع ساعت اینترنتی از MainActivity.
-         *
-         * اگر مرجع جدید همراه فرمان شروع ارسال شده باشد،
-         * جایگزین مرجع قبلی می‌شود.
-         *
-         * اگر extras مرجع ارسال نشده باشند، مرجع معتبر بازیابی‌شده
-         * از SharedPreferences حفظ می‌شود.
-         */
         if (config.hasExtra("internet_epoch_at_sync_ms")
                 && config.hasExtra("internet_elapsed_at_sync_ms")) {
 
@@ -2040,14 +1997,6 @@ public class FloatingService extends Service {
             }
         }
 
-        /*
-         * محافظ جدید:
-         * اگر ساعت اینترنتی انتخاب شده اما هیچ مرجع معتبر اینترنتی
-         * در دسترس نیست، اجرای چرخه مجاز نیست.
-         *
-         * این شرط فقط از شروع با ساعت نامعتبر جلوگیری می‌کند؛
-         * هیچ محدودیت ۵۰ میلی‌ثانیه‌ای روی کلیک‌ها اعمال نمی‌کند.
-         */
         if (CLOCK_INTERNET.equals(clockSource)
                 && !internetTimeAnchorAvailable) {
 
@@ -2090,11 +2039,6 @@ public class FloatingService extends Service {
         long nowElapsed = SystemClock.elapsedRealtime();
         long delayMs;
 
-        /*
-         * مسیر جدید:
-         * زمان شروع مطلق monotonic مستقیماً از MainActivity دریافت می‌شود.
-         * در این حالت دیگر زمان هدف را از روی start_delay_ms بازسازی نمی‌کنیم.
-         */
         if (config.hasExtra("start_elapsed_realtime_ms")) {
 
             anchorElapsedMs = config.getLongExtra(
@@ -2118,10 +2062,6 @@ public class FloatingService extends Service {
 
         } else {
 
-            /*
-             * سازگاری با نسخه قبلی:
-             * اگر extra جدید موجود نباشد، روش قبلی استفاده می‌شود.
-             */
             if (config.hasExtra("start_delay_ms")) {
 
                 delayMs = config.getLongExtra(
@@ -2286,11 +2226,6 @@ public class FloatingService extends Service {
                 return;
             }
 
-            /*
-             * آماده شدن سرویس نباید مبدأ یا پایان چرخه را جابه‌جا کند.
-             * اگر Gesture قبلی هنوز فعال است، تا پایان آن صبر می‌کنیم
-             * و قبل از پایانش شمارنده‌های سرویس را reset نمی‌کنیم.
-             */
             if (accessibility.isGestureInProgress()) {
                 cycleStartRunnable = () -> {
                     if (isCurrentRun(generation) && cycleActive) {
@@ -2334,11 +2269,6 @@ public class FloatingService extends Service {
             return;
         }
 
-        /*
-         * مبدأ چرخه از قبل و بر اساس anchorElapsedMs تعیین شده است:
-         * چرخه شماره N دقیقاً در anchor + N * (مدت چرخه + مکث)
-         * زمان‌بندی می‌شود. دیر اجرا شدن Handler نباید چرخه را تمدید کند.
-         */
         long scheduledCycleStart = getCycleTargetElapsed(cycleIndex);
 
         if (scheduledCycleStart == Long.MAX_VALUE) {
@@ -2371,10 +2301,6 @@ public class FloatingService extends Service {
                     cycleStartElapsedMs + cycleDurationMs;
         }
 
-        /*
-         * زمان دیواری گزارش نیز از همان مبدأ برنامه‌ریزی‌شده ساخته می‌شود؛
-         * تأخیر اجرای تابع، زمان شروع ثبت‌شده را جلو نمی‌برد.
-         */
         long cycleOffset = cycleStartElapsedMs - anchorElapsedMs;
 
         if (cycleOffset >= 0
@@ -2395,7 +2321,6 @@ public class FloatingService extends Service {
         accessibility = getReadyAccessibility();
 
         if (accessibility == null) {
-            /* چرخه با مهلت ثابت آغاز شده؛ منتظر سرویس می‌مانیم، نه مبدأ تازه. */
             waitForAccessibility(generation);
             updateDisplay();
             return;
@@ -2456,10 +2381,6 @@ public class FloatingService extends Service {
         cycleServicePrepared = true;
     }
 
-    /*
-     * تبدیل زمان elapsedRealtime برحسب میلی‌ثانیه به نانوثانیه با
-     * جلوگیری از overflow. هر دو زمان از یک ساعت monotonic می‌آیند.
-     */
     private long elapsedMsToNanos(long elapsedMs) {
 
         if (elapsedMs <= 0) {
@@ -2484,52 +2405,19 @@ public class FloatingService extends Service {
     }
 
     /**
-     * برای هر جایگاه کلیک، timestamp مطلق مستقل می‌سازیم:
-     * cycleStart + index * interval.
-     * AutoClickService خودش درخواست را با lead تطبیقی پیش‌ارسال می‌کند.
+     * تمام کلیک‌های چرخه در یک Gesture ارسال می‌شوند.
      */
     private void scheduleNextClick(long generation) {
 
-    if (!isCurrentRun(generation) || !cycleActive) {
-        return;
-    }
+        if (!isCurrentRun(generation) || !cycleActive) {
+            return;
+        }
 
-    if (cycleFinishRunnable != null) {
-        handler.removeCallbacks(cycleFinishRunnable);
-        cycleFinishRunnable = null;
-    }
+        if (cycleFinishRunnable != null) {
+            handler.removeCallbacks(cycleFinishRunnable);
+            cycleFinishRunnable = null;
+        }
 
-    accessibility = getReadyAccessibility();
-
-    if (accessibility == null) {
-        waitForAccessibility(generation);
-        return;
-    }
-
-    if (accessibility.isGestureInProgress()) {
-        nextClickRunnable = () -> {
-            nextClickRunnable = null;
-
-            if (isCurrentRun(generation) && cycleActive) {
-                scheduleNextClick(generation);
-            }
-        };
-
-        handler.postDelayed(nextClickRunnable, GESTURE_RETRY_MS);
-        return;
-    }
-
-    /*
-     * تمام کلیک‌های چرخه در یک Gesture ارسال می‌شوند.
-     * فاصله بین Strokeها از همان clickIntervalMs گرفته می‌شود.
-     * دیگر برای ارسال کلیک بعدی منتظر callback کلیک قبلی نمی‌مانیم.
-     */
-
-    dispatchNextClick(
-            generation,
-            elapsedMsToNanos(cycleStartElapsedMs)
-    );
-}
         accessibility = getReadyAccessibility();
 
         if (accessibility == null) {
@@ -2539,6 +2427,8 @@ public class FloatingService extends Service {
 
         if (accessibility.isGestureInProgress()) {
             nextClickRunnable = () -> {
+                nextClickRunnable = null;
+
                 if (isCurrentRun(generation) && cycleActive) {
                     scheduleNextClick(generation);
                 }
@@ -2548,229 +2438,178 @@ public class FloatingService extends Service {
             return;
         }
 
-        long effectiveIntervalMs = Math.max(
-                1L,
-                accessibility.getEffectiveClickIntervalMs(clickIntervalMs)
+        dispatchNextClick(
+                generation,
+                elapsedMsToNanos(cycleStartElapsedMs)
         );
+    }
 
-        if (effectiveIntervalMs > Long.MAX_VALUE / 1_000_000L) {
-            cycleOtherFailure = true;
-            addLiveError("فاصله کلیک از محدوده زمان‌بندی مجاز خارج شد");
-            waitForCycleEnd(generation);
+    private void dispatchNextClick(
+            long generation,
+            long targetElapsedRealtimeNanos
+    ) {
+
+        if (!isCurrentRun(generation) || !cycleActive) {
             return;
         }
 
-        long intervalNanos = effectiveIntervalMs * 1_000_000L;
+        accessibility = getReadyAccessibility();
 
-        if (nextClickIndex > 0
-                && intervalNanos
-                > (Long.MAX_VALUE - cycleStartNanos) / nextClickIndex) {
-
-            cycleOtherFailure = true;
-            addLiveError("محاسبه زمان هدف کلیک از محدوده مجاز خارج شد");
-            waitForCycleEnd(generation);
+        if (accessibility == null) {
+            waitForAccessibility(generation);
             return;
         }
 
-        long targetNanos =
-                cycleStartNanos + nextClickIndex * intervalNanos;
+        if (accessibility.isGestureInProgress()) {
 
-        // پایان چرخه exclusive است؛ کلیک باید کاملاً قبل از deadline تمام شود.
-        if (targetNanos >= cycleDeadlineNanos
-                || targetNanos > Long.MAX_VALUE - 1_000_000L
-                || targetNanos + 1_000_000L > cycleDeadlineNanos) {
+            nextClickRunnable = () -> {
+                nextClickRunnable = null;
+
+                if (isCurrentRun(generation) && cycleActive) {
+                    dispatchNextClick(
+                            generation,
+                            targetElapsedRealtimeNanos
+                    );
+                }
+            };
+
+            handler.postDelayed(nextClickRunnable, GESTURE_RETRY_MS);
+            return;
+        }
+
+        final long cycleDeadlineNanos =
+                elapsedMsToNanos(cycleDeadlineElapsedMs);
+
+        final long nowNanos =
+                SystemClock.elapsedRealtimeNanos();
+
+        if (nowNanos >= cycleDeadlineNanos) {
 
             markDeadlineSkipped(
-                    "جایگاه‌های باقی‌مانده کلیک در محدوده زمانی چرخه جا نمی‌شوند"
+                    "زمان چرخه پیش از ارسال دسته کلیک پایان یافت"
             );
 
             waitForCycleEnd(generation);
             return;
         }
 
-        final long targetForThisClick = targetNanos;
+        accessibility.setTarget(targetX, targetY);
 
-        nextClickRunnable = () -> {
-            nextClickRunnable = null;
+        final AutoClickService clickService = accessibility;
 
-            if (isCurrentRun(generation) && cycleActive) {
-                dispatchNextClick(generation, targetForThisClick);
-            }
-        };
+        final long successesBefore =
+                clickService.getSuccessfulClicks();
 
-        // این فراخوانی زودتر از زمان هدف مجاز است؛ سرویس خودش زمان پیش‌ارسال
-        // را با lead تطبیقی تعیین می‌کند و کلیک اول را قبل از شروع چرخه نمی‌فرستد.
-        nextClickRunnable.run();
-    }
+        final long failuresBefore =
+                clickService.getFailedClicks();
 
-    private void dispatchNextClick(
-        long generation,
-        long targetElapsedRealtimeNanos
-) {
+        final long deadlineElapsedMs =
+                cycleDeadlineElapsedMs;
 
-    if (!isCurrentRun(generation) || !cycleActive) {
-        return;
-    }
+        /*
+         * مقدار پذیرفته‌شده در آرایه نگهداری می‌شود تا callback
+         * بتواند آن را بدون ارجاع به متغیر در حال مقداردهی بخواند.
+         */
+        final int[] acceptedCountHolder = new int[]{0};
 
-    accessibility = getReadyAccessibility();
+        final int acceptedCount = clickService.performClickBatch(
+                (int) Math.min(clickCount, Integer.MAX_VALUE),
+                clickIntervalMs,
+                deadlineElapsedMs,
+                () -> handler.post(() -> {
 
-    if (accessibility == null) {
-        waitForAccessibility(generation);
-        return;
-    }
+                    if (!isCurrentRun(generation) || !cycleActive) {
+                        return;
+                    }
 
-    if (accessibility.isGestureInProgress()) {
+                    long successesAfter =
+                            clickService.getSuccessfulClicks();
 
-        nextClickRunnable = () -> {
-            nextClickRunnable = null;
+                    long failuresAfter =
+                            clickService.getFailedClicks();
 
-            if (isCurrentRun(generation) && cycleActive) {
-                dispatchNextClick(
-                        generation,
-                        targetElapsedRealtimeNanos
-                );
-            }
-        };
+                    long successfulInThisBatch =
+                            Math.max(0L, successesAfter - successesBefore);
 
-        handler.postDelayed(nextClickRunnable, GESTURE_RETRY_MS);
-        return;
-    }
+                    long failedInThisBatch =
+                            Math.max(0L, failuresAfter - failuresBefore);
 
-    final long cycleStartNanos =
-            elapsedMsToNanos(cycleStartElapsedMs);
+                    clickNumber = successfulInThisBatch
+                            + failedInThisBatch;
 
-    final long cycleDeadlineNanos =
-            elapsedMsToNanos(cycleDeadlineElapsedMs);
+                    nextClickIndex = clickNumber;
 
-    final long nowNanos =
-            SystemClock.elapsedRealtimeNanos();
+                    if (clickService.getLastBatchSkippedByDeadline() > 0) {
 
-    if (nowNanos >= cycleDeadlineNanos) {
+                        markDeadlineSkipped(
+                                clickService.getLastError()
+                        );
+                    }
 
-        markDeadlineSkipped(
-                "زمان چرخه پیش از ارسال دسته کلیک پایان یافت"
+                    if (acceptedCountHolder[0] < clickCount) {
+
+                        cycleOtherFailure = true;
+
+                        addLiveError(
+                                "تعداد کلیک‌ها از ظرفیت یک Gesture بیشتر بود؛ "
+                                        + "تمام کلیک‌های درخواستی در یک دسته جا نشدند"
+                        );
+                    }
+
+                    if (failedInThisBatch > 0) {
+
+                        cycleOtherFailure = true;
+
+                        addLiveError(
+                                clickService.getLastError()
+                        );
+                    }
+
+                    if (successfulInThisBatch < acceptedCountHolder[0]
+                            && failedInThisBatch == 0) {
+
+                        cycleOtherFailure = true;
+
+                        addLiveError(
+                                "تعداد کلیک موفق کمتر از تعداد کلیک پذیرفته‌شده بود"
+                        );
+                    }
+
+                    updateDisplay();
+
+                    waitForCycleEnd(generation);
+                })
         );
 
-        waitForCycleEnd(generation);
-        return;
+        acceptedCountHolder[0] = acceptedCount;
+
+        if (acceptedCount > 0) {
+
+            clickNumber = acceptedCount;
+            nextClickIndex = acceptedCount;
+
+            lastClickDispatchElapsedMs =
+                    SystemClock.elapsedRealtime();
+
+            lastBatchCount = acceptedCount;
+
+            updateDisplay();
+
+        } else {
+
+            cycleOtherFailure = true;
+
+            addLiveError(
+                    clickService.getLastError() == null
+                            ? "ارسال دسته کلیک ناموفق بود"
+                            : clickService.getLastError()
+            );
+
+            updateDisplay();
+
+            waitForCycleEnd(generation);
+        }
     }
-
-    accessibility.setTarget(targetX, targetY);
-
-    final AutoClickService clickService = accessibility;
-
-    final long successesBefore =
-            clickService.getSuccessfulClicks();
-
-    final long failuresBefore =
-            clickService.getFailedClicks();
-
-    final long deadlineElapsedMs =
-            cycleDeadlineElapsedMs;
-
-    /*
-     * درخواست تمام کلیک‌های چرخه به‌صورت یک دسته.
-     * خود AutoClickService تعداد قابل‌اجرا را بر اساس محدودیت
-     * GestureDescription و مهلت پایان چرخه کنترل می‌کند.
-     */
-    final int acceptedCount = clickService.performClickBatch(
-            (int) Math.min(clickCount, Integer.MAX_VALUE),
-            clickIntervalMs,
-            deadlineElapsedMs,
-            () -> handler.post(() -> {
-
-                if (!isCurrentRun(generation) || !cycleActive) {
-                    return;
-                }
-
-                long successesAfter =
-                        clickService.getSuccessfulClicks();
-
-                long failuresAfter =
-                        clickService.getFailedClicks();
-
-                long successfulInThisBatch =
-                        Math.max(0L, successesAfter - successesBefore);
-
-                long failedInThisBatch =
-                        Math.max(0L, failuresAfter - failuresBefore);
-
-                clickNumber = successfulInThisBatch
-                        + failedInThisBatch;
-
-                nextClickIndex = clickNumber;
-
-                if (clickService.getLastBatchSkippedByDeadline() > 0) {
-
-                    markDeadlineSkipped(
-                            clickService.getLastError()
-                    );
-                }
-
-                if (acceptedCount < clickCount) {
-
-                    cycleOtherFailure = true;
-
-                    addLiveError(
-                            "تعداد کلیک‌ها از ظرفیت یک Gesture بیشتر بود؛ "
-                                    + "تمام کلیک‌های درخواستی در یک دسته جا نشدند"
-                    );
-                }
-
-                if (failedInThisBatch > 0) {
-
-                    cycleOtherFailure = true;
-
-                    addLiveError(
-                            clickService.getLastError()
-                    );
-                }
-
-                if (successfulInThisBatch < acceptedCount
-                        && failedInThisBatch == 0) {
-
-                    cycleOtherFailure = true;
-
-                    addLiveError(
-                            "تعداد کلیک موفق کمتر از تعداد کلیک پذیرفته‌شده بود"
-                    );
-                }
-
-                updateDisplay();
-
-                /*
-                 * چرخه در زمان اصلی خودش پایان می‌یابد.
-                 * callback فقط برای ثبت نتیجه است و مبدأ چرخه را تغییر نمی‌دهد.
-                 */
-                waitForCycleEnd(generation);
-            })
-    );
-
-    if (acceptedCount > 0) {
-
-        clickNumber = acceptedCount;
-        nextClickIndex = acceptedCount;
-
-        lastClickDispatchElapsedMs =
-                SystemClock.elapsedRealtime();
-
-        lastBatchCount = acceptedCount;
-
-        updateDisplay();
-
-    } else {
-
-        cycleOtherFailure = true;
-
-        addLiveError(
-                clickService.getLastError() == null
-                        ? "ارسال دسته کلیک ناموفق بود"
-                        : clickService.getLastError()
-        );
-
-        updateDisplay();
-    }
-}
 
     private void waitForCycleEnd(long generation) {
 
