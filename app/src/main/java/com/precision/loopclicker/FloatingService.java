@@ -139,6 +139,9 @@ public class FloatingService extends Service {
     private long lastBatchCount;
     private long cycleStartWallMs;
 
+    // تا وقتی سرویس دسترسی‌پذیری آماده نشده، آمار چرخه فقط یک‌بار reset می‌شود.
+    private boolean cycleServicePrepared;
+
     private long clickCount;
     private long clickNumber;
 
@@ -1890,6 +1893,7 @@ public class FloatingService extends Service {
         cycleIntervalViolation = false;
         cycleDeadlineSkipped = false;
         cycleOtherFailure = false;
+        cycleServicePrepared = false;
 
         setMarkerTouchable(false);
 
@@ -1983,10 +1987,30 @@ public class FloatingService extends Service {
 
             if (!cycleActive) {
                 startCycle(generation);
-            } else {
-                scheduleNextClick(generation);
+                return;
             }
 
+            /*
+             * آماده شدن سرویس نباید مبدأ یا پایان چرخه را جابه‌جا کند.
+             * اگر Gesture قبلی هنوز فعال است، تا پایان آن صبر می‌کنیم
+             * و قبل از پایانش شمارنده‌های سرویس را reset نمی‌کنیم.
+             */
+            if (accessibility.isGestureInProgress()) {
+                cycleStartRunnable = () -> {
+                    if (isCurrentRun(generation) && cycleActive) {
+                        startCycleServiceWhenGestureEnds(generation);
+                    }
+                };
+                handler.postDelayed(cycleStartRunnable, GESTURE_RETRY_MS);
+                return;
+            }
+
+            if (!cycleServicePrepared) {
+                prepareCycleService(accessibility);
+            }
+
+            scheduleNextClick(generation);
+            updateDisplay();
             return;
         }
 
@@ -2010,27 +2034,22 @@ public class FloatingService extends Service {
 
     private void startCycle(long generation) {
 
-        if (!isCurrentRun(generation)) {
+        if (!isCurrentRun(generation) || cycleActive) {
             return;
         }
 
-        accessibility = getReadyAccessibility();
+        /*
+         * مبدأ چرخه از قبل و بر اساس anchorElapsedMs تعیین شده است:
+         * چرخه شماره N دقیقاً در anchor + N * (مدت چرخه + مکث)
+         * زمان‌بندی می‌شود. دیر اجرا شدن Handler نباید چرخه را تمدید کند.
+         */
+        long scheduledCycleStart = getCycleTargetElapsed(cycleIndex);
 
-        if (accessibility == null) {
-            waitForAccessibility(generation);
-            return;
-        }
-
-        if (accessibility.isGestureInProgress()) {
-
-            cycleStartRunnable = () -> {
-
-                if (isCurrentRun(generation)) {
-                    startCycle(generation);
-                }
-            };
-
-            handler.postDelayed(cycleStartRunnable, GESTURE_RETRY_MS);
+        if (scheduledCycleStart == Long.MAX_VALUE) {
+            cycleOtherFailure = true;
+            addLiveError("زمان شروع چرخه از محدوده مجاز خارج شد");
+            stopLoop();
+            updateCountdownStatus("محدودیت زمان‌بندی چرخه");
             return;
         }
 
@@ -2044,8 +2063,9 @@ public class FloatingService extends Service {
         cycleIntervalViolation = false;
         cycleDeadlineSkipped = false;
         cycleOtherFailure = false;
+        cycleServicePrepared = false;
 
-        cycleStartElapsedMs = SystemClock.elapsedRealtime();
+        cycleStartElapsedMs = scheduledCycleStart;
 
         if (cycleDurationMs > Long.MAX_VALUE - cycleStartElapsedMs) {
             cycleDeadlineElapsedMs = Long.MAX_VALUE;
@@ -2054,16 +2074,85 @@ public class FloatingService extends Service {
                     cycleStartElapsedMs + cycleDurationMs;
         }
 
-        cycleStartWallMs = System.currentTimeMillis();
+        /*
+         * زمان دیواری گزارش نیز از همان مبدأ برنامه‌ریزی‌شده ساخته می‌شود؛
+         * تأخیر اجرای تابع، زمان شروع ثبت‌شده را جلو نمی‌برد.
+         */
+        long cycleOffset = cycleStartElapsedMs - anchorElapsedMs;
 
-        accessibility.resetClickCounters();
+        if (cycleOffset >= 0
+                && selectedStartEpochMs <= Long.MAX_VALUE - cycleOffset) {
+            cycleStartWallMs = selectedStartEpochMs + cycleOffset;
+        } else {
+            cycleStartWallMs = System.currentTimeMillis()
+                    - Math.max(0L,
+                    SystemClock.elapsedRealtime() - cycleStartElapsedMs);
+        }
 
         currentCycleStatsFinalized = false;
 
-        accessibility.setTarget(targetX, targetY);
+        accessibility = getReadyAccessibility();
 
+        if (accessibility == null) {
+            /* چرخه با مهلت ثابت آغاز شده؛ منتظر سرویس می‌مانیم، نه مبدأ تازه. */
+            waitForAccessibility(generation);
+            updateDisplay();
+            return;
+        }
+
+        if (accessibility.isGestureInProgress()) {
+
+            cycleStartRunnable = () -> {
+
+                if (isCurrentRun(generation) && cycleActive) {
+                    startCycleServiceWhenGestureEnds(generation);
+                }
+            };
+
+            handler.postDelayed(cycleStartRunnable, GESTURE_RETRY_MS);
+            updateDisplay();
+            return;
+        }
+
+        prepareCycleService(accessibility);
         scheduleNextClick(generation);
         updateDisplay();
+    }
+
+    private void startCycleServiceWhenGestureEnds(long generation) {
+
+        if (!isCurrentRun(generation) || !cycleActive) {
+            return;
+        }
+
+        accessibility = getReadyAccessibility();
+
+        if (accessibility == null) {
+            waitForAccessibility(generation);
+            return;
+        }
+
+        if (accessibility.isGestureInProgress()) {
+            cycleStartRunnable = () ->
+                    startCycleServiceWhenGestureEnds(generation);
+            handler.postDelayed(cycleStartRunnable, GESTURE_RETRY_MS);
+            return;
+        }
+
+        prepareCycleService(accessibility);
+        scheduleNextClick(generation);
+        updateDisplay();
+    }
+
+    private void prepareCycleService(AutoClickService service) {
+
+        if (service == null || cycleServicePrepared) {
+            return;
+        }
+
+        service.resetClickCounters();
+        service.setTarget(targetX, targetY);
+        cycleServicePrepared = true;
     }
 
     /*
@@ -2142,7 +2231,8 @@ public class FloatingService extends Service {
 
         if (clickNumber == 0 || lastBatchCount <= 0) {
 
-            targetElapsed = now;
+            // هدف کلیک اول، نقطه صفر چرخه است؛ اگر دیر رسیده‌ایم فوراً dispatch می‌کنیم.
+            targetElapsed = cycleStartElapsedMs;
 
         } else {
 
