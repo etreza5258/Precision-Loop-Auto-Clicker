@@ -410,6 +410,7 @@ public class FloatingService extends Service {
     private TextView dashboardClockView;
     private TextView dashboardReportsView;
     private TextView dashboardBenchmarkButton;
+    private TextView dashboardDispatchBenchmarkButton;
 
     private Runnable dashboardUpdateRunnable;
 
@@ -1413,6 +1414,22 @@ public class FloatingService extends Service {
         );
         root.addView(dashboardBenchmarkButton);
 
+        dashboardDispatchBenchmarkButton = createDialogButton(
+                "شروع تست دقت فاصله کلیک‌ها (۱۰۰ کلیک)",
+                Color.rgb(55, 115, 85)
+        );
+        LinearLayout.LayoutParams dispatchButtonParams =
+                new LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        dp(40)
+                );
+        dispatchButtonParams.setMargins(0, 0, 0, dp(7));
+        dashboardDispatchBenchmarkButton.setLayoutParams(dispatchButtonParams);
+        dashboardDispatchBenchmarkButton.setOnClickListener(v ->
+                onDispatchTimingBenchmarkButtonClicked()
+        );
+        root.addView(dashboardDispatchBenchmarkButton);
+
         ScrollView scrollView = new ScrollView(this);
         scrollView.setFillViewport(true);
 
@@ -1489,6 +1506,7 @@ public class FloatingService extends Service {
             dashboardErrorView = null;
             dashboardReportsView = null;
             dashboardBenchmarkButton = null;
+            dashboardDispatchBenchmarkButton = null;
         });
 
         try {
@@ -1720,6 +1738,22 @@ public class FloatingService extends Service {
 
         AutoClickService service = AutoClickService.getInstance();
 
+        if (service != null && service.isDispatchTimingBenchmarkRunning()) {
+            builder.insert(
+                    0,
+                    "تست دقت فاصله کلیک‌ها در حال اجراست؛ لطفاً تا پایان تست صبر کنید.\n\n"
+            );
+        } else if (service != null) {
+            AutoClickService.DispatchTimingBenchmarkResult dispatchResult =
+                    service.getLastDispatchTimingBenchmarkResult();
+            if (dispatchResult != null) {
+                builder.insert(
+                        0,
+                        formatDispatchTimingBenchmarkReport(dispatchResult) + "\n\n"
+                );
+            }
+        }
+
         if (service != null && service.isCallbackBenchmarkRunning()) {
             builder.insert(
                     0,
@@ -1756,6 +1790,224 @@ public class FloatingService extends Service {
                     )
             );
         }
+
+        if (dashboardDispatchBenchmarkButton != null) {
+            boolean dispatchRunning = service != null
+                    && service.isDispatchTimingBenchmarkRunning();
+            dashboardDispatchBenchmarkButton.setText(
+                    dispatchRunning
+                            ? "لغو تست دقت فاصله کلیک‌ها"
+                            : "شروع تست دقت فاصله کلیک‌ها (۱۰۰ کلیک)"
+            );
+            dashboardDispatchBenchmarkButton.setBackground(
+                    makeBackground(
+                            dispatchRunning
+                                    ? Color.rgb(170, 65, 45)
+                                    : Color.rgb(55, 115, 85),
+                            dp(7)
+                    )
+            );
+        }
+    }
+
+    private void onDispatchTimingBenchmarkButtonClicked() {
+
+        AutoClickService service = AutoClickService.getInstance();
+
+        if (service != null && service.isDispatchTimingBenchmarkRunning()) {
+            service.cancelDispatchTimingBenchmark();
+            updateCountdownStatus("درخواست لغو تست دقت فاصله کلیک‌ها ارسال شد");
+            updateDashboardReports();
+            return;
+        }
+
+        if (running || cycleActive) {
+            updateCountdownStatus(
+                    "برای اجرای تست، ابتدا اجرای چرخه‌ها را متوقف کنید"
+            );
+            return;
+        }
+
+        if (service == null || !service.isServiceReady()) {
+            updateCountdownStatus("سرویس دسترسی‌پذیری متصل یا آماده نیست");
+            return;
+        }
+
+        if (service.isGestureInProgress()
+                || service.isCallbackBenchmarkRunning()) {
+            updateCountdownStatus(
+                    "یک لمس یا تست دیگر در حال اجراست؛ ابتدا منتظر پایان آن بمانید"
+            );
+            return;
+        }
+
+        showDispatchTimingBenchmarkConfirmation();
+    }
+
+    private void showDispatchTimingBenchmarkConfirmation() {
+
+        Dialog dialog = new Dialog(
+                this,
+                android.R.style.Theme_Material_Dialog_Alert
+        );
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setPadding(dp(16), dp(14), dp(16), dp(12));
+        root.setBackground(makeBackground(Color.rgb(20, 30, 42), dp(12)));
+
+        TextView title = new TextView(this);
+        title.setText("تأیید تست دقت فاصله کلیک‌ها");
+        title.setTextColor(TITLE_COLOR);
+        title.setTextSize(16);
+        title.setTypeface(null, Typeface.BOLD);
+        title.setGravity(Gravity.CENTER);
+        title.setPadding(0, 0, 0, dp(10));
+        root.addView(title);
+
+        TextView message = new TextView(this);
+        message.setText(
+                "این آزمایش ۱۰۰ لمس واقعی در محل نشانگر قرمز انجام می‌دهد.\n\n"
+                        + "فاصله هدف بین زمان‌های ارسال لمس: ۵۰ میلی‌ثانیه.\n\n"
+                        + "گزارش شامل فاصله واقعی ارسال‌ها، خطای فاصله و تأخیر نسبت به زمان هدف است.\n\n"
+                        + "لطفاً نشانگر را روی قسمت بی‌خطر صفحه قرار دهید و مطمئن شوید اجرای چرخه‌ها متوقف است."
+        );
+        message.setTextColor(Color.WHITE);
+        message.setTextSize(13);
+        message.setGravity(Gravity.CENTER);
+        message.setPadding(0, 0, 0, dp(12));
+        root.addView(message);
+
+        LinearLayout buttons = new LinearLayout(this);
+        buttons.setOrientation(LinearLayout.HORIZONTAL);
+        buttons.setGravity(Gravity.CENTER);
+
+        TextView cancel = createDialogButton("انصراف", Color.rgb(80, 85, 95));
+        TextView confirm = createDialogButton("شروع آزمایش", Color.rgb(20, 125, 75));
+        buttons.addView(cancel);
+        buttons.addView(confirm);
+        root.addView(buttons);
+
+        dialog.setContentView(root);
+        dialog.setCancelable(true);
+
+        Window window = dialog.getWindow();
+        if (window != null) {
+            window.setType(getOverlayType());
+            window.setBackgroundDrawableResource(android.R.color.transparent);
+            WindowManager.LayoutParams params = window.getAttributes();
+            params.width = dp(310);
+            params.height = WindowManager.LayoutParams.WRAP_CONTENT;
+            params.gravity = Gravity.CENTER;
+            window.setAttributes(params);
+        }
+
+        cancel.setOnClickListener(v -> dialog.dismiss());
+        confirm.setOnClickListener(v -> {
+            dialog.dismiss();
+            startDispatchTimingBenchmarkNow();
+        });
+
+        try {
+            dialog.show();
+            if (window != null) {
+                window.setLayout(dp(310), WindowManager.LayoutParams.WRAP_CONTENT);
+            }
+        } catch (Exception e) {
+            updateCountdownStatus("نمایش تأییدیه تست زمان‌بندی ممکن نشد");
+        }
+    }
+
+    private void startDispatchTimingBenchmarkNow() {
+
+        if (running || cycleActive) {
+            updateCountdownStatus("اجرای چرخه فعال است؛ تست شروع نشد");
+            return;
+        }
+
+        AutoClickService service = AutoClickService.getInstance();
+        if (service == null || !service.isServiceReady()) {
+            updateCountdownStatus("سرویس دسترسی‌پذیری آماده نیست");
+            return;
+        }
+
+        if (service.isGestureInProgress()
+                || service.isCallbackBenchmarkRunning()
+                || service.isDispatchTimingBenchmarkRunning()) {
+            updateCountdownStatus("سرویس مشغول اجرای لمس یا تست دیگری است");
+            return;
+        }
+
+        updateTarget();
+        service.setTarget(targetX, targetY);
+
+        boolean started = service.startDispatchTimingBenchmark(
+                100,
+                50L,
+                result -> {
+                    setMarkerTouchable(true);
+                    updateCountdownStatus(
+                            result.cancelled
+                                    ? "تست دقت فاصله کلیک‌ها لغو شد"
+                                    : "تست دقت فاصله کلیک‌ها تکمیل شد"
+                    );
+                    updateLiveDashboard();
+                }
+        );
+
+        if (started) {
+            setMarkerTouchable(false);
+            updateCountdownStatus("تست دقت فاصله کلیک‌ها شروع شد؛ ۱۰۰ لمس در حال اجراست");
+        } else {
+            setMarkerTouchable(true);
+            updateCountdownStatus("شروع تست ممکن نشد؛ سرویس مشغول است یا شرایط تست برقرار نیست");
+        }
+
+        updateLiveDashboard();
+    }
+
+    private String formatDispatchTimingBenchmarkReport(
+            AutoClickService.DispatchTimingBenchmarkResult result
+    ) {
+        StringBuilder report = new StringBuilder();
+        report.append("گزارش تست دقت فاصله کلیک‌ها\n");
+        report.append("وضعیت: ")
+                .append(result.cancelled ? "لغو شده" : "تکمیل شده")
+                .append("\n");
+        report.append("تعداد درخواستی: ").append(result.requestedAttempts)
+                .append(" | تلاش‌شده: ").append(result.attemptedAttempts)
+                .append("\n");
+        report.append("ارسال پذیرفته‌شده: ").append(result.acceptedDispatches)
+                .append(" | Callback: ").append(result.callbacks).append("\n");
+        report.append("موفق: ").append(result.successfulCallbacks)
+                .append(" | لغوشده: ").append(result.cancelledCallbacks)
+                .append(" | ردشده: ").append(result.rejectedAttempts).append("\n");
+        report.append("فاصله هدف: ")
+                .append(String.format(Locale.US, "%.2f", result.requestedIntervalMs))
+                .append(" ms\n");
+        report.append("فاصله واقعی — حداقل: ")
+                .append(String.format(Locale.US, "%.2f", result.minActualIntervalMs))
+                .append(" | میانگین: ")
+                .append(String.format(Locale.US, "%.2f", result.averageActualIntervalMs))
+                .append(" ms\n");
+        report.append("میانه: ")
+                .append(String.format(Locale.US, "%.2f", result.medianActualIntervalMs))
+                .append(" | صدک ۹۵: ")
+                .append(String.format(Locale.US, "%.2f", result.p95ActualIntervalMs))
+                .append(" | حداکثر: ")
+                .append(String.format(Locale.US, "%.2f", result.maxActualIntervalMs))
+                .append(" ms\n");
+        report.append("میانگین خطای فاصله: ")
+                .append(String.format(Locale.US, "%.2f", result.averageIntervalErrorMs))
+                .append(" ms | صدک ۹۵ خطای مطلق: ")
+                .append(String.format(Locale.US, "%.2f", result.p95AbsoluteIntervalErrorMs))
+                .append(" ms\n");
+        report.append("میانگین تأخیر ارسال نسبت به هدف: ")
+                .append(String.format(Locale.US, "%.2f", result.averageDispatchLatenessMs))
+                .append(" ms | صدک ۹۵: ")
+                .append(String.format(Locale.US, "%.2f", result.p95DispatchLatenessMs))
+                .append(" ms");
+        return report.toString();
     }
 
     private void onCallbackBenchmarkButtonClicked() {
@@ -2216,9 +2468,10 @@ public class FloatingService extends Service {
                 AutoClickService.getInstance();
 
         if (currentAccessibility != null
-                && currentAccessibility.isCallbackBenchmarkRunning()) {
+                && (currentAccessibility.isCallbackBenchmarkRunning()
+                || currentAccessibility.isDispatchTimingBenchmarkRunning())) {
             updateCountdownStatus(
-                    "ابتدا تست Callback را تمام یا لغو کنید؛ سپس چرخه را شروع کنید"
+                    "ابتدا تست فعال را تمام یا لغو کنید؛ سپس چرخه را شروع کنید"
             );
             return;
         }
@@ -3073,7 +3326,8 @@ public class FloatingService extends Service {
         }
 
         if (activeService == null
-                || !activeService.isCallbackBenchmarkRunning()) {
+                || (!activeService.isCallbackBenchmarkRunning()
+                && !activeService.isDispatchTimingBenchmarkRunning())) {
             setMarkerTouchable(true);
         }
 
