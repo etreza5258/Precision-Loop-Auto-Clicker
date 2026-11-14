@@ -3058,9 +3058,7 @@ public class FloatingService extends Service {
         final long cycleStartNanos =
                 elapsedMsToNanos(cycleStartElapsedMs);
 
-        final long cycleDeadlineNanos =
-                elapsedMsToNanos(cycleDeadlineElapsedMs);
-
+        // cycleDeadlineNanos was calculated above and is reused here.
         final int acceptedCount = clickService.performClickBatchAtTarget(
                 (int) Math.min(clickCount, Integer.MAX_VALUE),
                 clickIntervalMs,
