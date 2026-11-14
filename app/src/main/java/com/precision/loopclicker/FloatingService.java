@@ -66,6 +66,11 @@ public class FloatingService extends Service {
 
     private static final long SERVICE_RETRY_MS = 250;
     private static final long GESTURE_RETRY_MS = 10;
+    /*
+     * زمان آماده‌سازی Gesture پیش از شروع واقعی چرخه.
+     * زمان اولین Stroke همچنان دقیقاً به cycleStartElapsedMs متصل می‌ماند.
+     */
+    private static final long PRE_DISPATCH_LEAD_MS = 40;
     private static final long DISPLAY_UPDATE_MS = 50;
     private static final long DASHBOARD_UPDATE_MS = 250;
 
@@ -2678,7 +2683,14 @@ public class FloatingService extends Service {
             }
         };
 
-        postAtElapsedTime(cycleStartRunnable, anchorElapsedMs);
+        long firstCyclePrepareTime = Math.max(
+                nowElapsed,
+                anchorElapsedMs > PRE_DISPATCH_LEAD_MS
+                        ? anchorElapsedMs - PRE_DISPATCH_LEAD_MS
+                        : anchorElapsedMs
+        );
+
+        postAtElapsedTime(cycleStartRunnable, firstCyclePrepareTime);
 
         updateCountdownStatus(
                 delayMs == 0
@@ -3042,10 +3054,18 @@ public class FloatingService extends Service {
          */
         final int[] acceptedCountHolder = new int[]{0};
 
-        final int acceptedCount = clickService.performClickBatch(
+        final long cycleStartNanos =
+                elapsedMsToNanos(cycleStartElapsedMs);
+
+        final long cycleDeadlineNanos =
+                elapsedMsToNanos(cycleDeadlineElapsedMs);
+
+        final int acceptedCount = clickService.performClickBatchAtTarget(
                 (int) Math.min(clickCount, Integer.MAX_VALUE),
                 clickIntervalMs,
-                deadlineElapsedMs,
+                cycleStartNanos,
+                cycleStartNanos,
+                cycleDeadlineNanos,
                 () -> handler.post(() -> {
 
                     if (!isCurrentRun(generation) || !cycleActive) {
@@ -3304,7 +3324,14 @@ public class FloatingService extends Service {
             }
         };
 
-        postAtElapsedTime(cycleStartRunnable, nextTarget);
+        long nextCyclePrepareTime = Math.max(
+                SystemClock.elapsedRealtime(),
+                nextTarget > PRE_DISPATCH_LEAD_MS
+                        ? nextTarget - PRE_DISPATCH_LEAD_MS
+                        : nextTarget
+        );
+
+        postAtElapsedTime(cycleStartRunnable, nextCyclePrepareTime);
 
         updateDisplay();
     }
