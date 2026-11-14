@@ -10,6 +10,10 @@ import android.os.SystemClock;
 import android.util.Log;
 import android.view.accessibility.AccessibilityEvent;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
 public class AutoClickService extends AccessibilityService {
 
     private static final String TAG = "PrecisionAutoClick";
@@ -66,6 +70,80 @@ public class AutoClickService extends AccessibilityService {
 
     private volatile String lastError = "هنوز کلیکی ارسال نشده";
 
+    // ---------------------------------------------------------
+    // Callback benchmark state (kept separate from normal counters)
+    // ---------------------------------------------------------
+
+    public interface CallbackBenchmarkListener {
+        void onBenchmarkFinished(CallbackBenchmarkResult result);
+    }
+
+    public static final class CallbackBenchmarkResult {
+        public final int requestedAttempts;
+        public final int attemptedAttempts;
+        public final int callbacks;
+        public final int successfulCallbacks;
+        public final int cancelledCallbacks;
+        public final int rejectedAttempts;
+        public final long minCallbackMs;
+        public final double averageCallbackMs;
+        public final long medianCallbackMs;
+        public final long p95CallbackMs;
+        public final long maxCallbackMs;
+        public final List<Long> samplesMs;
+        public final boolean cancelled;
+
+        private CallbackBenchmarkResult(
+                int requestedAttempts,
+                int attemptedAttempts,
+                int callbacks,
+                int successfulCallbacks,
+                int cancelledCallbacks,
+                int rejectedAttempts,
+                long minCallbackMs,
+                double averageCallbackMs,
+                long medianCallbackMs,
+                long p95CallbackMs,
+                long maxCallbackMs,
+                List<Long> samplesMs,
+                boolean cancelled
+        ) {
+            this.requestedAttempts = requestedAttempts;
+            this.attemptedAttempts = attemptedAttempts;
+            this.callbacks = callbacks;
+            this.successfulCallbacks = successfulCallbacks;
+            this.cancelledCallbacks = cancelledCallbacks;
+            this.rejectedAttempts = rejectedAttempts;
+            this.minCallbackMs = minCallbackMs;
+            this.averageCallbackMs = averageCallbackMs;
+            this.medianCallbackMs = medianCallbackMs;
+            this.p95CallbackMs = p95CallbackMs;
+            this.maxCallbackMs = maxCallbackMs;
+            this.samplesMs = Collections.unmodifiableList(
+                    new ArrayList<>(samplesMs)
+            );
+            this.cancelled = cancelled;
+        }
+    }
+
+    private volatile boolean callbackBenchmarkRunning = false;
+    private volatile boolean callbackBenchmarkCancelRequested = false;
+    private boolean activeBenchmarkAttempt = false;
+    private boolean benchmarkDispatchAccepted = false;
+    private int benchmarkRequested = 0;
+    private int benchmarkAttempted = 0;
+    private int benchmarkCallbacks = 0;
+    private int benchmarkSuccessful = 0;
+    private int benchmarkCancelled = 0;
+    private int benchmarkRejected = 0;
+    private long benchmarkIntervalAfterCallbackMs = 50L;
+    private long benchmarkAttemptStartNanos = 0L;
+    private long benchmarkGeneration = 0L;
+    private Runnable pendingBenchmarkStep;
+    private CallbackBenchmarkListener benchmarkListener;
+    private final ArrayList<Long> benchmarkSamplesMs = new ArrayList<>();
+    private volatile CallbackBenchmarkResult lastCallbackBenchmarkResult;
+
     public static AutoClickService getInstance() {
         AutoClickService service = instance;
 
@@ -94,6 +172,7 @@ public class AutoClickService extends AccessibilityService {
     @Override
     public void onInterrupt() {
         cancelPendingScheduledClick();
+        cancelCallbackBenchmark();
 
         handler.post(() -> {
             if (gestureInProgress) {
@@ -109,6 +188,7 @@ public class AutoClickService extends AccessibilityService {
     @Override
     public void onDestroy() {
         cancelPendingScheduledClick();
+        cancelCallbackBenchmark();
         serviceReady = false;
 
         Runnable cleanup = () -> {
@@ -167,6 +247,243 @@ public class AutoClickService extends AccessibilityService {
 
     public long getSuccessfulClicks() {
         return successfulClicks;
+    }
+
+    public boolean isCallbackBenchmarkRunning() {
+        return callbackBenchmarkRunning;
+    }
+
+    public CallbackBenchmarkResult getLastCallbackBenchmarkResult() {
+        return lastCallbackBenchmarkResult;
+    }
+
+    /**
+     * Runs real accessibility taps at the currently configured target.
+     * Minimum interval is 50 ms and maximum attempts is 5000.
+     */
+    public boolean startCallbackBenchmark(
+            int requestedAttempts,
+            long intervalAfterCallbackMs,
+            CallbackBenchmarkListener listener
+    ) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            handler.post(() -> startCallbackBenchmark(
+                    requestedAttempts,
+                    intervalAfterCallbackMs,
+                    listener
+            ));
+            return true;
+        }
+
+        if (!serviceReady || callbackBenchmarkRunning
+                || gestureInProgress || pendingScheduledClick != null
+                || requestedAttempts < 1 || requestedAttempts > 5000
+                || intervalAfterCallbackMs < 50L) {
+            return false;
+        }
+
+        callbackBenchmarkRunning = true;
+        callbackBenchmarkCancelRequested = false;
+        benchmarkRequested = requestedAttempts;
+        benchmarkAttempted = 0;
+        benchmarkCallbacks = 0;
+        benchmarkSuccessful = 0;
+        benchmarkCancelled = 0;
+        benchmarkRejected = 0;
+        benchmarkIntervalAfterCallbackMs = intervalAfterCallbackMs;
+        benchmarkListener = listener;
+        benchmarkSamplesMs.clear();
+        lastCallbackBenchmarkResult = null;
+
+        final long generation = ++benchmarkGeneration;
+        pendingBenchmarkStep = () -> runCallbackBenchmarkAttempt(generation);
+        handler.post(pendingBenchmarkStep);
+        return true;
+    }
+
+    public void cancelCallbackBenchmark() {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            handler.post(this::cancelCallbackBenchmark);
+            return;
+        }
+
+        if (!callbackBenchmarkRunning) {
+            return;
+        }
+
+        callbackBenchmarkCancelRequested = true;
+        benchmarkGeneration++;
+
+        if (pendingBenchmarkStep != null) {
+            handler.removeCallbacks(pendingBenchmarkStep);
+            pendingBenchmarkStep = null;
+        }
+
+        // If a test gesture is in flight, wait for its Android callback.
+        // No new benchmark tap will be scheduled after that callback.
+        if (!activeBenchmarkAttempt) {
+            finishCallbackBenchmark(true);
+        }
+    }
+
+    private void runCallbackBenchmarkAttempt(long generation) {
+        pendingBenchmarkStep = null;
+
+        if (!callbackBenchmarkRunning
+                || callbackBenchmarkCancelRequested
+                || generation != benchmarkGeneration) {
+            if (callbackBenchmarkRunning && callbackBenchmarkCancelRequested
+                    && !activeBenchmarkAttempt) {
+                finishCallbackBenchmark(true);
+            }
+            return;
+        }
+
+        if (!serviceReady || gestureInProgress || pendingScheduledClick != null) {
+            benchmarkRejected++;
+            finishCallbackBenchmark(false);
+            return;
+        }
+
+        if (benchmarkAttempted >= benchmarkRequested) {
+            finishCallbackBenchmark(false);
+            return;
+        }
+
+        benchmarkAttempted++;
+        benchmarkAttemptStartNanos = SystemClock.elapsedRealtimeNanos();
+        activeBenchmarkAttempt = true;
+        benchmarkDispatchAccepted = false;
+
+        final int attemptNumber = benchmarkAttempted;
+        int dispatched = performClickBatch(1, 0L, () -> {
+            // A synchronous completion before dispatchGesture accepted the
+            // request means this attempt was rejected before a callback.
+            if (!benchmarkDispatchAccepted && activeBenchmarkAttempt) {
+                activeBenchmarkAttempt = false;
+                benchmarkRejected++;
+                scheduleNextBenchmarkAttempt(generation);
+            }
+        });
+
+        benchmarkDispatchAccepted = dispatched > 0;
+
+        // Defensive fallback for an early return that did not invoke completion.
+        if (dispatched <= 0 && activeBenchmarkAttempt && !gestureInProgress) {
+            activeBenchmarkAttempt = false;
+            benchmarkRejected++;
+            scheduleNextBenchmarkAttempt(generation);
+        }
+
+        Log.d(TAG, "Callback benchmark attempt " + attemptNumber
+                + " dispatched=" + dispatched);
+    }
+
+    private void onBenchmarkGestureFinished(boolean success, long latencyNanos) {
+        if (!activeBenchmarkAttempt) {
+            return;
+        }
+
+        activeBenchmarkAttempt = false;
+        benchmarkCallbacks++;
+
+        long elapsedMs = Math.max(0L, latencyNanos / NANOS_PER_MS);
+        benchmarkSamplesMs.add(elapsedMs);
+
+        if (success) {
+            benchmarkSuccessful++;
+        } else {
+            benchmarkCancelled++;
+        }
+
+        scheduleNextBenchmarkAttempt(benchmarkGeneration);
+    }
+
+    private void scheduleNextBenchmarkAttempt(long generation) {
+        if (!callbackBenchmarkRunning) {
+            return;
+        }
+
+        if (callbackBenchmarkCancelRequested
+                || benchmarkAttempted >= benchmarkRequested) {
+            finishCallbackBenchmark(callbackBenchmarkCancelRequested);
+            return;
+        }
+
+        pendingBenchmarkStep = () -> runCallbackBenchmarkAttempt(generation);
+        handler.postDelayed(
+                pendingBenchmarkStep,
+                benchmarkIntervalAfterCallbackMs
+        );
+    }
+
+    private void finishCallbackBenchmark(boolean cancelled) {
+        if (!callbackBenchmarkRunning) {
+            return;
+        }
+
+        callbackBenchmarkRunning = false;
+        callbackBenchmarkCancelRequested = false;
+        activeBenchmarkAttempt = false;
+
+        if (pendingBenchmarkStep != null) {
+            handler.removeCallbacks(pendingBenchmarkStep);
+            pendingBenchmarkStep = null;
+        }
+
+        ArrayList<Long> sorted = new ArrayList<>(benchmarkSamplesMs);
+        Collections.sort(sorted);
+
+        long min = 0L;
+        long median = 0L;
+        long p95 = 0L;
+        long max = 0L;
+        double average = 0.0;
+
+        if (!sorted.isEmpty()) {
+            min = sorted.get(0);
+            max = sorted.get(sorted.size() - 1);
+            long sum = 0L;
+            for (Long sample : sorted) {
+                sum += sample;
+            }
+            average = (double) sum / sorted.size();
+            int size = sorted.size();
+            median = (size % 2 == 1)
+                    ? sorted.get(size / 2)
+                    : (sorted.get(size / 2 - 1) + sorted.get(size / 2)) / 2L;
+            int p95Index = Math.max(0,
+                    (int) Math.ceil(size * 0.95) - 1);
+            p95 = sorted.get(p95Index);
+        }
+
+        CallbackBenchmarkResult result = new CallbackBenchmarkResult(
+                benchmarkRequested,
+                benchmarkAttempted,
+                benchmarkCallbacks,
+                benchmarkSuccessful,
+                benchmarkCancelled,
+                benchmarkRejected,
+                min,
+                average,
+                median,
+                p95,
+                max,
+                benchmarkSamplesMs,
+                cancelled
+        );
+
+        lastCallbackBenchmarkResult = result;
+        CallbackBenchmarkListener listener = benchmarkListener;
+        benchmarkListener = null;
+
+        if (listener != null) {
+            try {
+                listener.onBenchmarkFinished(result);
+            } catch (Exception e) {
+                Log.e(TAG, "Benchmark listener failed", e);
+            }
+        }
     }
 
     public long getFailedClicks() {
@@ -339,6 +656,12 @@ public class AutoClickService extends AccessibilityService {
 
         if (!serviceReady) {
             lastError = "سرویس دسترسی‌پذیری آماده نیست";
+            completeSafely(completion);
+            return 0;
+        }
+
+        if (callbackBenchmarkRunning && !activeBenchmarkAttempt) {
+            lastError = "تست Callback در حال اجراست";
             completeSafely(completion);
             return 0;
         }
@@ -606,6 +929,12 @@ public class AutoClickService extends AccessibilityService {
 
         if (!serviceReady) {
             lastError = "سرویس دسترسی‌پذیری آماده نیست";
+            completeSafely(completion);
+            return false;
+        }
+
+        if (callbackBenchmarkRunning) {
+            lastError = "تست Callback در حال اجراست";
             completeSafely(completion);
             return false;
         }
@@ -919,6 +1248,30 @@ public class AutoClickService extends AccessibilityService {
         );
 
         int completedBatchCount = activeBatchClickCount;
+
+        if (activeBenchmarkAttempt) {
+            // Benchmark measurements are deliberately isolated from normal
+            // click totals and normal gesture-latency aggregates.
+            gestureInProgress = false;
+            activeBatchClickCount = 0;
+            activeBatchIntervalMs = 0L;
+            activeIsScheduledSingleClick = false;
+            activeScheduledTargetNanos = 0L;
+
+            Runnable benchmarkCompletion = activeCompletion;
+            activeCompletion = null;
+
+            if (benchmarkDispatchAccepted) {
+                onBenchmarkGestureFinished(success, latency);
+            } else {
+                activeBenchmarkAttempt = false;
+                benchmarkRejected++;
+                scheduleNextBenchmarkAttempt(benchmarkGeneration);
+            }
+
+            completeSafely(benchmarkCompletion);
+            return;
+        }
 
         if (success) {
             successfulClicks += completedBatchCount;
