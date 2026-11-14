@@ -154,6 +154,8 @@ public class AutoClickService extends AccessibilityService {
         public final double averageDispatchLatenessMs;
         public final double p95DispatchLatenessMs;
         public final boolean cancelled;
+        public final String cancellationReason;
+        public final int interruptions;
 
         private DispatchTimingBenchmarkResult(
                 int requestedAttempts,
@@ -173,7 +175,9 @@ public class AutoClickService extends AccessibilityService {
                 double p95AbsoluteIntervalErrorMs,
                 double averageDispatchLatenessMs,
                 double p95DispatchLatenessMs,
-                boolean cancelled
+                boolean cancelled,
+                String cancellationReason,
+                int interruptions
         ) {
             this.requestedAttempts = requestedAttempts;
             this.attemptedAttempts = attemptedAttempts;
@@ -193,6 +197,8 @@ public class AutoClickService extends AccessibilityService {
             this.averageDispatchLatenessMs = averageDispatchLatenessMs;
             this.p95DispatchLatenessMs = p95DispatchLatenessMs;
             this.cancelled = cancelled;
+            this.cancellationReason = cancellationReason;
+            this.interruptions = interruptions;
         }
     }
 
@@ -207,6 +213,8 @@ public class AutoClickService extends AccessibilityService {
     private int timingBenchmarkSuccessful = 0;
     private int timingBenchmarkCancelled = 0;
     private int timingBenchmarkRejected = 0;
+    private int timingBenchmarkInterruptions = 0;
+    private String timingBenchmarkCancellationReason = "";
     private long timingBenchmarkIntervalNanos = 50L * NANOS_PER_MS;
     private long timingBenchmarkStartNanos = 0L;
     private long timingBenchmarkTargetNanos = 0L;
@@ -267,10 +275,21 @@ public class AutoClickService extends AccessibilityService {
     public void onInterrupt() {
         cancelPendingScheduledClick();
         cancelCallbackBenchmark();
-        cancelDispatchTimingBenchmark();
 
+        // Android may call onInterrupt() without destroying this service.
+        // Do not cancel the dispatch-timing benchmark here. In particular,
+        // do not mark its active gesture finished before Android delivers the
+        // real GestureResultCallback; doing so could allow overlapping taps.
         handler.post(() -> {
-            if (gestureInProgress) {
+            if (dispatchTimingBenchmarkRunning) {
+                timingBenchmarkInterruptions++;
+                Log.w(TAG, "Accessibility onInterrupt during dispatch timing benchmark; "
+                        + "waiting for the active gesture callback");
+            }
+
+            if (gestureInProgress
+                    && !activeTimingBenchmarkAttempt
+                    && !activeBenchmarkAttempt) {
                 finishGesture(
                         activeGestureId,
                         false,
@@ -284,7 +303,7 @@ public class AutoClickService extends AccessibilityService {
     public void onDestroy() {
         cancelPendingScheduledClick();
         cancelCallbackBenchmark();
-        cancelDispatchTimingBenchmark();
+        cancelDispatchTimingBenchmark("سرویس دسترس‌پذیری بسته شد");
         serviceReady = false;
 
         Runnable cleanup = () -> {
@@ -403,6 +422,8 @@ public class AutoClickService extends AccessibilityService {
         timingBenchmarkSuccessful = 0;
         timingBenchmarkCancelled = 0;
         timingBenchmarkRejected = 0;
+        timingBenchmarkInterruptions = 0;
+        timingBenchmarkCancellationReason = "";
 
         timingBenchmarkIntervalNanos =
                 requestedIntervalMs * NANOS_PER_MS;
@@ -427,8 +448,12 @@ public class AutoClickService extends AccessibilityService {
     }
 
     public void cancelDispatchTimingBenchmark() {
+        cancelDispatchTimingBenchmark("لغو به درخواست کاربر");
+    }
+
+    private void cancelDispatchTimingBenchmark(String reason) {
         if (Looper.myLooper() != Looper.getMainLooper()) {
-            handler.post(this::cancelDispatchTimingBenchmark);
+            handler.post(() -> cancelDispatchTimingBenchmark(reason));
             return;
         }
 
@@ -436,6 +461,9 @@ public class AutoClickService extends AccessibilityService {
             return;
         }
 
+        if (timingBenchmarkCancellationReason.isEmpty()) {
+            timingBenchmarkCancellationReason = reason;
+        }
         dispatchTimingBenchmarkCancelRequested = true;
         timingBenchmarkGeneration++;
 
@@ -630,10 +658,22 @@ public class AutoClickService extends AccessibilityService {
                         absoluteErrors[3],
                         lateness[1],
                         lateness[3],
-                        cancelled
+                        cancelled,
+                        cancelled ? timingBenchmarkCancellationReason : "",
+                        timingBenchmarkInterruptions
                 );
 
         lastDispatchTimingBenchmarkResult = result;
+        if (cancelled) {
+            Log.w(TAG, "Dispatch timing benchmark cancelled: "
+                    + result.cancellationReason
+                    + " | interruptions=" + result.interruptions
+                    + " | attempted=" + result.attemptedAttempts
+                    + " | callbacks=" + result.callbacks);
+        } else if (result.interruptions > 0) {
+            Log.i(TAG, "Dispatch timing benchmark completed with interruptions="
+                    + result.interruptions);
+        }
         DispatchTimingBenchmarkListener listener = timingBenchmarkListener;
         timingBenchmarkListener = null;
 
