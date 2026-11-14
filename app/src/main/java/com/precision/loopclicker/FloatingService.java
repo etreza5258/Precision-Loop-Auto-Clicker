@@ -409,6 +409,7 @@ public class FloatingService extends Service {
     private TextView dashboardErrorView;
     private TextView dashboardClockView;
     private TextView dashboardReportsView;
+    private TextView dashboardBenchmarkButton;
 
     private Runnable dashboardUpdateRunnable;
 
@@ -1389,12 +1390,28 @@ public class FloatingService extends Service {
         root.addView(dashboardErrorView);
 
         TextView reportsTitle = new TextView(this);
-        reportsTitle.setText("گزارش چرخه‌های تکمیل‌شده");
+        reportsTitle.setText("گزارش چرخه‌ها و تست Callback");
         reportsTitle.setTextColor(TITLE_COLOR);
         reportsTitle.setTextSize(14);
         reportsTitle.setTypeface(null, Typeface.BOLD);
         reportsTitle.setPadding(0, dp(10), 0, dp(6));
         root.addView(reportsTitle);
+
+        dashboardBenchmarkButton = createDialogButton(
+                "شروع تست Callback (۱۰۰ کلیک واقعی)",
+                Color.rgb(25, 105, 145)
+        );
+        LinearLayout.LayoutParams benchmarkButtonParams =
+                new LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        dp(40)
+                );
+        benchmarkButtonParams.setMargins(0, 0, 0, dp(7));
+        dashboardBenchmarkButton.setLayoutParams(benchmarkButtonParams);
+        dashboardBenchmarkButton.setOnClickListener(v ->
+                onCallbackBenchmarkButtonClicked()
+        );
+        root.addView(dashboardBenchmarkButton);
 
         ScrollView scrollView = new ScrollView(this);
         scrollView.setFillViewport(true);
@@ -1471,6 +1488,7 @@ public class FloatingService extends Service {
             dashboardClockView = null;
             dashboardErrorView = null;
             dashboardReportsView = null;
+            dashboardBenchmarkButton = null;
         });
 
         try {
@@ -1700,7 +1718,255 @@ public class FloatingService extends Service {
             );
         }
 
+        AutoClickService service = AutoClickService.getInstance();
+
+        if (service != null && service.isCallbackBenchmarkRunning()) {
+            builder.insert(
+                    0,
+                    "تست Callback در حال اجراست؛ لطفاً تا پایان تست صبر کنید.\n\n"
+            );
+        } else if (service != null) {
+            AutoClickService.CallbackBenchmarkResult result =
+                    service.getLastCallbackBenchmarkResult();
+
+            if (result != null) {
+                builder.insert(
+                        0,
+                        formatCallbackBenchmarkReport(result) + "\n\n"
+                );
+            }
+        }
+
         dashboardReportsView.setText(builder.toString());
+
+        if (dashboardBenchmarkButton != null) {
+            boolean benchmarkRunning = service != null
+                    && service.isCallbackBenchmarkRunning();
+            dashboardBenchmarkButton.setText(
+                    benchmarkRunning
+                            ? "لغو تست Callback"
+                            : "شروع تست Callback (۱۰۰ کلیک واقعی)"
+            );
+            dashboardBenchmarkButton.setBackground(
+                    makeBackground(
+                            benchmarkRunning
+                                    ? Color.rgb(170, 65, 45)
+                                    : Color.rgb(25, 105, 145),
+                            dp(7)
+                    )
+            );
+        }
+    }
+
+    private void onCallbackBenchmarkButtonClicked() {
+
+        AutoClickService service = AutoClickService.getInstance();
+
+        if (service != null && service.isCallbackBenchmarkRunning()) {
+            service.cancelCallbackBenchmark();
+            updateCountdownStatus("درخواست لغو تست Callback ارسال شد");
+            updateDashboardReports();
+            return;
+        }
+
+        if (running || cycleActive) {
+            updateCountdownStatus(
+                    "برای اجرای تست Callback ابتدا اجرای چرخه‌ها را متوقف کنید"
+            );
+            return;
+        }
+
+        if (service == null || !service.isServiceReady()) {
+            updateCountdownStatus(
+                    "سرویس دسترسی‌پذیری متصل یا آماده نیست"
+            );
+            return;
+        }
+
+        if (service.isGestureInProgress()) {
+            updateCountdownStatus(
+                    "یک لمس در حال انجام است؛ چند لحظه بعد دوباره تلاش کنید"
+            );
+            return;
+        }
+
+        showCallbackBenchmarkConfirmation();
+    }
+
+    private void showCallbackBenchmarkConfirmation() {
+
+        Dialog dialog = new Dialog(
+                this,
+                android.R.style.Theme_Material_Dialog_Alert
+        );
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setPadding(dp(16), dp(14), dp(16), dp(12));
+        root.setBackground(makeBackground(Color.rgb(20, 30, 42), dp(12)));
+
+        TextView title = new TextView(this);
+        title.setText("تأیید اجرای تست Callback");
+        title.setTextColor(TITLE_COLOR);
+        title.setTextSize(16);
+        title.setTypeface(null, Typeface.BOLD);
+        title.setGravity(Gravity.CENTER);
+        title.setPadding(0, 0, 0, dp(10));
+        root.addView(title);
+
+        TextView message = new TextView(this);
+        message.setText(
+                "این آزمایش ۱۰۰ لمس واقعی در محل نشانگر قرمز انجام می‌دهد.\n\n"
+                        + "فاصله بین لمس‌ها: ۵۰ میلی‌ثانیه پس از دریافت هر Callback.\n\n"
+                        + "لطفاً نشانگر را روی قسمت بی‌خطر صفحه قرار دهید و مطمئن شوید اجرای چرخه‌ها متوقف است."
+        );
+        message.setTextColor(Color.WHITE);
+        message.setTextSize(13);
+        message.setGravity(Gravity.CENTER);
+        message.setPadding(0, 0, 0, dp(12));
+        root.addView(message);
+
+        LinearLayout buttons = new LinearLayout(this);
+        buttons.setOrientation(LinearLayout.HORIZONTAL);
+        buttons.setGravity(Gravity.CENTER);
+
+        TextView cancel = createDialogButton(
+                "انصراف",
+                Color.rgb(80, 85, 95)
+        );
+        TextView confirm = createDialogButton(
+                "شروع آزمایش",
+                Color.rgb(20, 125, 75)
+        );
+        buttons.addView(cancel);
+        buttons.addView(confirm);
+        root.addView(buttons);
+
+        dialog.setContentView(root);
+        dialog.setCancelable(true);
+
+        Window window = dialog.getWindow();
+        if (window != null) {
+            window.setType(getOverlayType());
+            window.setBackgroundDrawableResource(android.R.color.transparent);
+            WindowManager.LayoutParams params = window.getAttributes();
+            params.width = dp(310);
+            params.height = WindowManager.LayoutParams.WRAP_CONTENT;
+            params.gravity = Gravity.CENTER;
+            window.setAttributes(params);
+        }
+
+        cancel.setOnClickListener(v -> dialog.dismiss());
+        confirm.setOnClickListener(v -> {
+            dialog.dismiss();
+            startCallbackBenchmarkNow();
+        });
+
+        try {
+            dialog.show();
+            if (window != null) {
+                window.setLayout(
+                        dp(310),
+                        WindowManager.LayoutParams.WRAP_CONTENT
+                );
+            }
+        } catch (Exception e) {
+            updateCountdownStatus("نمایش تأییدیه تست Callback ممکن نشد");
+        }
+    }
+
+    private void startCallbackBenchmarkNow() {
+
+        if (running || cycleActive) {
+            updateCountdownStatus(
+                    "اجرای چرخه فعال است؛ تست Callback شروع نشد"
+            );
+            return;
+        }
+
+        AutoClickService service = AutoClickService.getInstance();
+        if (service == null || !service.isServiceReady()) {
+            updateCountdownStatus("سرویس دسترسی‌پذیری آماده نیست");
+            return;
+        }
+
+        if (service.isGestureInProgress()) {
+            updateCountdownStatus("یک لمس دیگر هنوز تکمیل نشده است");
+            return;
+        }
+
+        updateTarget();
+        service.setTarget(targetX, targetY);
+
+        boolean started = service.startCallbackBenchmark(
+                100,
+                50L,
+                result -> {
+                    setMarkerTouchable(true);
+                    updateCountdownStatus(
+                            result.cancelled
+                                    ? "تست Callback لغو شد"
+                                    : "تست Callback تکمیل شد"
+                    );
+                    updateLiveDashboard();
+                }
+        );
+
+        if (started) {
+            setMarkerTouchable(false);
+            updateCountdownStatus("تست Callback شروع شد؛ ۱۰۰ لمس واقعی در حال اجراست");
+        } else {
+            setMarkerTouchable(true);
+            updateCountdownStatus(
+                    "شروع تست ممکن نشد؛ سرویس مشغول است یا شرایط تست برقرار نیست"
+            );
+        }
+
+        updateLiveDashboard();
+    }
+
+    private String formatCallbackBenchmarkReport(
+            AutoClickService.CallbackBenchmarkResult result
+    ) {
+
+        StringBuilder report = new StringBuilder();
+        report.append("گزارش آخرین تست Callback\n");
+        report.append("وضعیت: ")
+                .append(result.cancelled ? "لغو شده" : "تکمیل شده")
+                .append("\n");
+        report.append("تعداد درخواستی: ")
+                .append(result.requestedAttempts)
+                .append(" | تلاش‌شده: ")
+                .append(result.attemptedAttempts)
+                .append("\n");
+        report.append("Callback دریافت‌شده: ")
+                .append(result.callbacks)
+                .append(" | موفق: ")
+                .append(result.successfulCallbacks)
+                .append("\n");
+        report.append("لغوشده: ")
+                .append(result.cancelledCallbacks)
+                .append(" | ردشده: ")
+                .append(result.rejectedAttempts)
+                .append("\n");
+
+        if (result.callbacks > 0) {
+            report.append("حداقل: ")
+                    .append(result.minCallbackMs).append(" ms")
+                    .append(" | میانگین: ")
+                    .append(String.format(Locale.US, "%.2f", result.averageCallbackMs))
+                    .append(" ms\n");
+            report.append("میانه: ")
+                    .append(result.medianCallbackMs).append(" ms")
+                    .append(" | صدک ۹۵: ")
+                    .append(result.p95CallbackMs).append(" ms")
+                    .append(" | حداکثر: ")
+                    .append(result.maxCallbackMs).append(" ms");
+        } else {
+            report.append("نمونه Callback معتبری برای محاسبه زمان ثبت نشد.");
+        }
+
+        return report.toString();
     }
 
     private void addLiveError(String error) {
@@ -1945,6 +2211,17 @@ public class FloatingService extends Service {
     // ---------------------------------------------------------
 
     private void startLoop(Intent config) {
+
+        AutoClickService currentAccessibility =
+                AutoClickService.getInstance();
+
+        if (currentAccessibility != null
+                && currentAccessibility.isCallbackBenchmarkRunning()) {
+            updateCountdownStatus(
+                    "ابتدا تست Callback را تمام یا لغو کنید؛ سپس چرخه را شروع کنید"
+            );
+            return;
+        }
 
         stopLoop();
 
@@ -2795,7 +3072,10 @@ public class FloatingService extends Service {
             activeService.cancelPendingScheduledClick();
         }
 
-        setMarkerTouchable(true);
+        if (activeService == null
+                || !activeService.isCallbackBenchmarkRunning()) {
+            setMarkerTouchable(true);
+        }
 
         if (countdownStatusView != null) {
             updateCountdownStatus("متوقف شد");
