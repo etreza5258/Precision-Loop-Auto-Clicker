@@ -21,8 +21,17 @@ public class AutoClickService extends AccessibilityService {
     private static final long TAP_DURATION_MS = 1L;
     private static final long MIN_SEQUENTIAL_INTERVAL_MS = 1L;
     private static final long NANOS_PER_MS = 1_000_000L;
+    /*
+     * Calibration from the user's 100-click test:
+     * dispatch-to-touch latency: min 21ms, mean 50ms, p95 65ms, max 74ms.
+     * Keep a small guard below the observed minimum so the first touch is
+     * not intentionally scheduled before the cycle start. Reserve the
+     * observed maximum plus an extra margin at the cycle deadline.
+     */
+    private static final long MIN_SAFE_DISPATCH_LATENCY_MS = 18L;
+    private static final long MAX_OBSERVED_DISPATCH_LATENCY_MS = 74L;
     private static final long CYCLE_DEADLINE_SAFETY_NANOS =
-            20L * NANOS_PER_MS;
+            (MAX_OBSERVED_DISPATCH_LATENCY_MS + 5L) * NANOS_PER_MS;
 
     private static final long MAX_ADAPTIVE_LEAD_NANOS = 5_000_000L;
     private static final long MIN_ADAPTIVE_LEAD_NANOS = 0L;
@@ -1218,11 +1227,29 @@ public class AutoClickService extends AccessibilityService {
         final long intervalNanos = effectiveInterval * NANOS_PER_MS;
         final long nowNanos = SystemClock.elapsedRealtimeNanos();
 
-        final long firstStrokeOffsetNanos =
-                firstTargetElapsedRealtimeNanos > 0L
-                        && firstTargetElapsedRealtimeNanos > nowNanos
-                        ? firstTargetElapsedRealtimeNanos - nowNanos
-                        : 0L;
+        /*
+         * Submit the Gesture early, but do not blindly use the whole
+         * pre-dispatch lead as a stroke offset. The measured Android
+         * dispatch-to-touch delay already contributes to the real start.
+         * Subtract a conservative lower-bound guard (18ms) from the time
+         * remaining to the target. This reduces average lateness while
+         * avoiding an intentional start before the cycle boundary, based
+         * on the user's observed minimum delay of 21ms.
+         */
+        final long firstStrokeOffsetNanos;
+        if (firstTargetElapsedRealtimeNanos > 0L
+                && firstTargetElapsedRealtimeNanos > nowNanos) {
+            long remainingToTarget =
+                    firstTargetElapsedRealtimeNanos - nowNanos;
+            long safeLatencyGuardNanos =
+                    MIN_SAFE_DISPATCH_LATENCY_MS * NANOS_PER_MS;
+            firstStrokeOffsetNanos = Math.max(
+                    0L,
+                    remainingToTarget - safeLatencyGuardNanos
+            );
+        } else {
+            firstStrokeOffsetNanos = 0L;
+        }
 
         final long firstStrokeOffsetMs =
                 firstStrokeOffsetNanos == 0L
@@ -1425,6 +1452,9 @@ public class AutoClickService extends AccessibilityService {
                         + " | count=" + batchCount
                         + " | interval=" + effectiveInterval
                         + " | firstOffsetMs=" + firstStrokeOffsetMs
+                        + " | minLatencyGuardMs=" + MIN_SAFE_DISPATCH_LATENCY_MS
+                        + " | deadlineGuardMs="
+                        + (CYCLE_DEADLINE_SAFETY_NANOS / NANOS_PER_MS)
                         + " | x=" + clickX
                         + " | y=" + clickY
         );
