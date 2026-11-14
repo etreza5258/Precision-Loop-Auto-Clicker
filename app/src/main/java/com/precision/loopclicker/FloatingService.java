@@ -1,3 +1,4 @@
+
 package com.precision.loopclicker;
 
 import android.app.Dialog;
@@ -66,12 +67,9 @@ public class FloatingService extends Service {
 
     private static final long SERVICE_RETRY_MS = 250;
     private static final long GESTURE_RETRY_MS = 10;
-    /*
-     * Gesture حدود ۴۵ میلی‌ثانیه پیش از شروع چرخه ارسال می‌شود.
-     * جبران تأخیر شروع Stroke در AutoClickService با توجه به حداقل
-     * تأخیر اندازه‌گیری‌شده انجام می‌شود تا لمس عمداً قبل از چرخه نباشد.
-     */
-    private static final long PRE_DISPATCH_LEAD_MS = 45;
+    // Gesture را کمی پیش از شروع چرخه به اندروید می‌سپاریم تا تأخیر ارسال
+    // در زمان هدف کلیک‌ها جمع نشود؛ خود Stroke با offset محافظت‌شده شروع می‌شود.
+    private static final long CYCLE_PRE_DISPATCH_MS = 50L;
     private static final long DISPLAY_UPDATE_MS = 50;
     private static final long DASHBOARD_UPDATE_MS = 250;
 
@@ -159,11 +157,13 @@ public class FloatingService extends Service {
     private long lastBatchCount;
     private long cycleStartWallMs;
 
+    // تا وقتی سرویس دسترسی‌پذیری آماده نشده، آمار چرخه فقط یک‌بار reset می‌شود.
     private boolean cycleServicePrepared;
 
     private long clickCount;
     private long clickNumber;
 
+    // شماره جایگاه کلیک بعدی در چرخه؛ هر جایگاه فقط یک‌بار بررسی می‌شود.
     private long nextClickIndex;
 
     private boolean cycleYellow;
@@ -221,6 +221,12 @@ public class FloatingService extends Service {
                 return;
             }
 
+            /*
+             * اگر MainActivity مرجع جدید اینترنت را فرستاده باشد،
+             * همان مرجع را دریافت و ذخیره می‌کنیم.
+             *
+             * هر دو مقدار باید متعلق به یک لحظه همگام‌سازی باشند.
+             */
             boolean hasInternetAnchor =
                     intent.hasExtra("internet_epoch_at_sync_ms")
                             && intent.hasExtra("internet_elapsed_at_sync_ms");
@@ -260,6 +266,10 @@ public class FloatingService extends Service {
                 }
             }
 
+            /*
+             * تغییر منبع فقط روی نمایش ساعت و انتخاب‌گر اثر دارد.
+             * anchorElapsedMs و زمان‌بندی چرخه جاری تغییر نمی‌کنند.
+             */
             clockSource = newSource;
 
             getSharedPreferences(
@@ -324,6 +334,12 @@ public class FloatingService extends Service {
         clockSourceReceiverRegistered = false;
     }
 
+    /*
+     * منبع ساعت و مرجع اینترنتی ذخیره‌شده را بازیابی می‌کند.
+     *
+     * اگر مرجع اینترنتی معتبر باشد، زمان فعلی اینترنت از آن
+     * و elapsedRealtime محاسبه خواهد شد.
+     */
     private void loadSavedClockSource() {
 
         try {
@@ -370,6 +386,17 @@ public class FloatingService extends Service {
         }
     }
 
+    /*
+     * ساعت فعلی بر اساس منبع انتخاب‌شده.
+     *
+     * در حالت اینترنتی، فقط از مرجع اینترنتی و elapsedRealtime
+     * استفاده می‌شود.
+     *
+     * اگر مرجع اینترنتی موجود نباشد، صفر برمی‌گرداند تا ساعت گوشی
+     * به‌اشتباه به‌عنوان ساعت اینترنتی نمایش داده نشود.
+     *
+     * این تابع هیچ درخواست شبکه‌ای انجام نمی‌دهد.
+     */
     private long getCurrentClockEpochMs() {
 
         if (CLOCK_INTERNET.equals(clockSource)) {
@@ -415,8 +442,6 @@ public class FloatingService extends Service {
     private TextView dashboardErrorView;
     private TextView dashboardClockView;
     private TextView dashboardReportsView;
-    private TextView dashboardBenchmarkButton;
-    private TextView dashboardDispatchBenchmarkButton;
 
     private Runnable dashboardUpdateRunnable;
 
@@ -785,6 +810,10 @@ public class FloatingService extends Service {
             return;
         }
 
+        /*
+         * در حالت اینترنتی، بدون مرجع معتبر نباید زمان گوشی
+         * به‌عنوان ساعت اینترنتی وارد انتخاب‌گر شود.
+         */
         if (CLOCK_INTERNET.equals(clockSource)
                 && !internetTimeAnchorAvailable) {
 
@@ -1397,44 +1426,12 @@ public class FloatingService extends Service {
         root.addView(dashboardErrorView);
 
         TextView reportsTitle = new TextView(this);
-        reportsTitle.setText("گزارش چرخه‌ها و تست Callback");
+        reportsTitle.setText("گزارش چرخه‌های تکمیل‌شده");
         reportsTitle.setTextColor(TITLE_COLOR);
         reportsTitle.setTextSize(14);
         reportsTitle.setTypeface(null, Typeface.BOLD);
         reportsTitle.setPadding(0, dp(10), 0, dp(6));
         root.addView(reportsTitle);
-
-        dashboardBenchmarkButton = createDialogButton(
-                "شروع تست Callback (۱۰۰ کلیک واقعی)",
-                Color.rgb(25, 105, 145)
-        );
-        LinearLayout.LayoutParams benchmarkButtonParams =
-                new LinearLayout.LayoutParams(
-                        LinearLayout.LayoutParams.MATCH_PARENT,
-                        dp(40)
-                );
-        benchmarkButtonParams.setMargins(0, 0, 0, dp(7));
-        dashboardBenchmarkButton.setLayoutParams(benchmarkButtonParams);
-        dashboardBenchmarkButton.setOnClickListener(v ->
-                onCallbackBenchmarkButtonClicked()
-        );
-        root.addView(dashboardBenchmarkButton);
-
-        dashboardDispatchBenchmarkButton = createDialogButton(
-                "شروع تست دقت فاصله کلیک‌ها (۱۰۰ کلیک)",
-                Color.rgb(55, 115, 85)
-        );
-        LinearLayout.LayoutParams dispatchButtonParams =
-                new LinearLayout.LayoutParams(
-                        LinearLayout.LayoutParams.MATCH_PARENT,
-                        dp(40)
-                );
-        dispatchButtonParams.setMargins(0, 0, 0, dp(7));
-        dashboardDispatchBenchmarkButton.setLayoutParams(dispatchButtonParams);
-        dashboardDispatchBenchmarkButton.setOnClickListener(v ->
-                onDispatchTimingBenchmarkButtonClicked()
-        );
-        root.addView(dashboardDispatchBenchmarkButton);
 
         ScrollView scrollView = new ScrollView(this);
         scrollView.setFillViewport(true);
@@ -1511,8 +1508,6 @@ public class FloatingService extends Service {
             dashboardClockView = null;
             dashboardErrorView = null;
             dashboardReportsView = null;
-            dashboardBenchmarkButton = null;
-            dashboardDispatchBenchmarkButton = null;
         });
 
         try {
@@ -1742,489 +1737,7 @@ public class FloatingService extends Service {
             );
         }
 
-        AutoClickService service = AutoClickService.getInstance();
-
-        if (service != null && service.isDispatchTimingBenchmarkRunning()) {
-            builder.insert(
-                    0,
-                    "تست دقت فاصله کلیک‌ها در حال اجراست؛ لطفاً تا پایان تست صبر کنید.\n\n"
-            );
-        } else if (service != null) {
-            AutoClickService.DispatchTimingBenchmarkResult dispatchResult =
-                    service.getLastDispatchTimingBenchmarkResult();
-            if (dispatchResult != null) {
-                builder.insert(
-                        0,
-                        formatDispatchTimingBenchmarkReport(dispatchResult) + "\n\n"
-                );
-            }
-        }
-
-        if (service != null && service.isCallbackBenchmarkRunning()) {
-            builder.insert(
-                    0,
-                    "تست Callback در حال اجراست؛ لطفاً تا پایان تست صبر کنید.\n\n"
-            );
-        } else if (service != null) {
-            AutoClickService.CallbackBenchmarkResult result =
-                    service.getLastCallbackBenchmarkResult();
-
-            if (result != null) {
-                builder.insert(
-                        0,
-                        formatCallbackBenchmarkReport(result) + "\n\n"
-                );
-            }
-        }
-
         dashboardReportsView.setText(builder.toString());
-
-        if (dashboardBenchmarkButton != null) {
-            boolean benchmarkRunning = service != null
-                    && service.isCallbackBenchmarkRunning();
-            dashboardBenchmarkButton.setText(
-                    benchmarkRunning
-                            ? "لغو تست Callback"
-                            : "شروع تست Callback (۱۰۰ کلیک واقعی)"
-            );
-            dashboardBenchmarkButton.setBackground(
-                    makeBackground(
-                            benchmarkRunning
-                                    ? Color.rgb(170, 65, 45)
-                                    : Color.rgb(25, 105, 145),
-                            dp(7)
-                    )
-            );
-        }
-
-        if (dashboardDispatchBenchmarkButton != null) {
-            boolean dispatchRunning = service != null
-                    && service.isDispatchTimingBenchmarkRunning();
-            dashboardDispatchBenchmarkButton.setText(
-                    dispatchRunning
-                            ? "لغو تست دقت فاصله کلیک‌ها"
-                            : "شروع تست دقت فاصله کلیک‌ها (۱۰۰ کلیک)"
-            );
-            dashboardDispatchBenchmarkButton.setBackground(
-                    makeBackground(
-                            dispatchRunning
-                                    ? Color.rgb(170, 65, 45)
-                                    : Color.rgb(55, 115, 85),
-                            dp(7)
-                    )
-            );
-        }
-    }
-
-    private void onDispatchTimingBenchmarkButtonClicked() {
-
-        AutoClickService service = AutoClickService.getInstance();
-
-        if (service != null && service.isDispatchTimingBenchmarkRunning()) {
-            service.cancelDispatchTimingBenchmark();
-            updateCountdownStatus("درخواست لغو تست دقت فاصله کلیک‌ها ارسال شد");
-            updateDashboardReports();
-            return;
-        }
-
-        if (running || cycleActive) {
-            updateCountdownStatus(
-                    "برای اجرای تست، ابتدا اجرای چرخه‌ها را متوقف کنید"
-            );
-            return;
-        }
-
-        if (service == null || !service.isServiceReady()) {
-            updateCountdownStatus("سرویس دسترسی‌پذیری متصل یا آماده نیست");
-            return;
-        }
-
-        if (service.isGestureInProgress()
-                || service.isCallbackBenchmarkRunning()) {
-            updateCountdownStatus(
-                    "یک لمس یا تست دیگر در حال اجراست؛ ابتدا منتظر پایان آن بمانید"
-            );
-            return;
-        }
-
-        showDispatchTimingBenchmarkConfirmation();
-    }
-
-    private void showDispatchTimingBenchmarkConfirmation() {
-
-        Dialog dialog = new Dialog(
-                this,
-                android.R.style.Theme_Material_Dialog_Alert
-        );
-
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(16), dp(14), dp(16), dp(12));
-        root.setBackground(makeBackground(Color.rgb(20, 30, 42), dp(12)));
-
-        TextView title = new TextView(this);
-        title.setText("تأیید تست دقت فاصله کلیک‌ها");
-        title.setTextColor(TITLE_COLOR);
-        title.setTextSize(16);
-        title.setTypeface(null, Typeface.BOLD);
-        title.setGravity(Gravity.CENTER);
-        title.setPadding(0, 0, 0, dp(10));
-        root.addView(title);
-
-        TextView message = new TextView(this);
-        message.setText(
-                "این آزمایش ۱۰۰ لمس واقعی در محل نشانگر قرمز انجام می‌دهد.\n\n"
-                        + "فاصله هدف بین زمان‌های ارسال لمس: ۵۰ میلی‌ثانیه.\n\n"
-                        + "گزارش شامل فاصله واقعی ارسال‌ها، خطای فاصله و تأخیر نسبت به زمان هدف است.\n\n"
-                        + "لطفاً نشانگر را روی قسمت بی‌خطر صفحه قرار دهید و مطمئن شوید اجرای چرخه‌ها متوقف است."
-        );
-        message.setTextColor(Color.WHITE);
-        message.setTextSize(13);
-        message.setGravity(Gravity.CENTER);
-        message.setPadding(0, 0, 0, dp(12));
-        root.addView(message);
-
-        LinearLayout buttons = new LinearLayout(this);
-        buttons.setOrientation(LinearLayout.HORIZONTAL);
-        buttons.setGravity(Gravity.CENTER);
-
-        TextView cancel = createDialogButton("انصراف", Color.rgb(80, 85, 95));
-        TextView confirm = createDialogButton("شروع آزمایش", Color.rgb(20, 125, 75));
-        buttons.addView(cancel);
-        buttons.addView(confirm);
-        root.addView(buttons);
-
-        dialog.setContentView(root);
-        dialog.setCancelable(true);
-
-        Window window = dialog.getWindow();
-        if (window != null) {
-            window.setType(getOverlayType());
-            window.setBackgroundDrawableResource(android.R.color.transparent);
-            WindowManager.LayoutParams params = window.getAttributes();
-            params.width = dp(310);
-            params.height = WindowManager.LayoutParams.WRAP_CONTENT;
-            params.gravity = Gravity.CENTER;
-            window.setAttributes(params);
-        }
-
-        cancel.setOnClickListener(v -> dialog.dismiss());
-        confirm.setOnClickListener(v -> {
-            dialog.dismiss();
-            startDispatchTimingBenchmarkNow();
-        });
-
-        try {
-            dialog.show();
-            if (window != null) {
-                window.setLayout(dp(310), WindowManager.LayoutParams.WRAP_CONTENT);
-            }
-        } catch (Exception e) {
-            updateCountdownStatus("نمایش تأییدیه تست زمان‌بندی ممکن نشد");
-        }
-    }
-
-    private void startDispatchTimingBenchmarkNow() {
-
-        if (running || cycleActive) {
-            updateCountdownStatus("اجرای چرخه فعال است؛ تست شروع نشد");
-            return;
-        }
-
-        AutoClickService service = AutoClickService.getInstance();
-        if (service == null || !service.isServiceReady()) {
-            updateCountdownStatus("سرویس دسترسی‌پذیری آماده نیست");
-            return;
-        }
-
-        if (service.isGestureInProgress()
-                || service.isCallbackBenchmarkRunning()
-                || service.isDispatchTimingBenchmarkRunning()) {
-            updateCountdownStatus("سرویس مشغول اجرای لمس یا تست دیگری است");
-            return;
-        }
-
-        updateTarget();
-        service.setTarget(targetX, targetY);
-
-        boolean started = service.startDispatchTimingBenchmark(
-                100,
-                50L,
-                result -> {
-                    setMarkerTouchable(true);
-                    updateCountdownStatus(
-                            result.cancelled
-                                    ? "تست دقت فاصله کلیک‌ها لغو شد"
-                                    : "تست دقت فاصله کلیک‌ها تکمیل شد"
-                    );
-                    updateLiveDashboard();
-                }
-        );
-
-        if (started) {
-            setMarkerTouchable(false);
-            updateCountdownStatus("تست دقت فاصله کلیک‌ها شروع شد؛ ۱۰۰ لمس در حال اجراست");
-        } else {
-            setMarkerTouchable(true);
-            updateCountdownStatus("شروع تست ممکن نشد؛ سرویس مشغول است یا شرایط تست برقرار نیست");
-        }
-
-        updateLiveDashboard();
-    }
-
-    private String formatDispatchTimingBenchmarkReport(
-            AutoClickService.DispatchTimingBenchmarkResult result
-    ) {
-        StringBuilder report = new StringBuilder();
-        report.append("گزارش تست دقت فاصله کلیک‌ها\n");
-        report.append("وضعیت: ")
-                .append(result.cancelled ? "لغو شده" : "تکمیل شده")
-                .append("\n");
-        report.append("تعداد درخواستی: ").append(result.requestedAttempts)
-                .append(" | تلاش‌شده: ").append(result.attemptedAttempts)
-                .append("\n");
-        report.append("ارسال پذیرفته‌شده: ").append(result.acceptedDispatches)
-                .append(" | Callback: ").append(result.callbacks).append("\n");
-        report.append("موفق: ").append(result.successfulCallbacks)
-                .append(" | لغوشده: ").append(result.cancelledCallbacks)
-                .append(" | ردشده: ").append(result.rejectedAttempts).append("\n");
-        report.append("فاصله هدف: ")
-                .append(String.format(Locale.US, "%.2f", result.requestedIntervalMs))
-                .append(" ms\n");
-        report.append("فاصله واقعی — حداقل: ")
-                .append(String.format(Locale.US, "%.2f", result.minActualIntervalMs))
-                .append(" | میانگین: ")
-                .append(String.format(Locale.US, "%.2f", result.averageActualIntervalMs))
-                .append(" ms\n");
-        report.append("میانه: ")
-                .append(String.format(Locale.US, "%.2f", result.medianActualIntervalMs))
-                .append(" | صدک ۹۵: ")
-                .append(String.format(Locale.US, "%.2f", result.p95ActualIntervalMs))
-                .append(" | حداکثر: ")
-                .append(String.format(Locale.US, "%.2f", result.maxActualIntervalMs))
-                .append(" ms\n");
-        report.append("میانگین خطای فاصله: ")
-                .append(String.format(Locale.US, "%.2f", result.averageIntervalErrorMs))
-                .append(" ms | صدک ۹۵ خطای مطلق: ")
-                .append(String.format(Locale.US, "%.2f", result.p95AbsoluteIntervalErrorMs))
-                .append(" ms\n");
-        report.append("میانگین تأخیر ارسال نسبت به هدف: ")
-                .append(String.format(Locale.US, "%.2f", result.averageDispatchLatenessMs))
-                .append(" ms | صدک ۹۵: ")
-                .append(String.format(Locale.US, "%.2f", result.p95DispatchLatenessMs))
-                .append(" ms");
-        return report.toString();
-    }
-
-    private void onCallbackBenchmarkButtonClicked() {
-
-        AutoClickService service = AutoClickService.getInstance();
-
-        if (service != null && service.isCallbackBenchmarkRunning()) {
-            service.cancelCallbackBenchmark();
-            updateCountdownStatus("درخواست لغو تست Callback ارسال شد");
-            updateDashboardReports();
-            return;
-        }
-
-        if (running || cycleActive) {
-            updateCountdownStatus(
-                    "برای اجرای تست Callback ابتدا اجرای چرخه‌ها را متوقف کنید"
-            );
-            return;
-        }
-
-        if (service == null || !service.isServiceReady()) {
-            updateCountdownStatus(
-                    "سرویس دسترسی‌پذیری متصل یا آماده نیست"
-            );
-            return;
-        }
-
-        if (service.isGestureInProgress()) {
-            updateCountdownStatus(
-                    "یک لمس در حال انجام است؛ چند لحظه بعد دوباره تلاش کنید"
-            );
-            return;
-        }
-
-        showCallbackBenchmarkConfirmation();
-    }
-
-    private void showCallbackBenchmarkConfirmation() {
-
-        Dialog dialog = new Dialog(
-                this,
-                android.R.style.Theme_Material_Dialog_Alert
-        );
-
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(16), dp(14), dp(16), dp(12));
-        root.setBackground(makeBackground(Color.rgb(20, 30, 42), dp(12)));
-
-        TextView title = new TextView(this);
-        title.setText("تأیید اجرای تست Callback");
-        title.setTextColor(TITLE_COLOR);
-        title.setTextSize(16);
-        title.setTypeface(null, Typeface.BOLD);
-        title.setGravity(Gravity.CENTER);
-        title.setPadding(0, 0, 0, dp(10));
-        root.addView(title);
-
-        TextView message = new TextView(this);
-        message.setText(
-                "این آزمایش ۱۰۰ لمس واقعی در محل نشانگر قرمز انجام می‌دهد.\n\n"
-                        + "فاصله بین لمس‌ها: ۵۰ میلی‌ثانیه پس از دریافت هر Callback.\n\n"
-                        + "لطفاً نشانگر را روی قسمت بی‌خطر صفحه قرار دهید و مطمئن شوید اجرای چرخه‌ها متوقف است."
-        );
-        message.setTextColor(Color.WHITE);
-        message.setTextSize(13);
-        message.setGravity(Gravity.CENTER);
-        message.setPadding(0, 0, 0, dp(12));
-        root.addView(message);
-
-        LinearLayout buttons = new LinearLayout(this);
-        buttons.setOrientation(LinearLayout.HORIZONTAL);
-        buttons.setGravity(Gravity.CENTER);
-
-        TextView cancel = createDialogButton(
-                "انصراف",
-                Color.rgb(80, 85, 95)
-        );
-        TextView confirm = createDialogButton(
-                "شروع آزمایش",
-                Color.rgb(20, 125, 75)
-        );
-        buttons.addView(cancel);
-        buttons.addView(confirm);
-        root.addView(buttons);
-
-        dialog.setContentView(root);
-        dialog.setCancelable(true);
-
-        Window window = dialog.getWindow();
-        if (window != null) {
-            window.setType(getOverlayType());
-            window.setBackgroundDrawableResource(android.R.color.transparent);
-            WindowManager.LayoutParams params = window.getAttributes();
-            params.width = dp(310);
-            params.height = WindowManager.LayoutParams.WRAP_CONTENT;
-            params.gravity = Gravity.CENTER;
-            window.setAttributes(params);
-        }
-
-        cancel.setOnClickListener(v -> dialog.dismiss());
-        confirm.setOnClickListener(v -> {
-            dialog.dismiss();
-            startCallbackBenchmarkNow();
-        });
-
-        try {
-            dialog.show();
-            if (window != null) {
-                window.setLayout(
-                        dp(310),
-                        WindowManager.LayoutParams.WRAP_CONTENT
-                );
-            }
-        } catch (Exception e) {
-            updateCountdownStatus("نمایش تأییدیه تست Callback ممکن نشد");
-        }
-    }
-
-    private void startCallbackBenchmarkNow() {
-
-        if (running || cycleActive) {
-            updateCountdownStatus(
-                    "اجرای چرخه فعال است؛ تست Callback شروع نشد"
-            );
-            return;
-        }
-
-        AutoClickService service = AutoClickService.getInstance();
-        if (service == null || !service.isServiceReady()) {
-            updateCountdownStatus("سرویس دسترسی‌پذیری آماده نیست");
-            return;
-        }
-
-        if (service.isGestureInProgress()) {
-            updateCountdownStatus("یک لمس دیگر هنوز تکمیل نشده است");
-            return;
-        }
-
-        updateTarget();
-        service.setTarget(targetX, targetY);
-
-        boolean started = service.startCallbackBenchmark(
-                100,
-                50L,
-                result -> {
-                    setMarkerTouchable(true);
-                    updateCountdownStatus(
-                            result.cancelled
-                                    ? "تست Callback لغو شد"
-                                    : "تست Callback تکمیل شد"
-                    );
-                    updateLiveDashboard();
-                }
-        );
-
-        if (started) {
-            setMarkerTouchable(false);
-            updateCountdownStatus("تست Callback شروع شد؛ ۱۰۰ لمس واقعی در حال اجراست");
-        } else {
-            setMarkerTouchable(true);
-            updateCountdownStatus(
-                    "شروع تست ممکن نشد؛ سرویس مشغول است یا شرایط تست برقرار نیست"
-            );
-        }
-
-        updateLiveDashboard();
-    }
-
-    private String formatCallbackBenchmarkReport(
-            AutoClickService.CallbackBenchmarkResult result
-    ) {
-
-        StringBuilder report = new StringBuilder();
-        report.append("گزارش آخرین تست Callback\n");
-        report.append("وضعیت: ")
-                .append(result.cancelled ? "لغو شده" : "تکمیل شده")
-                .append("\n");
-        report.append("تعداد درخواستی: ")
-                .append(result.requestedAttempts)
-                .append(" | تلاش‌شده: ")
-                .append(result.attemptedAttempts)
-                .append("\n");
-        report.append("Callback دریافت‌شده: ")
-                .append(result.callbacks)
-                .append(" | موفق: ")
-                .append(result.successfulCallbacks)
-                .append("\n");
-        report.append("لغوشده: ")
-                .append(result.cancelledCallbacks)
-                .append(" | ردشده: ")
-                .append(result.rejectedAttempts)
-                .append("\n");
-
-        if (result.callbacks > 0) {
-            report.append("حداقل: ")
-                    .append(result.minCallbackMs).append(" ms")
-                    .append(" | میانگین: ")
-                    .append(String.format(Locale.US, "%.2f", result.averageCallbackMs))
-                    .append(" ms\n");
-            report.append("میانه: ")
-                    .append(result.medianCallbackMs).append(" ms")
-                    .append(" | صدک ۹۵: ")
-                    .append(result.p95CallbackMs).append(" ms")
-                    .append(" | حداکثر: ")
-                    .append(result.maxCallbackMs).append(" ms");
-        } else {
-            report.append("نمونه Callback معتبری برای محاسبه زمان ثبت نشد.");
-        }
-
-        return report.toString();
     }
 
     private void addLiveError(String error) {
@@ -2470,18 +1983,6 @@ public class FloatingService extends Service {
 
     private void startLoop(Intent config) {
 
-        AutoClickService currentAccessibility =
-                AutoClickService.getInstance();
-
-        if (currentAccessibility != null
-                && (currentAccessibility.isCallbackBenchmarkRunning()
-                || currentAccessibility.isDispatchTimingBenchmarkRunning())) {
-            updateCountdownStatus(
-                    "ابتدا تست فعال را تمام یا لغو کنید؛ سپس چرخه را شروع کنید"
-            );
-            return;
-        }
-
         stopLoop();
 
         if (config == null) {
@@ -2495,6 +1996,15 @@ public class FloatingService extends Service {
             clockSource = CLOCK_PHONE;
         }
 
+        /*
+         * دریافت مرجع ساعت اینترنتی از MainActivity.
+         *
+         * اگر مرجع جدید همراه فرمان شروع ارسال شده باشد،
+         * جایگزین مرجع قبلی می‌شود.
+         *
+         * اگر extras مرجع ارسال نشده باشند، مرجع معتبر بازیابی‌شده
+         * از SharedPreferences حفظ می‌شود.
+         */
         if (config.hasExtra("internet_epoch_at_sync_ms")
                 && config.hasExtra("internet_elapsed_at_sync_ms")) {
 
@@ -2533,6 +2043,14 @@ public class FloatingService extends Service {
             }
         }
 
+        /*
+         * محافظ جدید:
+         * اگر ساعت اینترنتی انتخاب شده اما هیچ مرجع معتبر اینترنتی
+         * در دسترس نیست، اجرای چرخه مجاز نیست.
+         *
+         * این شرط فقط از شروع با ساعت نامعتبر جلوگیری می‌کند؛
+         * هیچ محدودیت ۵۰ میلی‌ثانیه‌ای روی کلیک‌ها اعمال نمی‌کند.
+         */
         if (CLOCK_INTERNET.equals(clockSource)
                 && !internetTimeAnchorAvailable) {
 
@@ -2575,6 +2093,11 @@ public class FloatingService extends Service {
         long nowElapsed = SystemClock.elapsedRealtime();
         long delayMs;
 
+        /*
+         * مسیر جدید:
+         * زمان شروع مطلق monotonic مستقیماً از MainActivity دریافت می‌شود.
+         * در این حالت دیگر زمان هدف را از روی start_delay_ms بازسازی نمی‌کنیم.
+         */
         if (config.hasExtra("start_elapsed_realtime_ms")) {
 
             anchorElapsedMs = config.getLongExtra(
@@ -2598,6 +2121,10 @@ public class FloatingService extends Service {
 
         } else {
 
+            /*
+             * سازگاری با نسخه قبلی:
+             * اگر extra جدید موجود نباشد، روش قبلی استفاده می‌شود.
+             */
             if (config.hasExtra("start_delay_ms")) {
 
                 delayMs = config.getLongExtra(
@@ -2684,14 +2211,11 @@ public class FloatingService extends Service {
             }
         };
 
-        long firstCyclePrepareTime = Math.max(
+        long firstPreDispatchElapsedMs = Math.max(
                 nowElapsed,
-                anchorElapsedMs > PRE_DISPATCH_LEAD_MS
-                        ? anchorElapsedMs - PRE_DISPATCH_LEAD_MS
-                        : anchorElapsedMs
+                anchorElapsedMs - CYCLE_PRE_DISPATCH_MS
         );
-
-        postAtElapsedTime(cycleStartRunnable, firstCyclePrepareTime);
+        postAtElapsedTime(cycleStartRunnable, firstPreDispatchElapsedMs);
 
         updateCountdownStatus(
                 delayMs == 0
@@ -2769,6 +2293,11 @@ public class FloatingService extends Service {
                 return;
             }
 
+            /*
+             * آماده شدن سرویس نباید مبدأ یا پایان چرخه را جابه‌جا کند.
+             * اگر Gesture قبلی هنوز فعال است، تا پایان آن صبر می‌کنیم
+             * و قبل از پایانش شمارنده‌های سرویس را reset نمی‌کنیم.
+             */
             if (accessibility.isGestureInProgress()) {
                 cycleStartRunnable = () -> {
                     if (isCurrentRun(generation) && cycleActive) {
@@ -2812,6 +2341,11 @@ public class FloatingService extends Service {
             return;
         }
 
+        /*
+         * مبدأ چرخه از قبل و بر اساس anchorElapsedMs تعیین شده است:
+         * چرخه شماره N دقیقاً در anchor + N * (مدت چرخه + مکث)
+         * زمان‌بندی می‌شود. دیر اجرا شدن Handler نباید چرخه را تمدید کند.
+         */
         long scheduledCycleStart = getCycleTargetElapsed(cycleIndex);
 
         if (scheduledCycleStart == Long.MAX_VALUE) {
@@ -2844,6 +2378,10 @@ public class FloatingService extends Service {
                     cycleStartElapsedMs + cycleDurationMs;
         }
 
+        /*
+         * زمان دیواری گزارش نیز از همان مبدأ برنامه‌ریزی‌شده ساخته می‌شود؛
+         * تأخیر اجرای تابع، زمان شروع ثبت‌شده را جلو نمی‌برد.
+         */
         long cycleOffset = cycleStartElapsedMs - anchorElapsedMs;
 
         if (cycleOffset >= 0
@@ -2864,6 +2402,7 @@ public class FloatingService extends Service {
         accessibility = getReadyAccessibility();
 
         if (accessibility == null) {
+            /* چرخه با مهلت ثابت آغاز شده؛ منتظر سرویس می‌مانیم، نه مبدأ تازه. */
             waitForAccessibility(generation);
             updateDisplay();
             return;
@@ -2924,6 +2463,10 @@ public class FloatingService extends Service {
         cycleServicePrepared = true;
     }
 
+    /*
+     * تبدیل زمان elapsedRealtime برحسب میلی‌ثانیه به نانوثانیه با
+     * جلوگیری از overflow. هر دو زمان از یک ساعت monotonic می‌آیند.
+     */
     private long elapsedMsToNanos(long elapsedMs) {
 
         if (elapsedMs <= 0) {
@@ -2948,7 +2491,10 @@ public class FloatingService extends Service {
     }
 
     /**
-     * تمام کلیک‌های چرخه در یک Gesture ارسال می‌شوند.
+     * زمان هدف هر کلیک مستقل و ثابت است:
+     * cycleStart + index * interval.
+     * هر بار تا سقف ظرفیت Gesture، چند کلیک با هم و با offsetهای ثابت
+     * به اندروید سپرده می‌شوند تا زمان‌بندی کلیک‌ها منتظر Callback هر لمس نماند.
      */
     private void scheduleNextClick(long generation) {
 
@@ -2956,9 +2502,26 @@ public class FloatingService extends Service {
             return;
         }
 
-        if (cycleFinishRunnable != null) {
-            handler.removeCallbacks(cycleFinishRunnable);
-            cycleFinishRunnable = null;
+        if (nextClickIndex >= clickCount) {
+            waitForCycleEnd(generation);
+            return;
+        }
+
+        final long cycleStartNanos =
+                elapsedMsToNanos(cycleStartElapsedMs);
+
+        final long cycleDeadlineNanos =
+                elapsedMsToNanos(cycleDeadlineElapsedMs);
+
+        if (cycleDeadlineNanos <= cycleStartNanos
+                || SystemClock.elapsedRealtimeNanos() >= cycleDeadlineNanos) {
+
+            markDeadlineSkipped(
+                    "زمان چرخه پیش از رسیدن به کلیک بعدی پایان یافت"
+            );
+
+            waitForCycleEnd(generation);
+            return;
         }
 
         accessibility = getReadyAccessibility();
@@ -2970,8 +2533,6 @@ public class FloatingService extends Service {
 
         if (accessibility.isGestureInProgress()) {
             nextClickRunnable = () -> {
-                nextClickRunnable = null;
-
                 if (isCurrentRun(generation) && cycleActive) {
                     scheduleNextClick(generation);
                 }
@@ -2981,64 +2542,146 @@ public class FloatingService extends Service {
             return;
         }
 
-        dispatchNextClick(
-                generation,
-                elapsedMsToNanos(cycleStartElapsedMs)
+        long effectiveIntervalMs = Math.max(
+                1L,
+                accessibility.getEffectiveClickIntervalMs(clickIntervalMs)
         );
-    }
 
-    private void dispatchNextClick(
-            long generation,
-            long targetElapsedRealtimeNanos
-    ) {
-
-        if (!isCurrentRun(generation) || !cycleActive) {
+        if (effectiveIntervalMs > Long.MAX_VALUE / 1_000_000L) {
+            cycleOtherFailure = true;
+            addLiveError("فاصله کلیک از محدوده زمان‌بندی مجاز خارج شد");
+            waitForCycleEnd(generation);
             return;
         }
 
-        accessibility = getReadyAccessibility();
+        long intervalNanos = effectiveIntervalMs * 1_000_000L;
 
-        if (accessibility == null) {
-            waitForAccessibility(generation);
+        if (nextClickIndex > 0
+                && intervalNanos
+                > (Long.MAX_VALUE - cycleStartNanos) / nextClickIndex) {
+
+            cycleOtherFailure = true;
+            addLiveError("محاسبه زمان هدف کلیک از محدوده مجاز خارج شد");
+            waitForCycleEnd(generation);
             return;
         }
 
-        if (accessibility.isGestureInProgress()) {
+        long targetNanos =
+                cycleStartNanos + nextClickIndex * intervalNanos;
 
-            nextClickRunnable = () -> {
-                nextClickRunnable = null;
-
-                if (isCurrentRun(generation) && cycleActive) {
-                    dispatchNextClick(
-                            generation,
-                            targetElapsedRealtimeNanos
-                    );
-                }
-            };
-
-            handler.postDelayed(nextClickRunnable, GESTURE_RETRY_MS);
-            return;
-        }
-
-        final long cycleDeadlineNanos =
-                elapsedMsToNanos(cycleDeadlineElapsedMs);
-
-        final long nowNanos =
-                SystemClock.elapsedRealtimeNanos();
-
-        if (nowNanos >= cycleDeadlineNanos) {
+        // پایان چرخه exclusive است؛ کلیک باید کاملاً قبل از deadline تمام شود.
+        if (targetNanos >= cycleDeadlineNanos
+                || targetNanos > Long.MAX_VALUE - 1_000_000L
+                || targetNanos + 1_000_000L > cycleDeadlineNanos) {
 
             markDeadlineSkipped(
-                    "زمان چرخه پیش از ارسال دسته کلیک پایان یافت"
+                    "جایگاه‌های باقی‌مانده کلیک در محدوده زمانی چرخه جا نمی‌شوند"
             );
 
             waitForCycleEnd(generation);
             return;
         }
 
+        final long targetForThisClick = targetNanos;
+
+        nextClickRunnable = () -> {
+            nextClickRunnable = null;
+
+            if (isCurrentRun(generation) && cycleActive) {
+                dispatchNextClick(generation, targetForThisClick);
+            }
+        };
+
+        // در صورت امکان، startCycle حدود ۵۰ میلی‌ثانیه پیش از مبدأ اجرا می‌شود.
+        // AutoClickService offset اولین Stroke را طوری محاسبه می‌کند که با
+        // حاشیه محافظه‌کارانه، لمس عمداً پیش از شروع چرخه برنامه‌ریزی نشود.
+        nextClickRunnable.run();
+    }
+
+    private void dispatchNextClick(
+            long generation,
+            long firstTargetElapsedRealtimeNanos
+    ) {
+
+        if (!isCurrentRun(generation) || !cycleActive) {
+            return;
+        }
+
+        final long cycleStartNanos =
+                elapsedMsToNanos(cycleStartElapsedMs);
+
+        final long cycleDeadlineNanos =
+                elapsedMsToNanos(cycleDeadlineElapsedMs);
+
+        long nowNanos = SystemClock.elapsedRealtimeNanos();
+
+        if (nowNanos >= cycleDeadlineNanos) {
+            markDeadlineSkipped(
+                    "زمان چرخه پیش از ارسال دسته کلیک پایان یافت"
+            );
+            waitForCycleEnd(generation);
+            return;
+        }
+
+        accessibility = getReadyAccessibility();
+
+        if (accessibility == null) {
+            nextClickRunnable = () -> {
+                if (isCurrentRun(generation) && cycleActive) {
+                    dispatchNextClick(
+                            generation,
+                            firstTargetElapsedRealtimeNanos
+                    );
+                }
+            };
+            handler.postDelayed(nextClickRunnable, SERVICE_RETRY_MS);
+            return;
+        }
+
+        if (accessibility.isGestureInProgress()) {
+            nextClickRunnable = () -> {
+                if (isCurrentRun(generation) && cycleActive) {
+                    dispatchNextClick(
+                            generation,
+                            firstTargetElapsedRealtimeNanos
+                    );
+                }
+            };
+            handler.postDelayed(nextClickRunnable, GESTURE_RETRY_MS);
+            return;
+        }
+
         accessibility.setTarget(targetX, targetY);
 
         final AutoClickService clickService = accessibility;
+        final long callbackGeneration = generation;
+
+        long remainingClicks = clickCount - nextClickIndex;
+        if (remainingClicks <= 0L) {
+            waitForCycleEnd(generation);
+            return;
+        }
+
+        long effectiveIntervalMs = Math.max(
+                1L,
+                clickService.getEffectiveClickIntervalMs(clickIntervalMs)
+        );
+
+        int maxBatchCount = clickService.getMaxBatchClickCount(
+                effectiveIntervalMs
+        );
+
+        if (maxBatchCount <= 0) {
+            cycleOtherFailure = true;
+            addLiveError("ظرفیت اجرای دسته کلیک معتبر نیست");
+            waitForCycleEnd(generation);
+            return;
+        }
+
+        final int requestedBatchCount = (int) Math.min(
+                remainingClicks,
+                (long) maxBatchCount
+        );
 
         final long successesBefore =
                 clickService.getSuccessfulClicks();
@@ -3046,30 +2689,25 @@ public class FloatingService extends Service {
         final long failuresBefore =
                 clickService.getFailedClicks();
 
-        final long deadlineElapsedMs =
-                cycleDeadlineElapsedMs;
+        // callback اندروید فقط پس از پایان کل Gesture اجرا می‌شود؛ بنابراین
+        // همه کلیک‌های این دسته از ابتدا با فاصله‌های ثابت به اندروید سپرده می‌شوند.
+        // آرایه برای پوشش callbackهای هم‌زمانِ رد درخواست لازم است؛ callback
+        // نتیجه را روی Handler صف می‌کند و پس از بازگشت این متد اجرا خواهد شد.
+        final int[] dispatchedCountHolder = new int[]{0};
 
-        /*
-         * مقدار پذیرفته‌شده در آرایه نگهداری می‌شود تا callback
-         * بتواند آن را بدون ارجاع به متغیر در حال مقداردهی بخواند.
-         */
-        final int[] acceptedCountHolder = new int[]{0};
-
-        final long cycleStartNanos =
-                elapsedMsToNanos(cycleStartElapsedMs);
-
-        // cycleDeadlineNanos was calculated above and is reused here.
-        final int acceptedCount = clickService.performClickBatchAtTarget(
-                (int) Math.min(clickCount, Integer.MAX_VALUE),
-                clickIntervalMs,
-                cycleStartNanos,
+        int dispatchedCount = clickService.performClickBatchAtTarget(
+                requestedBatchCount,
+                effectiveIntervalMs,
+                firstTargetElapsedRealtimeNanos,
                 cycleStartNanos,
                 cycleDeadlineNanos,
                 () -> handler.post(() -> {
 
-                    if (!isCurrentRun(generation) || !cycleActive) {
+                    if (!isCurrentRun(callbackGeneration) || !cycleActive) {
                         return;
                     }
+
+                    int completedBatchCount = dispatchedCountHolder[0];
 
                     long successesAfter =
                             clickService.getSuccessfulClicks();
@@ -3077,86 +2715,99 @@ public class FloatingService extends Service {
                     long failuresAfter =
                             clickService.getFailedClicks();
 
-                    long successfulInThisBatch =
-                            Math.max(0L, successesAfter - successesBefore);
+                    boolean deadlineSkipped =
+                            clickService.getLastBatchSkippedByDeadline() > 0;
 
-                    long failedInThisBatch =
-                            Math.max(0L, failuresAfter - failuresBefore);
-
-                    clickNumber = successfulInThisBatch
-                            + failedInThisBatch;
-
-                    nextClickIndex = clickNumber;
-
-                    if (clickService.getLastBatchSkippedByDeadline() > 0) {
-
-                        markDeadlineSkipped(
-                                clickService.getLastError()
-                        );
+                    if (completedBatchCount > 0) {
+                        nextClickIndex += completedBatchCount;
                     }
 
-                    if (acceptedCountHolder[0] < clickCount) {
-
+                    if (failuresAfter > failuresBefore) {
                         cycleOtherFailure = true;
-
-                        addLiveError(
-                                "تعداد کلیک‌ها از ظرفیت یک Gesture بیشتر بود؛ "
-                                        + "تمام کلیک‌های درخواستی در یک دسته جا نشدند"
-                        );
+                        addLiveError(clickService.getLastError());
+                        if (deadlineSkipped) {
+                            markDeadlineSkipped(clickService.getLastError());
+                        }
+                        waitForCycleEnd(callbackGeneration);
+                        updateDisplay();
+                        return;
                     }
 
-                    if (failedInThisBatch > 0) {
-
-                        cycleOtherFailure = true;
-
-                        addLiveError(
-                                clickService.getLastError()
-                        );
+                    if (deadlineSkipped) {
+                        markDeadlineSkipped(clickService.getLastError());
+                        waitForCycleEnd(callbackGeneration);
+                        updateDisplay();
+                        return;
                     }
 
-                    if (successfulInThisBatch < acceptedCountHolder[0]
-                            && failedInThisBatch == 0) {
+                    if (completedBatchCount <= 0) {
+                        // رد شدن موقت به علت فاصله مجاز یا مشغول بودن Gesture،
+                        // جایگاه کلیک را مصرف نمی‌کند؛ همان زمان هدف ثابت دوباره تلاش می‌شود.
+                        if (clickService.wasLastBatchRejectedForInterval()
+                                || clickService.isGestureInProgress()) {
+                            nextClickRunnable = () -> {
+                                nextClickRunnable = null;
+                                if (isCurrentRun(callbackGeneration)
+                                        && cycleActive) {
+                                    dispatchNextClick(
+                                            callbackGeneration,
+                                            firstTargetElapsedRealtimeNanos
+                                    );
+                                }
+                            };
+                            handler.postDelayed(
+                                    nextClickRunnable,
+                                    GESTURE_RETRY_MS
+                            );
+                            updateDisplay();
+                            return;
+                        }
 
                         cycleOtherFailure = true;
-
                         addLiveError(
-                                "تعداد کلیک موفق کمتر از تعداد کلیک پذیرفته‌شده بود"
+                                clickService.getLastError() == null
+                                        ? "دسته کلیک بدون نتیجه ارسال شد"
+                                        : clickService.getLastError()
                         );
+                        waitForCycleEnd(callbackGeneration);
+                        updateDisplay();
+                        return;
+                    }
+
+                    if (successesAfter <= successesBefore) {
+                        cycleOtherFailure = true;
+                        addLiveError(
+                                clickService.getLastError() == null
+                                        ? "نتیجه موفق دسته کلیک از سرویس دریافت نشد"
+                                        : clickService.getLastError()
+                        );
+                        waitForCycleEnd(callbackGeneration);
+                        updateDisplay();
+                        return;
+                    }
+
+                    if (SystemClock.elapsedRealtimeNanos() >= cycleDeadlineNanos
+                            || nextClickIndex >= clickCount) {
+                        waitForCycleEnd(callbackGeneration);
+                    } else {
+                        // اگر محدودیت ظرفیت Gesture باعث کوچک‌تر شدن دسته شده باشد،
+                        // دسته بعدی از جایگاه مطلق بعدی چرخه ادامه پیدا می‌کند.
+                        scheduleNextClick(callbackGeneration);
                     }
 
                     updateDisplay();
-
-                    waitForCycleEnd(generation);
                 })
         );
 
-        acceptedCountHolder[0] = acceptedCount;
+        dispatchedCountHolder[0] = dispatchedCount;
 
-        if (acceptedCount > 0) {
-
-            clickNumber = acceptedCount;
-            nextClickIndex = acceptedCount;
-
-            lastClickDispatchElapsedMs =
-                    SystemClock.elapsedRealtime();
-
-            lastBatchCount = acceptedCount;
-
+        if (dispatchedCount > 0) {
+            clickNumber += dispatchedCount;
+            lastClickDispatchElapsedMs = SystemClock.elapsedRealtime();
+            lastBatchCount = dispatchedCount;
             updateDisplay();
-
         } else {
-
-            cycleOtherFailure = true;
-
-            addLiveError(
-                    clickService.getLastError() == null
-                            ? "ارسال دسته کلیک ناموفق بود"
-                            : clickService.getLastError()
-            );
-
             updateDisplay();
-
-            waitForCycleEnd(generation);
         }
     }
 
@@ -3323,14 +2974,11 @@ public class FloatingService extends Service {
             }
         };
 
-        long nextCyclePrepareTime = Math.max(
+        long nextPreDispatchElapsedMs = Math.max(
                 SystemClock.elapsedRealtime(),
-                nextTarget > PRE_DISPATCH_LEAD_MS
-                        ? nextTarget - PRE_DISPATCH_LEAD_MS
-                        : nextTarget
+                nextTarget - CYCLE_PRE_DISPATCH_MS
         );
-
-        postAtElapsedTime(cycleStartRunnable, nextCyclePrepareTime);
+        postAtElapsedTime(cycleStartRunnable, nextPreDispatchElapsedMs);
 
         updateDisplay();
     }
@@ -3351,11 +2999,7 @@ public class FloatingService extends Service {
             activeService.cancelPendingScheduledClick();
         }
 
-        if (activeService == null
-                || (!activeService.isCallbackBenchmarkRunning()
-                && !activeService.isDispatchTimingBenchmarkRunning())) {
-            setMarkerTouchable(true);
-        }
+        setMarkerTouchable(true);
 
         if (countdownStatusView != null) {
             updateCountdownStatus("متوقف شد");
