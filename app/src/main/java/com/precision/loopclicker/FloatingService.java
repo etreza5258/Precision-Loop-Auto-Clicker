@@ -67,10 +67,11 @@ public class FloatingService extends Service {
     private static final long SERVICE_RETRY_MS = 250;
     private static final long GESTURE_RETRY_MS = 10;
     /*
-     * زمان آماده‌سازی Gesture پیش از شروع واقعی چرخه.
-     * زمان اولین Stroke همچنان دقیقاً به cycleStartElapsedMs متصل می‌ماند.
+     * Gesture حدود ۴۵ میلی‌ثانیه پیش از شروع چرخه ارسال می‌شود.
+     * جبران تأخیر شروع Stroke در AutoClickService با توجه به حداقل
+     * تأخیر اندازه‌گیری‌شده انجام می‌شود تا لمس عمداً قبل از چرخه نباشد.
      */
-    private static final long PRE_DISPATCH_LEAD_MS = 40;
+    private static final long PRE_DISPATCH_LEAD_MS = 45;
     private static final long DISPLAY_UPDATE_MS = 50;
     private static final long DASHBOARD_UPDATE_MS = 250;
 
