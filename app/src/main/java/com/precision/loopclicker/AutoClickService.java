@@ -21,6 +21,8 @@ public class AutoClickService extends AccessibilityService {
     private static final long TAP_DURATION_MS = 1L;
     private static final long MIN_SEQUENTIAL_INTERVAL_MS = 1L;
     private static final long NANOS_PER_MS = 1_000_000L;
+    private static final long CYCLE_DEADLINE_SAFETY_NANOS =
+            20L * NANOS_PER_MS;
 
     private static final long MAX_ADAPTIVE_LEAD_NANOS = 5_000_000L;
     private static final long MIN_ADAPTIVE_LEAD_NANOS = 0L;
@@ -1100,12 +1102,56 @@ public class AutoClickService extends AccessibilityService {
             long deadlineElapsedRealtimeMs,
             Runnable completion
     ) {
+        return performClickBatchInternal(
+                requestedCount,
+                requestedIntervalMs,
+                elapsedMsToNanos(deadlineElapsedRealtimeMs),
+                0L,
+                0L,
+                completion
+        );
+    }
+
+    /**
+     * Schedules every tap in one Android Gesture, with the first tap anchored
+     * to an absolute elapsedRealtimeNanos target. The Gesture is submitted
+     * early when possible; later taps are already queued by Android and do
+     * not wait for an individual tap callback.
+     */
+    public int performClickBatchAtTarget(
+            int requestedCount,
+            long requestedIntervalMs,
+            long firstTargetElapsedRealtimeNanos,
+            long cycleStartElapsedRealtimeNanos,
+            long cycleDeadlineElapsedRealtimeNanos,
+            Runnable completion
+    ) {
+        return performClickBatchInternal(
+                requestedCount,
+                requestedIntervalMs,
+                cycleDeadlineElapsedRealtimeNanos,
+                firstTargetElapsedRealtimeNanos,
+                cycleStartElapsedRealtimeNanos,
+                completion
+        );
+    }
+
+    private int performClickBatchInternal(
+            int requestedCount,
+            long requestedIntervalMs,
+            long deadlineElapsedRealtimeNanos,
+            long firstTargetElapsedRealtimeNanos,
+            long cycleStartElapsedRealtimeNanos,
+            Runnable completion
+    ) {
         if (Looper.myLooper() != Looper.getMainLooper()) {
             handler.post(() ->
-                    performClickBatch(
+                    performClickBatchInternal(
                             requestedCount,
                             requestedIntervalMs,
-                            deadlineElapsedRealtimeMs,
+                            deadlineElapsedRealtimeNanos,
+                            firstTargetElapsedRealtimeNanos,
+                            cycleStartElapsedRealtimeNanos,
                             completion
                     )
             );
@@ -1144,6 +1190,21 @@ public class AutoClickService extends AccessibilityService {
             return 0;
         }
 
+        if (firstTargetElapsedRealtimeNanos > 0L) {
+            final long cycleDeadlineNanos =
+                    deadlineElapsedRealtimeNanos;
+
+            if (cycleStartElapsedRealtimeNanos <= 0L
+                    || firstTargetElapsedRealtimeNanos < cycleStartElapsedRealtimeNanos
+                    || cycleDeadlineNanos <= cycleStartElapsedRealtimeNanos
+                    || firstTargetElapsedRealtimeNanos >= cycleDeadlineNanos) {
+                lastError = "زمان هدف کلیک خارج از محدوده چرخه است";
+                lastBatchSkippedByDeadline = requestedCount;
+                completeSafely(completion);
+                return 0;
+            }
+        }
+
         final long effectiveInterval =
                 getEffectiveClickIntervalMs(requestedIntervalMs);
 
@@ -1156,6 +1217,23 @@ public class AutoClickService extends AccessibilityService {
 
         final long intervalNanos = effectiveInterval * NANOS_PER_MS;
         final long nowNanos = SystemClock.elapsedRealtimeNanos();
+
+        final long firstStrokeOffsetNanos =
+                firstTargetElapsedRealtimeNanos > 0L
+                        && firstTargetElapsedRealtimeNanos > nowNanos
+                        ? firstTargetElapsedRealtimeNanos - nowNanos
+                        : 0L;
+
+        final long firstStrokeOffsetMs =
+                firstStrokeOffsetNanos == 0L
+                        ? 0L
+                        : safeAdd(
+                                firstStrokeOffsetNanos,
+                                NANOS_PER_MS - 1L
+                        ) / NANOS_PER_MS;
+
+        final long roundedFirstStrokeOffsetNanos =
+                safeMultiply(firstStrokeOffsetMs, NANOS_PER_MS);
 
         if (nextAllowedClickNanos > 0
                 && nowNanos < nextAllowedClickNanos) {
@@ -1177,13 +1255,40 @@ public class AutoClickService extends AccessibilityService {
             return 0;
         }
 
+        final long maxGestureDurationMs =
+                GestureDescription.getMaxGestureDuration();
+        final long durationAvailableMs =
+                maxGestureDurationMs - firstStrokeOffsetMs - TAP_DURATION_MS;
+
+        final int maxByGestureDuration =
+                durationAvailableMs < 0L
+                        ? 0
+                        : (int) Math.min(
+                                Integer.MAX_VALUE,
+                                durationAvailableMs / effectiveInterval + 1L
+                        );
+
         int deadlineAllowedCount = requestedCount;
 
-        if (deadlineElapsedRealtimeMs != Long.MAX_VALUE) {
-            long deadlineNanos =
-                    elapsedMsToNanos(deadlineElapsedRealtimeMs);
+        final long effectiveDeadlineNanos =
+                deadlineElapsedRealtimeNanos == Long.MAX_VALUE
+                        ? Long.MAX_VALUE
+                        : firstTargetElapsedRealtimeNanos > 0L
+                                ? Math.max(
+                                        0L,
+                                        deadlineElapsedRealtimeNanos
+                                                - CYCLE_DEADLINE_SAFETY_NANOS
+                                )
+                                : deadlineElapsedRealtimeNanos;
 
-            long remainingNanos = deadlineNanos - nowNanos;
+        if (effectiveDeadlineNanos != Long.MAX_VALUE) {
+            long deadlineNanos = effectiveDeadlineNanos;
+
+            long firstStrokeStartNanos = safeAdd(
+                    nowNanos,
+                    roundedFirstStrokeOffsetNanos
+            );
+            long remainingNanos = deadlineNanos - firstStrokeStartNanos;
             long tapNanos = TAP_DURATION_MS * NANOS_PER_MS;
 
             if (remainingNanos < tapNanos) {
@@ -1205,7 +1310,10 @@ public class AutoClickService extends AccessibilityService {
         }
 
         final int batchCount = Math.min(
-                Math.min(requestedCount, maxBatchCount),
+                Math.min(
+                        Math.min(requestedCount, maxBatchCount),
+                        maxByGestureDuration
+                ),
                 deadlineAllowedCount
         );
 
@@ -1223,7 +1331,10 @@ public class AutoClickService extends AccessibilityService {
 
         try {
             for (int i = 0; i < batchCount; i++) {
-                long startOffset = safeMultiply(i, effectiveInterval);
+                long startOffset = safeAdd(
+                        firstStrokeOffsetMs,
+                        safeMultiply(i, effectiveInterval)
+                );
 
                 Path path = new Path();
                 path.moveTo(clickX, clickY);
@@ -1266,7 +1377,8 @@ public class AutoClickService extends AccessibilityService {
                 dispatchCheckNanos,
                 batchCount,
                 intervalNanos,
-                deadlineElapsedRealtimeMs
+                roundedFirstStrokeOffsetNanos,
+                effectiveDeadlineNanos
         )) {
             lastBatchSkippedByDeadline = requestedCount;
             lastError = "دسته کلیک به دلیل عبور از مهلت چرخه ارسال نشد";
@@ -1290,7 +1402,8 @@ public class AutoClickService extends AccessibilityService {
                 dispatchStartNanos,
                 batchCount,
                 intervalNanos,
-                deadlineElapsedRealtimeMs
+                roundedFirstStrokeOffsetNanos,
+                effectiveDeadlineNanos
         )) {
             clearActiveGestureState();
 
@@ -1302,7 +1415,7 @@ public class AutoClickService extends AccessibilityService {
         }
 
         nextAllowedClickNanos = safeAdd(
-                dispatchStartNanos,
+                safeAdd(dispatchStartNanos, roundedFirstStrokeOffsetNanos),
                 safeMultiply(batchCount, intervalNanos)
         );
 
@@ -1311,6 +1424,7 @@ public class AutoClickService extends AccessibilityService {
                 "Dispatch batch"
                         + " | count=" + batchCount
                         + " | interval=" + effectiveInterval
+                        + " | firstOffsetMs=" + firstStrokeOffsetMs
                         + " | x=" + clickX
                         + " | y=" + clickY
         );
@@ -1899,14 +2013,14 @@ public class AutoClickService extends AccessibilityService {
             long dispatchNanos,
             int count,
             long intervalNanos,
-            long deadlineElapsedRealtimeMs
+            long firstStrokeOffsetNanos,
+            long deadlineElapsedRealtimeNanos
     ) {
-        if (deadlineElapsedRealtimeMs == Long.MAX_VALUE) {
+        if (deadlineElapsedRealtimeNanos == Long.MAX_VALUE) {
             return true;
         }
 
-        long deadlineNanos =
-                elapsedMsToNanos(deadlineElapsedRealtimeMs);
+        long deadlineNanos = deadlineElapsedRealtimeNanos;
 
         long lastStrokeOffset = safeMultiply(
                 count - 1L,
@@ -1915,7 +2029,10 @@ public class AutoClickService extends AccessibilityService {
 
         long lastStrokeEndNanos = safeAdd(
                 safeAdd(
-                        dispatchNanos,
+                        safeAdd(
+                                dispatchNanos,
+                                firstStrokeOffsetNanos
+                        ),
                         lastStrokeOffset
                 ),
                 TAP_DURATION_MS * NANOS_PER_MS
