@@ -1,4 +1,3 @@
-
 package com.precision.loopclicker;
 
 import android.content.Context;
@@ -19,42 +18,40 @@ public final class CycleReportStore {
     private static final String PREF_NAME = "cycle_reports";
     private static final String KEY_REPORTS = "reports";
 
-    // صفحه اصلی: 20 گزارش آخر
-    private static final int MAX_REPORTS = 20;
-
-    // پنل شناور: 10 گزارش آخر
+    private static final int MAX_REPORTS = 100;
     private static final int FLOATING_MAX_REPORTS = 10;
 
-    public static final String STATUS_GREEN = "GREEN";
-    public static final String STATUS_YELLOW = "YELLOW";
-    public static final String STATUS_RED = "RED";
-
-    private static final SimpleDateFormat DATE_FORMAT =
-            new SimpleDateFormat(
-                    "yyyy-MM-dd HH:mm:ss.SSS",
-                    Locale.US
-            );
+    private static final SimpleDateFormat TIME_FORMAT =
+            new SimpleDateFormat("HH:mm:ss.SSS", Locale.US);
 
     private CycleReportStore() {
     }
 
-    // ---------------------------------------------------------
-    // ثبت گزارش جدید با وضعیت مشخص
-    // ---------------------------------------------------------
-
-    public static synchronized void addReport(
+    // ثبت گزارش هر کلیک
+    public static synchronized void addClickReport(
             Context context,
             long cycleNumber,
-            long startTimeWallMs,
-            String status,
-            long completedClicks
+            long clickNumber,
+            long targetTimeMs,
+            long actualTimeMs
     ) {
 
-        if (context == null) {
+        if (context == null) return;
+
+        long difference = actualTimeMs - targetTimeMs;
+
+        JSONObject report = new JSONObject();
+
+        try {
+            report.put("cycle", cycleNumber);
+            report.put("click", clickNumber);
+            report.put("target", targetTimeMs);
+            report.put("actual", actualTimeMs);
+            report.put("difference", difference);
+
+        } catch (JSONException e) {
             return;
         }
-
-        String finalStatus = normalizeStatus(status);
 
         SharedPreferences preferences =
                 context.getSharedPreferences(
@@ -63,159 +60,53 @@ public final class CycleReportStore {
                 );
 
         JSONArray oldReports = loadArray(preferences);
+        JSONArray updated = new JSONArray();
 
-        JSONObject report = new JSONObject();
+        updated.put(report);
 
-        try {
-            report.put("cycle", cycleNumber);
-            report.put("start_epoch", startTimeWallMs);
-            report.put("start", formatTime(startTimeWallMs));
-            report.put("status", finalStatus);
-            report.put("clicks", Math.max(0L, completedClicks));
-
-        } catch (JSONException e) {
-            return;
-        }
-
-        JSONArray updatedReports = new JSONArray();
-
-        // گزارش جدید همیشه در ابتدای فهرست قرار می‌گیرد.
-        updatedReports.put(report);
-
-        // فقط 19 گزارش قبلی را نگه می‌داریم.
-        int oldCount = Math.min(
+        int count = Math.min(
                 oldReports.length(),
                 MAX_REPORTS - 1
         );
 
-        for (int i = 0; i < oldCount; i++) {
+        for (int i = 0; i < count; i++) {
+            JSONObject old = oldReports.optJSONObject(i);
 
-            JSONObject oldReport =
-                    oldReports.optJSONObject(i);
-
-            if (oldReport != null) {
-                updatedReports.put(oldReport);
+            if (old != null) {
+                updated.put(old);
             }
         }
 
         preferences.edit()
-                .putString(
-                        KEY_REPORTS,
-                        updatedReports.toString()
-                )
-                .commit();
+                .putString(KEY_REPORTS, updated.toString())
+                .apply();
     }
 
-    // ---------------------------------------------------------
-    // سازگاری با نسخه قبلی FloatingService
-    // ---------------------------------------------------------
-
-    public static synchronized void addReport(
-            Context context,
-            long cycleNumber,
-            long startTimeWallMs,
-            long actualDurationMs,
-            long successfulClicks,
-            long failedClicks,
-            long averageGestureLatencyNanos,
-            long maxGestureLatencyNanos,
-            long measuredGestures
-    ) {
-
-        String status;
-
-        if (failedClicks > 0) {
-            status = STATUS_RED;
-        } else {
-            status = STATUS_GREEN;
-        }
-
-        addReport(
-                context,
-                cycleNumber,
-                startTimeWallMs,
-                status,
-                successfulClicks
-        );
-    }
-
-    // ---------------------------------------------------------
-    // گزارش خلاصه
-    // ---------------------------------------------------------
-
+    // گزارش آخرین کلیک
     public static synchronized String getReportSummary(
             Context context
     ) {
 
-        if (context == null) {
-            return "گزارشی ثبت نشده است.";
-        }
+        List<String> reports = getReports(context);
 
-        SharedPreferences preferences =
-                context.getSharedPreferences(
-                        PREF_NAME,
-                        Context.MODE_PRIVATE
-                );
-
-        JSONArray reports = loadArray(preferences);
-
-        if (reports.length() == 0) {
+        if (reports.isEmpty()) {
             return "هنوز گزارشی ثبت نشده است.";
         }
 
-        JSONObject latest = reports.optJSONObject(0);
-
-        if (latest == null) {
-            return "گزارشی ثبت نشده است.";
-        }
-
-        String start = getStartTime(latest);
-        String status = latest.optString(
-                "status",
-                STATUS_RED
-        );
-
-        long clicks = latest.optLong("clicks", 0L);
-
-        StringBuilder result = new StringBuilder();
-
-        result.append("تعداد گزارش‌ها: ")
-                .append(reports.length())
-                .append(" از ")
-                .append(MAX_REPORTS)
-                .append("\n\n");
-
-        result.append(buildReportText(
-                start,
-                status,
-                clicks
-        ));
-
-        return result.toString();
+        return reports.get(0);
     }
 
-    // ---------------------------------------------------------
-    // گزارش‌های صفحه اصلی: 20 مورد آخر
-    // ---------------------------------------------------------
-
+    // گزارش‌های صفحه اصلی
     public static synchronized List<String> getReports(
             Context context
     ) {
-
-        return getReportsInternal(
-                context,
-                MAX_REPORTS
-        );
+        return getReportsInternal(context, MAX_REPORTS);
     }
 
-    // ---------------------------------------------------------
-    // گزارش‌های پنل شناور: 10 مورد آخر
-    // ---------------------------------------------------------
-
+    // گزارش‌های پنل شناور
     public static synchronized List<String> getFloatingReports(
             Context context
     ) {
-
         return getReportsInternal(
                 context,
                 FLOATING_MAX_REPORTS
@@ -229,9 +120,7 @@ public final class CycleReportStore {
 
         List<String> result = new ArrayList<>();
 
-        if (context == null) {
-            return result;
-        }
+        if (context == null) return result;
 
         SharedPreferences preferences =
                 context.getSharedPreferences(
@@ -241,173 +130,68 @@ public final class CycleReportStore {
 
         JSONArray reports = loadArray(preferences);
 
-        int count = Math.min(
-                reports.length(),
-                maximum
-        );
+        int count = Math.min(reports.length(), maximum);
 
         for (int i = 0; i < count; i++) {
 
-            JSONObject report =
-                    reports.optJSONObject(i);
+            JSONObject report = reports.optJSONObject(i);
 
-            if (report == null) {
-                continue;
-            }
+            if (report == null) continue;
 
-            String start = getStartTime(report);
+            long cycle = report.optLong("cycle", 0);
+            long click = report.optLong("click", 0);
 
-            String status = normalizeStatus(
-                    report.optString(
-                            "status",
-                            STATUS_RED
-                    )
-            );
+            long target = report.optLong("target", 0);
+            long actual = report.optLong("actual", 0);
 
-            long clicks = report.optLong(
-                    "clicks",
-                    0L
-            );
+            long difference = actual - target;
+
+            String sign = difference > 0 ? "+" : "";
 
             result.add(
-                    buildReportText(
-                            start,
-                            status,
-                            clicks
-                    )
+                    "چرخه " + cycle +
+                    " | کلیک " + click +
+                    "\nهدف: " + formatTime(target) +
+                    " | واقعی: " + formatTime(actual) +
+                    "\nاختلاف: " + sign + difference + " ms"
             );
         }
 
         return result;
     }
 
-    // ---------------------------------------------------------
-    // ساخت متن ساده گزارش
-    // ---------------------------------------------------------
-
-    private static String buildReportText(
-            String start,
-            String status,
-            long clicks
-    ) {
-
-        if (STATUS_GREEN.equals(status)) {
-
-            return "🟢  " + start;
-        }
-
-        if (STATUS_YELLOW.equals(status)) {
-
-            return "🟡  " + start
-                    + "  |  کلیک انجام‌شده: "
-                    + clicks;
-        }
-
-        return "🔴  " + start
-                + "  |  کلیک انجام‌شده: "
-                + clicks;
-    }
-
-    // ---------------------------------------------------------
-    // زمان شروع گزارش
-    // ---------------------------------------------------------
-
-    private static String getStartTime(
-            JSONObject report
-    ) {
-
-        long startEpoch = report.optLong(
-                "start_epoch",
-                0L
-        );
-
-        if (startEpoch > 0) {
-            return formatTime(startEpoch);
-        }
-
-        return report.optString(
-                "start",
-                "-"
-        );
-    }
-
-    // ---------------------------------------------------------
-    // پاک کردن تمام گزارش‌ها
-    // ---------------------------------------------------------
-
+    // پاک کردن گزارش‌ها
     public static synchronized void clearReports(
             Context context
     ) {
 
-        if (context == null) {
-            return;
-        }
+        if (context == null) return;
 
-        SharedPreferences preferences =
-                context.getSharedPreferences(
-                        PREF_NAME,
-                        Context.MODE_PRIVATE
-                );
-
-        preferences.edit()
+        context.getSharedPreferences(
+                PREF_NAME,
+                Context.MODE_PRIVATE
+        ).edit()
                 .remove(KEY_REPORTS)
-                .commit();
+                .apply();
     }
-
-    // ---------------------------------------------------------
-    // بارگذاری گزارش‌ها
-    // ---------------------------------------------------------
 
     private static JSONArray loadArray(
             SharedPreferences preferences
     ) {
 
-        String json = preferences.getString(
-                KEY_REPORTS,
-                "[]"
-        );
-
-        if (json == null || json.trim().isEmpty()) {
-            return new JSONArray();
-        }
+        String json = preferences.getString(KEY_REPORTS, "[]");
 
         try {
             return new JSONArray(json);
-
         } catch (JSONException e) {
             return new JSONArray();
         }
     }
 
-    // ---------------------------------------------------------
-    // یکسان‌سازی وضعیت گزارش
-    // ---------------------------------------------------------
-
-    private static String normalizeStatus(
-            String status
-    ) {
-
-        if (STATUS_GREEN.equalsIgnoreCase(status)) {
-            return STATUS_GREEN;
-        }
-
-        if (STATUS_YELLOW.equalsIgnoreCase(status)) {
-            return STATUS_YELLOW;
-        }
-
-        return STATUS_RED;
-    }
-
-    // ---------------------------------------------------------
-    // تبدیل زمان
-    // ---------------------------------------------------------
-
     private static String formatTime(long timeMs) {
 
-        synchronized (DATE_FORMAT) {
-            return DATE_FORMAT.format(
-                    new Date(timeMs)
-            );
+        synchronized (TIME_FORMAT) {
+            return TIME_FORMAT.format(new Date(timeMs));
         }
     }
 }
