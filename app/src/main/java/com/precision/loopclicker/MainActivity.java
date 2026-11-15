@@ -30,10 +30,14 @@ import java.util.concurrent.Executors;
 
 public class MainActivity extends Activity {
 
-    private static final ZoneId IRAN_ZONE = ZoneId.of("Asia/Tehran");
+    private static final ZoneId IRAN_ZONE =
+            ZoneId.of("Asia/Tehran");
 
-    private static final String PREF_NAME = "precision_loop_settings";
-    private static final String PREF_CLOCK_SOURCE = "clock_source";
+    private static final String PREF_NAME =
+            "precision_loop_settings";
+
+    private static final String PREF_CLOCK_SOURCE =
+            "clock_source";
 
     private static final String PREF_INTERNET_EPOCH =
             "internet_epoch_at_sync_ms";
@@ -50,69 +54,63 @@ public class MainActivity extends Activity {
     private static final String ACTION_CLOCK_SOURCE_CHANGED =
             "com.precision.loopclicker.ACTION_CLOCK_SOURCE_CHANGED";
 
-    // فاصله همگام‌سازی عادی
     private static final long SYNC_INTERVAL_MS = 60000L;
-
-    // حداقل فاصله تلاش مجدد پس از شکست
     private static final long SYNC_RETRY_INTERVAL_MS = 10000L;
 
     private final android.os.Handler handler =
-            new android.os.Handler(android.os.Looper.getMainLooper());
+            new android.os.Handler(
+                    android.os.Looper.getMainLooper()
+            );
 
     private final ExecutorService networkExecutor =
             Executors.newSingleThreadExecutor();
 
+    // زمان شروع
     private EditText startHourInput;
     private EditText startMinuteInput;
     private EditText startSecondInput;
     private EditText startMillisInput;
 
+    // تنظیمات کلیک
     private EditText intervalSecondsInput;
     private EditText intervalMillisInput;
-
-    private EditText cycleSecondsInput;
-    private EditText cycleMillisInput;
     private EditText clickCountInput;
-    private EditText cycleTotalCountInput;
     private EditText touchMillisInput;
 
-    private EditText pauseSecondsInput;
-    private EditText pauseMillisInput;
-
+    // ساعت‌ها
     private TextView phoneClock;
     private TextView internetClock;
     private TextView clockDifference;
     private TextView syncStatus;
 
+    // شمارش معکوس
     private TextView countdownHour;
     private TextView countdownMinute;
     private TextView countdownSecond;
     private TextView countdownMillis;
     private TextView countdownText;
 
-    private TextView reportSummary;
-
+    // انتخاب مبنای ساعت
     private RadioGroup clockSourceGroup;
 
+    // دکمه‌ها
     private Button startButton;
     private Button stopButton;
     private Button accessibilityButton;
     private Button overlayButton;
     private Button showFloatingButton;
-    private Button clearReportsButton;
     private Button shutdownButton;
 
     private SharedPreferences preferences;
 
-    // مرجع ساعت اینترنتی در لحظه دریافت پاسخ NTP
+    // مرجع ساعت اینترنتی
     private volatile long trustedEpochAtSync = 0;
     private volatile long elapsedAtSync = 0;
 
     private volatile boolean timeSynced = false;
     private volatile boolean syncInProgress = false;
 
-    // اطلاعات کیفیت ساعت فقط برای گزارش و نمایش هستند.
-    // این مقادیر هیچ نقشی در اجازه یا جلوگیری از کلیک ندارند.
+    // اطلاعات کیفیت ساعت
     private volatile long syncUncertaintyMs = 0;
     private volatile long syncRoundTripMs = 0;
     private volatile long syncSpreadMs = 0;
@@ -123,11 +121,9 @@ public class MainActivity extends Activity {
     private volatile boolean syncWithinTarget50ms = false;
 
     private volatile long lastSyncElapsed = 0;
-
-    // زمان آخرین تلاش برای همگام‌سازی؛
-    // برای جلوگیری از درخواست‌های مکرر NTP استفاده می‌شود.
     private volatile long lastSyncAttemptElapsed = 0;
 
+    // شمارش معکوس زمان شروع
     private boolean countdownActive = false;
     private long scheduledStartElapsed = 0;
 
@@ -182,7 +178,6 @@ public class MainActivity extends Activity {
 
         setupButtons();
 
-        refreshReports();
         updateClocks();
         syncInternetTime();
 
@@ -231,7 +226,10 @@ public class MainActivity extends Activity {
                 .apply();
     }
 
-    private void saveInternetTimeAnchor(long epochMs, long elapsedMs) {
+    private void saveInternetTimeAnchor(
+            long epochMs,
+            long elapsedMs
+    ) {
 
         if (epochMs <= 0 || elapsedMs <= 0) {
             return;
@@ -246,12 +244,6 @@ public class MainActivity extends Activity {
                 .apply();
     }
 
-    /**
-     * بررسی و بازیابی مرجع ذخیره‌شده ساعت اینترنتی.
-     *
-     * در صورت معتبر بودن، علاوه بر بررسی، متغیرهای اصلی
-     * trustedEpochAtSync و elapsedAtSync نیز مقداردهی می‌شوند.
-     */
     private boolean loadSavedInternetTimeAnchor() {
 
         if (preferences == null) {
@@ -280,8 +272,6 @@ public class MainActivity extends Activity {
         long currentElapsed = SystemClock.elapsedRealtime();
         long currentWall = System.currentTimeMillis();
 
-        // اگر elapsedRealtime از مقدار ذخیره‌شده کوچک‌تر باشد،
-        // احتمالاً دستگاه مجدداً راه‌اندازی شده است.
         if (currentElapsed < elapsed || currentWall < savedWall) {
             return false;
         }
@@ -289,8 +279,6 @@ public class MainActivity extends Activity {
         long elapsedDifference = currentElapsed - elapsed;
         long wallDifference = currentWall - savedWall;
 
-        // تشخیص احتمال راه‌اندازی مجدد دستگاه یا نامعتبر شدن
-        // مرجع monotonic ذخیره‌شده.
         long differenceBetweenClocks =
                 Math.abs(wallDifference - elapsedDifference);
 
@@ -298,22 +286,16 @@ public class MainActivity extends Activity {
             return false;
         }
 
-        // بررسی سرریز هنگام محاسبه زمان اینترنتی فعلی
         if (epoch > Long.MAX_VALUE - elapsedDifference) {
             return false;
         }
 
-        // بازیابی واقعی مرجع، نه فقط بررسی اعتبار آن
         trustedEpochAtSync = epoch;
         elapsedAtSync = elapsed;
 
         timeSynced = true;
-
-        // زمان آخرین مرجع برای مدیریت همگام‌سازی دوره‌ای
         lastSyncElapsed = elapsed;
 
-        // اطلاعات کیفیت نمونه قبلی ذخیره نشده‌اند.
-        // بنابراین فقط مشخص می‌کنیم که مرجع از حافظه بازیابی شده است.
         syncServerName = "مرجع ذخیره‌شده";
         syncUncertaintyMs = 0;
         syncRoundTripMs = 0;
@@ -328,8 +310,6 @@ public class MainActivity extends Activity {
 
     private void restoreClockSourceSelection() {
 
-        // ابتدا مرجع ساعت اینترنتی را بازیابی می‌کنیم.
-        // اگر معتبر باشد، حتی در صورت شکست NTP نیز قابل استفاده است.
         loadSavedInternetTimeAnchor();
 
         if (clockSourceGroup == null) {
@@ -338,13 +318,14 @@ public class MainActivity extends Activity {
 
         String source = getSavedClockSource();
 
-        boolean useInternetClock =
-                CLOCK_INTERNET.equals(source);
-
-        setClockSourceSelection(useInternetClock);
+        setClockSourceSelection(
+                CLOCK_INTERNET.equals(source)
+        );
     }
 
-    private void setClockSourceSelection(boolean useInternetClock) {
+    private void setClockSourceSelection(
+            boolean useInternetClock
+    ) {
 
         if (clockSourceGroup == null) {
             return;
@@ -421,8 +402,6 @@ public class MainActivity extends Activity {
                             && elapsedAnchor > 0
                             && SystemClock.elapsedRealtime() >= elapsedAnchor;
 
-            // اگر هنوز در حافظه مرجع نداریم، مرجع ذخیره‌شده
-            // را فقط در صورت معتبر بودن بازیابی می‌کنیم.
             if (!anchorAvailable && loadSavedInternetTimeAnchor()) {
 
                 epochAnchor = trustedEpochAtSync;
@@ -510,7 +489,6 @@ public class MainActivity extends Activity {
             return;
         }
 
-        // هماهنگ کردن مبنای ساعت با پنل شناور
         if (CLOCK_INTERNET.equals(floatingClockSource)) {
 
             setClockSourceSelection(true);
@@ -548,26 +526,11 @@ public class MainActivity extends Activity {
         intervalMillisInput =
                 findViewById(R.id.intervalMillisInput);
 
-        cycleSecondsInput =
-                findViewById(R.id.cycleSecondsInput);
-
-        cycleMillisInput =
-                findViewById(R.id.cycleMillisInput);
-
         clickCountInput =
                 findViewById(R.id.clickCountInput);
 
-        cycleTotalCountInput =
-                findViewById(R.id.cycleTotalCountInput);
-
         touchMillisInput =
                 findViewById(R.id.touchMillisInput);
-
-        pauseSecondsInput =
-                findViewById(R.id.pauseSecondsInput);
-
-        pauseMillisInput =
-                findViewById(R.id.pauseMillisInput);
 
         phoneClock = findViewById(R.id.phoneClock);
         internetClock = findViewById(R.id.internetClock);
@@ -580,8 +543,6 @@ public class MainActivity extends Activity {
         countdownMillis = findViewById(R.id.countdownMillis);
         countdownText = findViewById(R.id.countdownText);
 
-        reportSummary = findViewById(R.id.reportSummary);
-
         clockSourceGroup = findViewById(R.id.clockSourceGroup);
 
         startButton = findViewById(R.id.startButton);
@@ -589,7 +550,6 @@ public class MainActivity extends Activity {
         accessibilityButton = findViewById(R.id.accessibilityButton);
         overlayButton = findViewById(R.id.overlayButton);
         showFloatingButton = findViewById(R.id.showFloatingButton);
-        clearReportsButton = findViewById(R.id.clearReportsButton);
         shutdownButton = findViewById(R.id.shutdownButton);
     }
 
@@ -615,19 +575,6 @@ public class MainActivity extends Activity {
         overlayButton.setOnClickListener(v -> openOverlaySettings());
 
         showFloatingButton.setOnClickListener(v -> showFloatingPanel());
-
-        clearReportsButton.setOnClickListener(v -> {
-
-            CycleReportStore.clearReports(this);
-
-            refreshReports();
-
-            Toast.makeText(
-                    this,
-                    "گزارش‌ها پاک شدند",
-                    Toast.LENGTH_SHORT
-            ).show();
-        });
 
         shutdownButton.setOnClickListener(v -> shutdownApplication());
 
@@ -768,7 +715,9 @@ public class MainActivity extends Activity {
                 Locale.US
         );
 
-        format.setTimeZone(TimeZone.getTimeZone("Asia/Tehran"));
+        format.setTimeZone(
+                TimeZone.getTimeZone("Asia/Tehran")
+        );
 
         return format.format(new Date(epochMillis));
     }
@@ -785,7 +734,8 @@ public class MainActivity extends Activity {
 
         long delta = elapsedNow - elapsedAnchor;
 
-        if (delta < 0 || epochAnchor <= 0
+        if (delta < 0
+                || epochAnchor <= 0
                 || epochAnchor > Long.MAX_VALUE - delta) {
             return 0;
         }
@@ -794,7 +744,7 @@ public class MainActivity extends Activity {
     }
 
     // ---------------------------------------------------------
-    // همگام‌سازی با موتور دقیق‌تر NTP
+    // همگام‌سازی NTP
     // ---------------------------------------------------------
 
     private void syncInternetTime() {
@@ -803,12 +753,11 @@ public class MainActivity extends Activity {
             return;
         }
 
-        // ثبت زمان تلاش، پیش از شروع کار شبکه‌ای.
-        // حتی اگر درخواست ناموفق شود، تلاش بعدی زودتر از
-        // SYNC_RETRY_INTERVAL_MS انجام نخواهد شد.
-        lastSyncAttemptElapsed = SystemClock.elapsedRealtime();
+        lastSyncAttemptElapsed =
+                SystemClock.elapsedRealtime();
 
         syncInProgress = true;
+
         handler.post(this::updateClocks);
 
         networkExecutor.execute(() -> {
@@ -818,7 +767,7 @@ public class MainActivity extends Activity {
             try {
                 result = NtpTimeSync.synchronize();
             } catch (Exception ignored) {
-                // در صورت خطا، زمان معتبر قبلی حفظ می‌شود.
+                // زمان معتبر قبلی حفظ می‌شود.
             }
 
             final NtpTimeSync.Result finalResult = result;
@@ -868,15 +817,11 @@ public class MainActivity extends Activity {
 
                     timeSynced = true;
 
-                    // ذخیره مرجع جدید برای استفاده پنل شناور
-                    // و بازیابی در صورت بازسازی سرویس.
                     saveInternetTimeAnchor(
                             trustedEpochAtSync,
                             elapsedAtSync
                     );
 
-                    // اگر ساعت اینترنتی انتخاب شده باشد،
-                    // مرجع تازه فوراً به FloatingService می‌رسد.
                     if (CLOCK_INTERNET.equals(getSavedClockSource())) {
 
                         notifyFloatingClockSourceChanged(
@@ -886,8 +831,6 @@ public class MainActivity extends Activity {
 
                 } else {
 
-                    // اگر همگام‌سازی جدید ناموفق بود،
-                    // آخرین زمان معتبر قبلی را نگه می‌داریم.
                     if (!timeSynced) {
 
                         syncStatus.setText(
@@ -910,7 +853,7 @@ public class MainActivity extends Activity {
     }
 
     // ---------------------------------------------------------
-    // شروع اجرای لوپی
+    // شروع کلیک‌ها با زمان‌بندی
     // ---------------------------------------------------------
 
     private void startClicking() {
@@ -946,8 +889,6 @@ public class MainActivity extends Activity {
 
         saveClockSource(selectedClockSource);
 
-        // فقط دریافت حداقل یک زمان معتبر اینترنتی لازم است.
-        // عدم‌قطعیت بیشتر از ۵۰ میلی‌ثانیه مانع کلیک نمی‌شود.
         if (useInternetClock
                 && (!timeSynced || getTrustedNow() <= 0)) {
 
@@ -984,38 +925,17 @@ public class MainActivity extends Activity {
             long intervalMillis =
                     readNumber(intervalMillisInput, 20);
 
-            long cycleSeconds =
-                    readNumber(cycleSecondsInput, 60);
-
-            long cycleMillis =
-                    readNumber(cycleMillisInput, 0);
-
             long clickCount =
                     readNumber(clickCountInput, 2);
-
-            long totalCycleCount =
-                    readNumber(cycleTotalCountInput, 1);
 
             long touchMillis =
                     readNumber(touchMillisInput, 5);
 
-            long pauseSeconds =
-                    readNumber(pauseSecondsInput, 0);
-
-            long pauseMillis =
-                    readNumber(pauseMillisInput, 0);
-
             if (intervalSeconds < 0
                     || intervalMillis < 0
-                    || cycleSeconds < 0
-                    || cycleMillis < 0
                     || clickCount <= 0
                     || clickCount > Integer.MAX_VALUE
-                    || totalCycleCount <= 0
-                    || totalCycleCount > Integer.MAX_VALUE
-                    || touchMillis <= 0
-                    || pauseSeconds < 0
-                    || pauseMillis < 0) {
+                    || touchMillis <= 0) {
 
                 showError("یکی از مقادیر تنظیمات معتبر نیست.");
                 return;
@@ -1023,17 +943,6 @@ public class MainActivity extends Activity {
 
             long intervalDuration =
                     combineDuration(intervalSeconds, intervalMillis);
-
-            long cycleDuration =
-                    combineDuration(cycleSeconds, cycleMillis);
-
-            long pauseDuration =
-                    combineDuration(pauseSeconds, pauseMillis);
-
-            if (cycleDuration <= 0) {
-                showError("مدت چرخه باید بیشتر از صفر باشد.");
-                return;
-            }
 
             // -------------------------------------------------
             // ثبت مرجع ساعت و تبدیل زمان هدف به elapsedRealtime
@@ -1046,7 +955,6 @@ public class MainActivity extends Activity {
 
             if (useInternetClock) {
 
-                // هر دو مقدار از یک نمونه NTP گرفته می‌شوند.
                 internetEpochAnchor = trustedEpochAtSync;
                 internetElapsedAnchor = elapsedAtSync;
 
@@ -1057,8 +965,11 @@ public class MainActivity extends Activity {
                     return;
                 }
 
-                long elapsedNow = SystemClock.elapsedRealtime();
-                long elapsedDelta = elapsedNow - internetElapsedAnchor;
+                long elapsedNow =
+                        SystemClock.elapsedRealtime();
+
+                long elapsedDelta =
+                        elapsedNow - internetElapsedAnchor;
 
                 if (elapsedDelta < 0
                         || internetEpochAnchor > Long.MAX_VALUE - elapsedDelta) {
@@ -1067,12 +978,11 @@ public class MainActivity extends Activity {
                     return;
                 }
 
-                sourceNow = internetEpochAnchor + elapsedDelta;
+                sourceNow =
+                        internetEpochAnchor + elapsedDelta;
 
             } else {
 
-                // برای ساعت گوشی نیز زمان دیواری و monotonic
-                // در یک نقطه زمانی ثبت می‌شوند.
                 internetEpochAnchor = 0;
                 internetElapsedAnchor = 0;
 
@@ -1102,7 +1012,8 @@ public class MainActivity extends Activity {
                             .toInstant()
                             .toEpochMilli();
 
-            long startDelay = scheduledStartEpoch - sourceNow;
+            long startDelay =
+                    scheduledStartEpoch - sourceNow;
 
             if (startDelay <= 0) {
 
@@ -1114,11 +1025,8 @@ public class MainActivity extends Activity {
                 return;
             }
 
-            long nowElapsed = SystemClock.elapsedRealtime();
-
             if (useInternetClock) {
 
-                // تبدیل مستقیم زمان هدف اینترنتی به زمان monotonic.
                 long targetDelta =
                         scheduledStartEpoch - internetEpochAnchor;
 
@@ -1134,9 +1042,11 @@ public class MainActivity extends Activity {
 
             } else {
 
-                // جفت‌کردن زمان گوشی و elapsedRealtime در یک لحظه.
-                long phoneEpochAtAnchor = System.currentTimeMillis();
-                long elapsedAtAnchor = SystemClock.elapsedRealtime();
+                long phoneEpochAtAnchor =
+                        System.currentTimeMillis();
+
+                long elapsedAtAnchor =
+                        SystemClock.elapsedRealtime();
 
                 long targetDelta =
                         scheduledStartEpoch - phoneEpochAtAnchor;
@@ -1144,13 +1054,19 @@ public class MainActivity extends Activity {
                 if (targetDelta <= 0
                         || elapsedAtAnchor > Long.MAX_VALUE - targetDelta) {
 
-                    showError("زمان هدف معتبر نیست یا بیش از حد بزرگ است.");
+                    showError(
+                            "زمان هدف معتبر نیست یا بیش از حد بزرگ است."
+                    );
+
                     return;
                 }
 
                 scheduledStartElapsed =
                         elapsedAtAnchor + targetDelta;
             }
+
+            long nowElapsed =
+                    SystemClock.elapsedRealtime();
 
             long actualStartDelay =
                     scheduledStartElapsed - nowElapsed;
@@ -1171,27 +1087,25 @@ public class MainActivity extends Activity {
             Intent serviceIntent =
                     new Intent(this, FloatingService.class);
 
-            serviceIntent.setAction(FloatingService.ACTION_START);
+            serviceIntent.setAction(
+                    FloatingService.ACTION_START
+            );
 
-            // زمان هدف واقعی؛ برای نمایش و گزارش.
             serviceIntent.putExtra(
                     "start_time_epoch_ms",
                     scheduledStartEpoch
             );
 
-            // زمان مطلق monotonic؛ مرجع اصلی اجرای شروع.
             serviceIntent.putExtra(
                     "start_elapsed_realtime_ms",
                     scheduledStartElapsed
             );
 
-            // برای سازگاری با نسخه قبلی سرویس حفظ شده است.
             serviceIntent.putExtra(
                     "start_delay_ms",
                     actualStartDelay
             );
 
-            // مرجع ساعت اینترنتی برای نمایش ساعت صحیح در پنل شناور.
             if (useInternetClock) {
 
                 serviceIntent.putExtra(
@@ -1206,28 +1120,13 @@ public class MainActivity extends Activity {
             }
 
             serviceIntent.putExtra(
-                    "cycle_duration_ms",
-                    cycleDuration
-            );
-
-            serviceIntent.putExtra(
                     "click_count",
                     clickCount
             );
 
             serviceIntent.putExtra(
-                    "cycle_total_count",
-                    totalCycleCount
-            );
-
-            serviceIntent.putExtra(
                     "touch_duration_ms",
                     touchMillis
-            );
-
-            serviceIntent.putExtra(
-                    "pause_duration_ms",
-                    pauseDuration
             );
 
             serviceIntent.putExtra(
@@ -1256,8 +1155,7 @@ public class MainActivity extends Activity {
 
             Toast.makeText(
                     this,
-                    "زمان شروع ثبت شد. تعداد چرخه‌ها: "
-                            + totalCycleCount,
+                    "زمان شروع کلیک‌ها ثبت شد.",
                     Toast.LENGTH_SHORT
             ).show();
 
@@ -1271,11 +1169,16 @@ public class MainActivity extends Activity {
 
         } catch (Exception e) {
 
-            showError("خطا در ثبت زمان شروع: " + e.getMessage());
+            showError(
+                    "خطا در ثبت زمان شروع: " + e.getMessage()
+            );
         }
     }
 
-    private long readNumber(EditText input, long defaultValue) {
+    private long readNumber(
+            EditText input,
+            long defaultValue
+    ) {
 
         String value = input.getText().toString().trim();
 
@@ -1309,7 +1212,7 @@ public class MainActivity extends Activity {
     }
 
     // ---------------------------------------------------------
-    // شمارش معکوس
+    // شمارش معکوس تا زمان شروع
     // ---------------------------------------------------------
 
     private void updateCountdown() {
@@ -1319,7 +1222,8 @@ public class MainActivity extends Activity {
         }
 
         long remaining =
-                scheduledStartElapsed - SystemClock.elapsedRealtime();
+                scheduledStartElapsed
+                        - SystemClock.elapsedRealtime();
 
         if (remaining <= 0) {
 
@@ -1328,7 +1232,9 @@ public class MainActivity extends Activity {
             countdownSecond.setText("00");
             countdownMillis.setText("000");
 
-            countdownText.setText("زمان شروع فرا رسیده است.");
+            countdownText.setText(
+                    "زمان شروع فرا رسیده است."
+            );
 
             countdownActive = false;
             return;
@@ -1364,8 +1270,12 @@ public class MainActivity extends Activity {
 
         countdownActive = false;
 
-        Intent intent = new Intent(this, FloatingService.class);
-        intent.setAction(FloatingService.ACTION_STOP);
+        Intent intent =
+                new Intent(this, FloatingService.class);
+
+        intent.setAction(
+                FloatingService.ACTION_STOP
+        );
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(intent);
@@ -1373,7 +1283,9 @@ public class MainActivity extends Activity {
             startService(intent);
         }
 
-        countdownText.setText("اجرای کلیک‌ها متوقف شد.");
+        countdownText.setText(
+                "اجرای کلیک‌ها متوقف شد."
+        );
 
         Toast.makeText(
                 this,
@@ -1389,8 +1301,12 @@ public class MainActivity extends Activity {
             return;
         }
 
-        Intent intent = new Intent(this, FloatingService.class);
-        intent.setAction(FloatingService.SHOW_PANEL);
+        Intent intent =
+                new Intent(this, FloatingService.class);
+
+        intent.setAction(
+                FloatingService.SHOW_PANEL
+        );
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(intent);
@@ -1403,8 +1319,12 @@ public class MainActivity extends Activity {
 
         countdownActive = false;
 
-        Intent intent = new Intent(this, FloatingService.class);
-        intent.setAction(FloatingService.ACTION_SHUTDOWN);
+        Intent intent =
+                new Intent(this, FloatingService.class);
+
+        intent.setAction(
+                FloatingService.ACTION_SHUTDOWN
+        );
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(intent);
@@ -1431,9 +1351,13 @@ public class MainActivity extends Activity {
         }
 
         ComponentName serviceComponent =
-                new ComponentName(this, AutoClickService.class);
+                new ComponentName(
+                        this,
+                        AutoClickService.class
+                );
 
-        String expected = serviceComponent.flattenToString();
+        String expected =
+                serviceComponent.flattenToString();
 
         return enabledServices.toLowerCase(Locale.ROOT)
                 .contains(expected.toLowerCase(Locale.ROOT));
@@ -1452,26 +1376,10 @@ public class MainActivity extends Activity {
         }
     }
 
-    // ---------------------------------------------------------
-    // گزارش چرخه‌ها
-    // ---------------------------------------------------------
-
-    private void refreshReports() {
-
-        if (reportSummary == null) {
-            return;
-        }
-
-        reportSummary.setText(
-                CycleReportStore.getReportSummary(this)
-        );
-    }
-
     @Override
     protected void onResume() {
         super.onResume();
 
-        refreshReports();
         updateClocks();
     }
 
@@ -1479,6 +1387,7 @@ public class MainActivity extends Activity {
     protected void onDestroy() {
 
         handler.removeCallbacks(clockRunnable);
+
         networkExecutor.shutdownNow();
 
         super.onDestroy();
