@@ -172,7 +172,7 @@ public class MainActivity extends Activity {
         compensationInput = addInputAfter(
                 cycleCountInput,
                 "جبران دستی تأخیر ارسال (میلی‌ثانیه)",
-                "500"
+                "50"
         );
     }
 
