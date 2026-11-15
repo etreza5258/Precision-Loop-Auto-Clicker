@@ -12,6 +12,7 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.TimeZone;
 
 public final class CycleReportStore {
 
@@ -23,6 +24,12 @@ public final class CycleReportStore {
 
     private static final SimpleDateFormat TIME_FORMAT =
             new SimpleDateFormat("HH:mm:ss.SSS", Locale.US);
+
+    static {
+        TIME_FORMAT.setTimeZone(
+                TimeZone.getTimeZone("Asia/Tehran")
+        );
+    }
 
     private CycleReportStore() {
     }
@@ -70,6 +77,7 @@ public final class CycleReportStore {
         );
 
         for (int i = 0; i < count; i++) {
+
             JSONObject old = oldReports.optJSONObject(i);
 
             if (old != null) {
