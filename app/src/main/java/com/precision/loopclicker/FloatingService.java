@@ -1,4 +1,3 @@
-
 package com.precision.loopclicker;
 
 import android.app.Dialog;
@@ -23,10 +22,10 @@ import android.os.IBinder;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.provider.Settings;
+import android.util.Log;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
-import android.view.Window;
 import android.view.WindowManager;
 import android.widget.EditText;
 import android.widget.LinearLayout;
@@ -56,6 +55,8 @@ public class FloatingService extends Service {
 
     public static final String ACTION_START_FROM_FLOATING =
             "com.precision.loopclicker.ACTION_START_FROM_FLOATING";
+
+    private static final String TAG = "PrecisionLoop";
 
     private static final String CHANNEL_ID =
             "precision_loop_channel";
@@ -121,6 +122,41 @@ public class FloatingService extends Service {
     private int panelStartY;
 
     private Runnable displayRunnable;
+
+    // ---------------------------------------------------------
+    // Click scheduler
+    // ---------------------------------------------------------
+
+    private boolean clicking;
+
+    private boolean gestureWaiting;
+
+    private int runGeneration;
+
+    private int cycleIndex;
+    private int clickIndex;
+
+    private int clicksPerCycle;
+    private int cycleCount;
+
+    private long cycleDurationMs;
+    private long clickIntervalMs;
+    private long touchDurationMs;
+    private long compensationMs;
+
+    private long runStartElapsedMs;
+
+    private Runnable dispatchRunnable;
+
+    private int completedClicks;
+    private int expiredClicks;
+
+    private final StringBuilder reportBuffer =
+            new StringBuilder();
+
+    // ---------------------------------------------------------
+    // Clock source receiver
+    // ---------------------------------------------------------
 
     private final BroadcastReceiver clockSourceReceiver =
             new BroadcastReceiver() {
@@ -191,6 +227,10 @@ public class FloatingService extends Service {
         return instance;
     }
 
+    // ---------------------------------------------------------
+    // Service lifecycle
+    // ---------------------------------------------------------
+
     @Override
     public void onCreate() {
         super.onCreate();
@@ -235,12 +275,487 @@ public class FloatingService extends Service {
 
             shutdownService();
 
+        } else if (ACTION_STOP.equals(action)) {
+
+            stopClicking();
+
+        } else if (ACTION_START.equals(action)) {
+
+            createFloatingViews();
+            startClicking(intent);
+
         } else {
 
             createFloatingViews();
         }
 
         return START_STICKY;
+    }
+
+    // ---------------------------------------------------------
+    // Click scheduling
+    // ---------------------------------------------------------
+
+    private void startClicking(Intent intent) {
+
+        stopClicking();
+
+        int newGeneration = ++runGeneration;
+
+        long now = SystemClock.elapsedRealtime();
+
+        long requestedStart = intent.getLongExtra(
+                "start_elapsed_realtime_ms",
+                0L
+        );
+
+        if (requestedStart <= 0) {
+
+            long delay = intent.getLongExtra(
+                    "start_delay_ms",
+                    0L
+            );
+
+            requestedStart = now + Math.max(0L, delay);
+        }
+
+        int requestedClicks = intent.getIntExtra(
+                "clicks_per_cycle",
+                intent.getIntExtra("click_count", 1)
+        );
+
+        int requestedCycles = intent.getIntExtra(
+                "cycle_count",
+                1
+        );
+
+        long requestedCycleDuration = intent.getLongExtra(
+                "cycle_duration_ms",
+                0L
+        );
+
+        long requestedInterval = intent.getLongExtra(
+                "click_interval_ms",
+                50L
+        );
+
+        long requestedTouchDuration = intent.getLongExtra(
+                "touch_duration_ms",
+                1L
+        );
+
+        long requestedCompensation = intent.getLongExtra(
+                "compensation_ms",
+                intent.getLongExtra("dispatch_lead_ms", 50L)
+        );
+
+        if (requestedClicks < 1
+                || requestedCycles < 1
+                || requestedInterval < 0
+                || requestedCompensation < 0) {
+
+            updateStatus("تنظیمات اجرای کلیک نامعتبر است");
+            return;
+        }
+
+        if (requestedCycleDuration <= 0) {
+
+            long lastOffset;
+
+            try {
+                lastOffset = Math.multiplyExact(
+                        requestedClicks - 1L,
+                        requestedInterval
+                );
+            } catch (ArithmeticException e) {
+                updateStatus("مدت چرخه بیش از حد بزرگ است");
+                return;
+            }
+
+            requestedCycleDuration = lastOffset + 1L;
+        }
+
+        long lastClickOffset;
+
+        try {
+            lastClickOffset = Math.multiplyExact(
+                    requestedClicks - 1L,
+                    requestedInterval
+            );
+        } catch (ArithmeticException e) {
+            updateStatus("فاصله کلیک‌ها نامعتبر است");
+            return;
+        }
+
+        if (lastClickOffset >= requestedCycleDuration) {
+            updateStatus(
+                    "آخرین کلیک خارج از محدوده چرخه قرار می‌گیرد"
+            );
+            return;
+        }
+
+        try {
+
+            Math.multiplyExact(
+                    requestedCycles,
+                    requestedCycleDuration
+            );
+
+        } catch (ArithmeticException e) {
+
+            updateStatus("مدت کل اجرا بیش از حد بزرگ است");
+            return;
+        }
+
+        clicksPerCycle = requestedClicks;
+        cycleCount = requestedCycles;
+
+        cycleDurationMs = requestedCycleDuration;
+        clickIntervalMs = requestedInterval;
+        touchDurationMs = requestedTouchDuration;
+        compensationMs = requestedCompensation;
+
+        runStartElapsedMs = requestedStart;
+
+        cycleIndex = 0;
+        clickIndex = 0;
+
+        completedClicks = 0;
+        expiredClicks = 0;
+
+        gestureWaiting = false;
+
+        reportBuffer.setLength(0);
+
+        clicking = true;
+
+        updateStatus("زمان‌بندی کلیک‌ها آغاز شد");
+
+        Log.i(TAG,
+                "START cycles=" + cycleCount
+                        + " clicksPerCycle=" + clicksPerCycle
+                        + " cycleMs=" + cycleDurationMs
+                        + " intervalMs=" + clickIntervalMs
+                        + " compensationMs=" + compensationMs
+                        + " touchMs=" + touchDurationMs
+        );
+
+        scheduleNextClick(newGeneration);
+    }
+
+    private void scheduleNextClick(int generation) {
+
+        if (!clicking || generation != runGeneration) {
+            return;
+        }
+
+        if (cycleIndex >= cycleCount) {
+            finishClicking();
+            return;
+        }
+
+        if (clickIndex >= clicksPerCycle) {
+
+            cycleIndex++;
+            clickIndex = 0;
+
+            scheduleNextClick(generation);
+            return;
+        }
+
+        long cycleStart;
+        long targetElapsed;
+        long dispatchElapsed;
+        long cycleEnd;
+
+        try {
+
+            cycleStart = Math.addExact(
+                    runStartElapsedMs,
+                    Math.multiplyExact(
+                            cycleIndex,
+                            cycleDurationMs
+                    )
+            );
+
+            targetElapsed = Math.addExact(
+                    cycleStart,
+                    Math.multiplyExact(
+                            clickIndex,
+                            clickIntervalMs
+                    )
+            );
+
+            dispatchElapsed =
+                    targetElapsed - compensationMs;
+
+            cycleEnd = Math.addExact(
+                    cycleStart,
+                    cycleDurationMs
+            );
+
+        } catch (ArithmeticException e) {
+
+            updateStatus("خطای محاسبات زمان‌بندی");
+            stopClicking();
+            return;
+        }
+
+        final int currentCycle = cycleIndex;
+        final int currentClick = clickIndex;
+
+        final long currentTarget = targetElapsed;
+        final long currentDispatchTarget = dispatchElapsed;
+        final long currentCycleEnd = cycleEnd;
+
+        long now = SystemClock.elapsedRealtime();
+
+        if (now >= currentCycleEnd) {
+
+            reportExpired(
+                    currentCycle + 1,
+                    currentClick + 1,
+                    currentTarget
+            );
+
+            clickIndex++;
+
+            scheduleNextClick(generation);
+            return;
+        }
+
+        long delay = Math.max(
+                0L,
+                currentDispatchTarget - now
+        );
+
+        dispatchRunnable = () -> {
+
+            dispatchRunnable = null;
+
+            if (!clicking || generation != runGeneration) {
+                return;
+            }
+
+            long actualNow =
+                    SystemClock.elapsedRealtime();
+
+            if (actualNow >= currentCycleEnd) {
+
+                reportExpired(
+                        currentCycle + 1,
+                        currentClick + 1,
+                        currentTarget
+                );
+
+                clickIndex++;
+
+                scheduleNextClick(generation);
+                return;
+            }
+
+            dispatchClick(
+                    generation,
+                    currentCycle,
+                    currentClick,
+                    currentTarget,
+                    currentCycleEnd
+            );
+        };
+
+        handler.postDelayed(dispatchRunnable, delay);
+    }
+
+    private void dispatchClick(
+            int generation,
+            int cycle,
+            int click,
+            long targetElapsed,
+            long cycleEnd
+    ) {
+
+        if (!clicking || generation != runGeneration) {
+            return;
+        }
+
+        if (gestureWaiting) {
+            return;
+        }
+
+        AutoClickService service =
+                AutoClickService.getInstance();
+
+        if (service == null) {
+
+            updateStatus(
+                    "سرویس دسترس‌پذیری فعال نیست"
+            );
+
+            Log.e(TAG, "AutoClickService is null");
+
+            stopClicking();
+            return;
+        }
+
+        long dispatchTime =
+                SystemClock.elapsedRealtime();
+
+        if (dispatchTime >= cycleEnd) {
+
+            reportExpired(
+                    cycle + 1,
+                    click + 1,
+                    targetElapsed
+            );
+
+            clickIndex++;
+
+            scheduleNextClick(generation);
+            return;
+        }
+
+        long targetOffset =
+                targetElapsed - runStartElapsedMs;
+
+        long actualOffset =
+                dispatchTime - runStartElapsedMs;
+
+        long difference =
+                dispatchTime - targetElapsed;
+
+        String report = String.format(
+                Locale.US,
+                "چرخه %d | کلیک %d | هدف %dms | ارسال %dms | اختلاف %+dms",
+                cycle + 1,
+                click + 1,
+                targetOffset,
+                actualOffset,
+                difference
+        );
+
+        addReport(report);
+
+        gestureWaiting = true;
+
+        clickIndex++;
+
+        try {
+
+            service.performClickAtTarget(
+                    SystemClock.elapsedRealtimeNanos(),
+                    () -> {
+
+                        if (generation != runGeneration) {
+                            return;
+                        }
+
+                        gestureWaiting = false;
+
+                        completedClicks++;
+
+                        Log.i(
+                                TAG,
+                                "GESTURE COMPLETED cycle="
+                                        + (cycle + 1)
+                                        + " click="
+                                        + (click + 1)
+                        );
+
+                        scheduleNextClick(generation);
+                    }
+            );
+
+        } catch (Exception e) {
+
+            gestureWaiting = false;
+
+            Log.e(TAG, "Click dispatch error", e);
+
+            addReport("خطا در ارسال کلیک");
+
+            stopClicking();
+        }
+    }
+
+    private void reportExpired(
+            int cycle,
+            int click,
+            long targetElapsed
+    ) {
+
+        expiredClicks++;
+
+        long targetOffset =
+                targetElapsed - runStartElapsedMs;
+
+        String report = String.format(
+                Locale.US,
+                "منقضی: چرخه %d | کلیک %d | هدف %dms",
+                cycle,
+                click,
+                targetOffset
+        );
+
+        addReport(report);
+
+        Log.w(TAG, report);
+    }
+
+    private void addReport(String report) {
+
+        Log.i(TAG, report);
+
+        reportBuffer.append(report)
+                .append('\n');
+
+        if (reportBuffer.length() > 2500) {
+            reportBuffer.delete(
+                    0,
+                    reportBuffer.length() - 1800
+            );
+        }
+
+        updateStatus(report);
+    }
+
+    private void finishClicking() {
+
+        clicking = false;
+        gestureWaiting = false;
+
+        updateStatus(
+                "پایان اجرا | موفق: "
+                        + completedClicks
+                        + " | منقضی: "
+                        + expiredClicks
+        );
+
+        Log.i(
+                TAG,
+                "FINISHED completed="
+                        + completedClicks
+                        + " expired="
+                        + expiredClicks
+        );
+    }
+
+    private void stopClicking() {
+
+        clicking = false;
+
+        runGeneration++;
+
+        if (dispatchRunnable != null) {
+
+            handler.removeCallbacks(dispatchRunnable);
+            dispatchRunnable = null;
+        }
+
+        gestureWaiting = false;
+
+        updateStatus("اجرای کلیک‌ها متوقف شد");
+
+        Log.i(TAG, "STOP");
     }
 
     // ---------------------------------------------------------
@@ -828,7 +1343,9 @@ public class FloatingService extends Service {
         dialog.setContentView(root);
         dialog.setCancelable(true);
 
-        Window window = dialog.getWindow();
+        WindowManager.LayoutParams params;
+
+        android.view.Window window = dialog.getWindow();
 
         if (window != null) {
 
@@ -842,8 +1359,7 @@ public class FloatingService extends Service {
                     WindowManager.LayoutParams.FLAG_DIM_BEHIND
             );
 
-            WindowManager.LayoutParams params =
-                    window.getAttributes();
+            params = window.getAttributes();
 
             params.width = dp(340);
             params.height =
@@ -1241,6 +1757,8 @@ public class FloatingService extends Service {
 
     private void shutdownService() {
 
+        stopClicking();
+
         removeFloatingViews();
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -1272,6 +1790,8 @@ public class FloatingService extends Service {
 
     @Override
     public void onDestroy() {
+
+        stopClicking();
 
         if (displayRunnable != null) {
             handler.removeCallbacks(displayRunnable);
