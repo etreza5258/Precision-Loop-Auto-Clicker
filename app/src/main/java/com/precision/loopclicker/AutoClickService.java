@@ -1,3 +1,4 @@
+
 package com.precision.loopclicker;
 
 import android.accessibilityservice.AccessibilityService;
@@ -16,8 +17,18 @@ import java.util.List;
 public class AutoClickService extends AccessibilityService {
 
     private static final String TAG = "PrecisionAutoClick";
+
+    public interface DispatchListener {
+        void onDispatched(long dispatchElapsedRealtimeNanos);
+    }
+
     private static final long TAP_DURATION_MS = 1L;
+    private static final long MIN_SEQUENTIAL_INTERVAL_MS = 1L;
     private static final long NANOS_PER_MS = 1_000_000L;
+
+    private static final long MAX_ADAPTIVE_LEAD_NANOS = 5_000_000L;
+    private static final long MIN_ADAPTIVE_LEAD_NANOS = 0L;
+    private static final long ADAPTIVE_SAFETY_NANOS = 500_000L;
 
     private static volatile AutoClickService instance;
 
@@ -25,33 +36,47 @@ public class AutoClickService extends AccessibilityService {
 
     private volatile int targetX = 500;
     private volatile int targetY = 500;
-    private volatile boolean gestureInProgress;
-    private volatile boolean serviceReady;
+
+    private volatile boolean gestureInProgress = false;
+    private volatile boolean serviceReady = false;
 
     private Runnable activeCompletion;
-    private long activeGestureId;
-    private long dispatchStartNanos;
-    private int activeBatchClickCount;
-    private long activeBatchIntervalMs;
-    private long nextAllowedClickNanos;
+
+    private long activeGestureId = 0;
+    private long dispatchStartNanos = 0;
+
+    private int activeBatchClickCount = 0;
+    private long activeBatchIntervalMs = 0;
+
+    private long nextAllowedClickNanos = 0;
 
     private Runnable pendingScheduledClick;
-    private long scheduledClickGeneration;
+    private long scheduledClickGeneration = 0;
 
-    private volatile long successfulClicks;
-    private volatile long failedClicks;
-    private volatile long lastGestureLatencyNanos;
-    private volatile long totalGestureLatencyNanos;
-    private volatile long maxGestureLatencyNanos;
-    private volatile long measuredGestures;
+    private long activeScheduledTargetNanos = 0;
+    private boolean activeIsScheduledSingleClick = false;
 
-    private volatile boolean lastBatchRejectedForInterval;
-    private volatile int lastBatchRejectedClickCount;
+    private volatile long averageCompletionOverheadNanos = 0;
+    private volatile long adaptiveDispatchLeadNanos = 0;
+    private volatile long adaptiveSamples = 0;
+
+    private volatile boolean lastBatchRejectedForInterval = false;
+    private volatile int lastBatchSkippedByDeadline = 0;
+    private volatile int lastBatchRejectedClickCount = 0;
+
+    private volatile long successfulClicks = 0;
+    private volatile long failedClicks = 0;
+
+    private volatile long lastGestureLatencyNanos = 0;
+    private volatile long totalGestureLatencyNanos = 0;
+    private volatile long maxGestureLatencyNanos = 0;
+    private volatile long measuredGestures = 0;
+
     private volatile String lastError = "هنوز کلیکی ارسال نشده";
 
-    // -------------------------------------------------
-    // Callback benchmark
-    // -------------------------------------------------
+    // ---------------------------------------------------------
+    // Callback benchmark state (kept separate from normal counters)
+    // ---------------------------------------------------------
 
     public interface CallbackBenchmarkListener {
         void onBenchmarkFinished(CallbackBenchmarkResult result);
@@ -73,65 +98,42 @@ public class AutoClickService extends AccessibilityService {
         public final boolean cancelled;
 
         private CallbackBenchmarkResult(
-                int requested,
-                int attempted,
+                int requestedAttempts,
+                int attemptedAttempts,
                 int callbacks,
-                int successful,
+                int successfulCallbacks,
                 int cancelledCallbacks,
-                int rejected,
-                long min,
-                double average,
-                long median,
-                long p95,
-                long max,
-                List<Long> samples,
+                int rejectedAttempts,
+                long minCallbackMs,
+                double averageCallbackMs,
+                long medianCallbackMs,
+                long p95CallbackMs,
+                long maxCallbackMs,
+                List<Long> samplesMs,
                 boolean cancelled
         ) {
-            requestedAttempts = requested;
-            attemptedAttempts = attempted;
+            this.requestedAttempts = requestedAttempts;
+            this.attemptedAttempts = attemptedAttempts;
             this.callbacks = callbacks;
-            successfulCallbacks = successful;
+            this.successfulCallbacks = successfulCallbacks;
             this.cancelledCallbacks = cancelledCallbacks;
-            rejectedAttempts = rejected;
-            minCallbackMs = min;
-            averageCallbackMs = average;
-            medianCallbackMs = median;
-            p95CallbackMs = p95;
-            maxCallbackMs = max;
-            samplesMs = Collections.unmodifiableList(
-                    new ArrayList<>(samples)
+            this.rejectedAttempts = rejectedAttempts;
+            this.minCallbackMs = minCallbackMs;
+            this.averageCallbackMs = averageCallbackMs;
+            this.medianCallbackMs = medianCallbackMs;
+            this.p95CallbackMs = p95CallbackMs;
+            this.maxCallbackMs = maxCallbackMs;
+            this.samplesMs = Collections.unmodifiableList(
+                    new ArrayList<>(samplesMs)
             );
             this.cancelled = cancelled;
         }
     }
 
-    private volatile boolean callbackBenchmarkRunning;
-    private volatile boolean callbackBenchmarkCancelRequested;
 
-    private boolean activeBenchmarkAttempt;
-    private boolean benchmarkDispatchAccepted;
-
-    private int benchmarkRequested;
-    private int benchmarkAttempted;
-    private int benchmarkCallbacks;
-    private int benchmarkSuccessful;
-    private int benchmarkCancelled;
-    private int benchmarkRejected;
-
-    private long benchmarkIntervalAfterCallbackMs = 50L;
-    private long benchmarkAttemptStartNanos;
-    private long benchmarkGeneration;
-
-    private Runnable pendingBenchmarkStep;
-    private CallbackBenchmarkListener benchmarkListener;
-
-    private final ArrayList<Long> benchmarkSamplesMs = new ArrayList<>();
-
-    private volatile CallbackBenchmarkResult lastCallbackBenchmarkResult;
-
-    // -------------------------------------------------
-    // Dispatch timing benchmark
-    // -------------------------------------------------
+    // ---------------------------------------------------------
+    // Dispatch timing benchmark result (separate from normal counters)
+    // ---------------------------------------------------------
 
     public interface DispatchTimingBenchmarkListener {
         void onBenchmarkFinished(DispatchTimingBenchmarkResult result);
@@ -145,7 +147,6 @@ public class AutoClickService extends AccessibilityService {
         public final int successfulCallbacks;
         public final int cancelledCallbacks;
         public final int rejectedAttempts;
-
         public final double requestedIntervalMs;
         public final double minActualIntervalMs;
         public final double averageActualIntervalMs;
@@ -156,110 +157,122 @@ public class AutoClickService extends AccessibilityService {
         public final double p95AbsoluteIntervalErrorMs;
         public final double averageDispatchLatenessMs;
         public final double p95DispatchLatenessMs;
-
         public final boolean cancelled;
         public final String cancellationReason;
         public final int interruptions;
 
         private DispatchTimingBenchmarkResult(
-                int requested,
-                int attempted,
-                int accepted,
+                int requestedAttempts,
+                int attemptedAttempts,
+                int acceptedDispatches,
                 int callbacks,
-                int successful,
+                int successfulCallbacks,
                 int cancelledCallbacks,
-                int rejected,
-                double requestedInterval,
-                double min,
-                double average,
-                double median,
-                double p95,
-                double max,
-                double averageError,
-                double p95Error,
-                double averageLateness,
-                double p95Lateness,
+                int rejectedAttempts,
+                double requestedIntervalMs,
+                double minActualIntervalMs,
+                double averageActualIntervalMs,
+                double medianActualIntervalMs,
+                double p95ActualIntervalMs,
+                double maxActualIntervalMs,
+                double averageIntervalErrorMs,
+                double p95AbsoluteIntervalErrorMs,
+                double averageDispatchLatenessMs,
+                double p95DispatchLatenessMs,
                 boolean cancelled,
-                String reason,
+                String cancellationReason,
                 int interruptions
         ) {
-            requestedAttempts = requested;
-            attemptedAttempts = attempted;
-            acceptedDispatches = accepted;
+            this.requestedAttempts = requestedAttempts;
+            this.attemptedAttempts = attemptedAttempts;
+            this.acceptedDispatches = acceptedDispatches;
             this.callbacks = callbacks;
-            successfulCallbacks = successful;
+            this.successfulCallbacks = successfulCallbacks;
             this.cancelledCallbacks = cancelledCallbacks;
-            rejectedAttempts = rejected;
-
-            requestedIntervalMs = requestedInterval;
-            minActualIntervalMs = min;
-            averageActualIntervalMs = average;
-            medianActualIntervalMs = median;
-            p95ActualIntervalMs = p95;
-            maxActualIntervalMs = max;
-            averageIntervalErrorMs = averageError;
-            p95AbsoluteIntervalErrorMs = p95Error;
-            averageDispatchLatenessMs = averageLateness;
-            p95DispatchLatenessMs = p95Lateness;
-
+            this.rejectedAttempts = rejectedAttempts;
+            this.requestedIntervalMs = requestedIntervalMs;
+            this.minActualIntervalMs = minActualIntervalMs;
+            this.averageActualIntervalMs = averageActualIntervalMs;
+            this.medianActualIntervalMs = medianActualIntervalMs;
+            this.p95ActualIntervalMs = p95ActualIntervalMs;
+            this.maxActualIntervalMs = maxActualIntervalMs;
+            this.averageIntervalErrorMs = averageIntervalErrorMs;
+            this.p95AbsoluteIntervalErrorMs = p95AbsoluteIntervalErrorMs;
+            this.averageDispatchLatenessMs = averageDispatchLatenessMs;
+            this.p95DispatchLatenessMs = p95DispatchLatenessMs;
             this.cancelled = cancelled;
-            cancellationReason = reason;
+            this.cancellationReason = cancellationReason;
             this.interruptions = interruptions;
         }
     }
 
-    private volatile boolean dispatchTimingBenchmarkRunning;
-    private volatile boolean dispatchTimingBenchmarkCancelRequested;
-
-    private boolean activeTimingBenchmarkAttempt;
-    private boolean timingDispatchAccepted;
-
-    private int timingBenchmarkRequested;
-    private int timingBenchmarkAttempted;
-    private int timingBenchmarkAccepted;
-    private int timingBenchmarkCallbacks;
-    private int timingBenchmarkSuccessful;
-    private int timingBenchmarkCancelled;
-    private int timingBenchmarkRejected;
-    private int timingBenchmarkInterruptions;
-
+    private volatile boolean dispatchTimingBenchmarkRunning = false;
+    private volatile boolean dispatchTimingBenchmarkCancelRequested = false;
+    private boolean activeTimingBenchmarkAttempt = false;
+    private boolean timingDispatchAccepted = false;
+    private int timingBenchmarkRequested = 0;
+    private int timingBenchmarkAttempted = 0;
+    private int timingBenchmarkAccepted = 0;
+    private int timingBenchmarkCallbacks = 0;
+    private int timingBenchmarkSuccessful = 0;
+    private int timingBenchmarkCancelled = 0;
+    private int timingBenchmarkRejected = 0;
+    private int timingBenchmarkInterruptions = 0;
     private String timingBenchmarkCancellationReason = "";
-
-    private long timingBenchmarkIntervalNanos;
-    private long timingBenchmarkStartNanos;
-    private long timingBenchmarkTargetNanos;
-    private long timingBenchmarkPreviousDispatchNanos;
-    private long timingBenchmarkGeneration;
-
+    private long timingBenchmarkIntervalNanos = 50L * NANOS_PER_MS;
+    private long timingBenchmarkStartNanos = 0L;
+    private long timingBenchmarkTargetNanos = 0L;
+    private long timingBenchmarkPreviousDispatchNanos = 0L;
+    private long timingBenchmarkGeneration = 0L;
     private Runnable pendingTimingBenchmarkStep;
     private DispatchTimingBenchmarkListener timingBenchmarkListener;
-
     private final ArrayList<Double> timingActualIntervalsMs = new ArrayList<>();
     private final ArrayList<Double> timingIntervalErrorsMs = new ArrayList<>();
     private final ArrayList<Double> timingAbsoluteIntervalErrorsMs = new ArrayList<>();
     private final ArrayList<Double> timingDispatchLatenessMs = new ArrayList<>();
-
     private volatile DispatchTimingBenchmarkResult lastDispatchTimingBenchmarkResult;
 
-    // -------------------------------------------------
-    // Lifecycle
-    // -------------------------------------------------
+    private volatile boolean callbackBenchmarkRunning = false;
+    private volatile boolean callbackBenchmarkCancelRequested = false;
+    private boolean activeBenchmarkAttempt = false;
+    private boolean benchmarkDispatchAccepted = false;
+    private int benchmarkRequested = 0;
+    private int benchmarkAttempted = 0;
+    private int benchmarkCallbacks = 0;
+    private int benchmarkSuccessful = 0;
+    private int benchmarkCancelled = 0;
+    private int benchmarkRejected = 0;
+    private long benchmarkIntervalAfterCallbackMs = 50L;
+    private long benchmarkAttemptStartNanos = 0L;
+    private long benchmarkGeneration = 0L;
+    private Runnable pendingBenchmarkStep;
+    private CallbackBenchmarkListener benchmarkListener;
+    private final ArrayList<Long> benchmarkSamplesMs = new ArrayList<>();
+    private volatile CallbackBenchmarkResult lastCallbackBenchmarkResult;
 
     public static AutoClickService getInstance() {
         AutoClickService service = instance;
-        return service != null && service.serviceReady ? service : null;
+
+        if (service == null || !service.serviceReady) {
+            return null;
+        }
+
+        return service;
     }
 
     @Override
     protected void onServiceConnected() {
         super.onServiceConnected();
+
         instance = this;
         serviceReady = true;
+
         Log.i(TAG, "Accessibility service connected");
     }
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
+        // No page events are required.
     }
 
     @Override
@@ -267,9 +280,15 @@ public class AutoClickService extends AccessibilityService {
         cancelPendingScheduledClick();
         cancelCallbackBenchmark();
 
+        // Android may call onInterrupt() without destroying this service.
+        // Do not cancel the dispatch-timing benchmark here. In particular,
+        // do not mark its active gesture finished before Android delivers the
+        // real GestureResultCallback; doing so could allow overlapping taps.
         handler.post(() -> {
             if (dispatchTimingBenchmarkRunning) {
                 timingBenchmarkInterruptions++;
+                Log.w(TAG, "Accessibility onInterrupt during dispatch timing benchmark; "
+                        + "waiting for the active gesture callback");
             }
 
             if (gestureInProgress
@@ -289,7 +308,6 @@ public class AutoClickService extends AccessibilityService {
         cancelPendingScheduledClick();
         cancelCallbackBenchmark();
         cancelDispatchTimingBenchmark("سرویس دسترس‌پذیری بسته شد");
-
         serviceReady = false;
 
         Runnable cleanup = () -> {
@@ -308,14 +326,18 @@ public class AutoClickService extends AccessibilityService {
             handler.post(cleanup);
         }
 
-        if (instance == this) instance = null;
+        if (instance == this) {
+            instance = null;
+        }
+
+        Log.i(TAG, "Accessibility service destroyed");
 
         super.onDestroy();
     }
 
-    // -------------------------------------------------
-    // State and target
-    // -------------------------------------------------
+    // ---------------------------------------------------------
+    // Service state and target
+    // ---------------------------------------------------------
 
     public boolean isServiceReady() {
         return serviceReady;
@@ -338,8 +360,597 @@ public class AutoClickService extends AccessibilityService {
         return gestureInProgress;
     }
 
+    // ---------------------------------------------------------
+    // Statistics
+    // ---------------------------------------------------------
+
     public long getSuccessfulClicks() {
         return successfulClicks;
+    }
+
+    public boolean isCallbackBenchmarkRunning() {
+        return callbackBenchmarkRunning;
+    }
+
+    public CallbackBenchmarkResult getLastCallbackBenchmarkResult() {
+        return lastCallbackBenchmarkResult;
+    }
+
+
+    public boolean isDispatchTimingBenchmarkRunning() {
+        return dispatchTimingBenchmarkRunning;
+    }
+
+    public DispatchTimingBenchmarkResult getLastDispatchTimingBenchmarkResult() {
+        return lastDispatchTimingBenchmarkResult;
+    }
+
+    /**
+     * Sends real single-tap gestures on an absolute monotonic schedule.
+     * The next tap is never dispatched until Android completes/cancels
+     * the previous gesture. Late callbacks do not shift later target times.
+     */
+    public boolean startDispatchTimingBenchmark(
+            int requestedAttempts,
+            long requestedIntervalMs,
+            DispatchTimingBenchmarkListener listener
+    ) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            handler.post(() -> startDispatchTimingBenchmark(
+                    requestedAttempts, requestedIntervalMs, listener
+            ));
+            return true;
+        }
+
+        if (!serviceReady
+                || dispatchTimingBenchmarkRunning
+                || callbackBenchmarkRunning
+                || gestureInProgress
+                || pendingScheduledClick != null
+                || requestedAttempts < 2
+                || requestedAttempts > 2000
+                || requestedIntervalMs < 10L
+                || requestedIntervalMs > 60000L) {
+            return false;
+        }
+
+        dispatchTimingBenchmarkRunning = true;
+        dispatchTimingBenchmarkCancelRequested = false;
+        activeTimingBenchmarkAttempt = false;
+        timingDispatchAccepted = false;
+
+        timingBenchmarkRequested = requestedAttempts;
+        timingBenchmarkAttempted = 0;
+        timingBenchmarkAccepted = 0;
+        timingBenchmarkCallbacks = 0;
+        timingBenchmarkSuccessful = 0;
+        timingBenchmarkCancelled = 0;
+        timingBenchmarkRejected = 0;
+        timingBenchmarkInterruptions = 0;
+        timingBenchmarkCancellationReason = "";
+
+        timingBenchmarkIntervalNanos =
+                requestedIntervalMs * NANOS_PER_MS;
+
+        // A short lead gives the first Handler target time to be armed.
+        timingBenchmarkStartNanos =
+                SystemClock.elapsedRealtimeNanos() + 300L * NANOS_PER_MS;
+
+        timingBenchmarkTargetNanos = timingBenchmarkStartNanos;
+        timingBenchmarkPreviousDispatchNanos = 0L;
+
+        timingBenchmarkListener = listener;
+        timingActualIntervalsMs.clear();
+        timingIntervalErrorsMs.clear();
+        timingAbsoluteIntervalErrorsMs.clear();
+        timingDispatchLatenessMs.clear();
+        lastDispatchTimingBenchmarkResult = null;
+
+        final long generation = ++timingBenchmarkGeneration;
+        scheduleDispatchTimingAttempt(generation);
+        return true;
+    }
+
+    public void cancelDispatchTimingBenchmark() {
+        cancelDispatchTimingBenchmark("لغو به درخواست کاربر");
+    }
+
+    private void cancelDispatchTimingBenchmark(String reason) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            handler.post(() -> cancelDispatchTimingBenchmark(reason));
+            return;
+        }
+
+        if (!dispatchTimingBenchmarkRunning) {
+            return;
+        }
+
+        if (timingBenchmarkCancellationReason.isEmpty()) {
+            timingBenchmarkCancellationReason = reason;
+        }
+        dispatchTimingBenchmarkCancelRequested = true;
+        timingBenchmarkGeneration++;
+
+        if (pendingTimingBenchmarkStep != null) {
+            handler.removeCallbacks(pendingTimingBenchmarkStep);
+            pendingTimingBenchmarkStep = null;
+        }
+
+        if (!activeTimingBenchmarkAttempt) {
+            finishDispatchTimingBenchmark(true);
+        }
+    }
+
+    private void scheduleDispatchTimingAttempt(long generation) {
+        if (!dispatchTimingBenchmarkRunning) {
+            return;
+        }
+
+        if (dispatchTimingBenchmarkCancelRequested
+                || timingBenchmarkAttempted >= timingBenchmarkRequested) {
+            finishDispatchTimingBenchmark(
+                    dispatchTimingBenchmarkCancelRequested
+            );
+            return;
+        }
+
+        timingBenchmarkTargetNanos = safeAdd(
+                timingBenchmarkStartNanos,
+                safeMultiply(
+                        timingBenchmarkAttempted,
+                        timingBenchmarkIntervalNanos
+                )
+        );
+
+        pendingTimingBenchmarkStep = new Runnable() {
+            @Override
+            public void run() {
+                if (!dispatchTimingBenchmarkRunning
+                        || generation != timingBenchmarkGeneration
+                        || dispatchTimingBenchmarkCancelRequested) {
+                    return;
+                }
+
+                long now = SystemClock.elapsedRealtimeNanos();
+                if (now < timingBenchmarkTargetNanos) {
+                    long delay = remainingDelayMs(
+                            timingBenchmarkTargetNanos, now
+                    );
+                    handler.postDelayed(this, delay);
+                    return;
+                }
+
+                pendingTimingBenchmarkStep = null;
+                runDispatchTimingAttempt(generation);
+            }
+        };
+
+        long now = SystemClock.elapsedRealtimeNanos();
+        long delay = remainingDelayMs(timingBenchmarkTargetNanos, now);
+        if (delay == 0L) {
+            pendingTimingBenchmarkStep.run();
+        } else {
+            handler.postDelayed(pendingTimingBenchmarkStep, delay);
+        }
+    }
+
+    private void runDispatchTimingAttempt(long generation) {
+        if (!dispatchTimingBenchmarkRunning
+                || generation != timingBenchmarkGeneration
+                || dispatchTimingBenchmarkCancelRequested) {
+            return;
+        }
+
+        if (!serviceReady || gestureInProgress || pendingScheduledClick != null) {
+            timingBenchmarkRejected++;
+            timingBenchmarkAttempted++;
+            scheduleDispatchTimingAttempt(generation);
+            return;
+        }
+
+        timingBenchmarkAttempted++;
+        activeTimingBenchmarkAttempt = true;
+        timingDispatchAccepted = false;
+
+        int dispatched = performClickBatch(1, 0L, null);
+
+        if (dispatched > 0) {
+            timingDispatchAccepted = true;
+            timingBenchmarkAccepted++;
+
+            // dispatchStartNanos is captured immediately before the
+            // dispatchGesture() call inside performClickBatch().
+            long actualDispatchNanos = dispatchStartNanos;
+            double latenessMs =
+                    (actualDispatchNanos - timingBenchmarkTargetNanos)
+                            / (double) NANOS_PER_MS;
+
+            timingDispatchLatenessMs.add(latenessMs);
+
+            if (timingBenchmarkPreviousDispatchNanos > 0L) {
+                double actualIntervalMs =
+                        (actualDispatchNanos - timingBenchmarkPreviousDispatchNanos)
+                                / (double) NANOS_PER_MS;
+                double intervalErrorMs =
+                        actualIntervalMs
+                                - (timingBenchmarkIntervalNanos
+                                / (double) NANOS_PER_MS);
+
+                timingActualIntervalsMs.add(actualIntervalMs);
+                timingIntervalErrorsMs.add(intervalErrorMs);
+                timingAbsoluteIntervalErrorsMs.add(
+                        Math.abs(intervalErrorMs)
+                );
+            }
+
+            timingBenchmarkPreviousDispatchNanos = actualDispatchNanos;
+        } else if (activeTimingBenchmarkAttempt) {
+            activeTimingBenchmarkAttempt = false;
+            timingBenchmarkRejected++;
+            scheduleDispatchTimingAttempt(generation);
+        }
+    }
+
+    private void onDispatchTimingGestureFinished(boolean success) {
+        if (!activeTimingBenchmarkAttempt) {
+            return;
+        }
+
+        activeTimingBenchmarkAttempt = false;
+
+        if (timingDispatchAccepted) {
+            timingBenchmarkCallbacks++;
+            if (success) {
+                timingBenchmarkSuccessful++;
+            } else {
+                timingBenchmarkCancelled++;
+            }
+        } else {
+            timingBenchmarkRejected++;
+        }
+
+        timingDispatchAccepted = false;
+        scheduleDispatchTimingAttempt(timingBenchmarkGeneration);
+    }
+
+    private void finishDispatchTimingBenchmark(boolean cancelled) {
+        if (!dispatchTimingBenchmarkRunning) {
+            return;
+        }
+
+        dispatchTimingBenchmarkRunning = false;
+        dispatchTimingBenchmarkCancelRequested = false;
+        activeTimingBenchmarkAttempt = false;
+
+        if (pendingTimingBenchmarkStep != null) {
+            handler.removeCallbacks(pendingTimingBenchmarkStep);
+            pendingTimingBenchmarkStep = null;
+        }
+
+        double[] actual = summarizeDoubles(timingActualIntervalsMs);
+        double[] absoluteErrors = summarizeDoubles(
+                timingAbsoluteIntervalErrorsMs
+        );
+        double[] lateness = summarizeDoubles(timingDispatchLatenessMs);
+
+        double averageError = 0.0;
+        if (!timingIntervalErrorsMs.isEmpty()) {
+            double sum = 0.0;
+            for (Double value : timingIntervalErrorsMs) {
+                sum += value;
+            }
+            averageError = sum / timingIntervalErrorsMs.size();
+        }
+
+        DispatchTimingBenchmarkResult result =
+                new DispatchTimingBenchmarkResult(
+                        timingBenchmarkRequested,
+                        timingBenchmarkAttempted,
+                        timingBenchmarkAccepted,
+                        timingBenchmarkCallbacks,
+                        timingBenchmarkSuccessful,
+                        timingBenchmarkCancelled,
+                        timingBenchmarkRejected,
+                        timingBenchmarkIntervalNanos
+                                / (double) NANOS_PER_MS,
+                        actual[0],
+                        actual[1],
+                        actual[2],
+                        actual[3],
+                        actual[4],
+                        averageError,
+                        absoluteErrors[3],
+                        lateness[1],
+                        lateness[3],
+                        cancelled,
+                        cancelled ? timingBenchmarkCancellationReason : "",
+                        timingBenchmarkInterruptions
+                );
+
+        lastDispatchTimingBenchmarkResult = result;
+        if (cancelled) {
+            Log.w(TAG, "Dispatch timing benchmark cancelled: "
+                    + result.cancellationReason
+                    + " | interruptions=" + result.interruptions
+                    + " | attempted=" + result.attemptedAttempts
+                    + " | callbacks=" + result.callbacks);
+        } else if (result.interruptions > 0) {
+            Log.i(TAG, "Dispatch timing benchmark completed with interruptions="
+                    + result.interruptions);
+        }
+        DispatchTimingBenchmarkListener listener = timingBenchmarkListener;
+        timingBenchmarkListener = null;
+
+        if (listener != null) {
+            try {
+                listener.onBenchmarkFinished(result);
+            } catch (Exception e) {
+                Log.e(TAG, "Dispatch timing benchmark listener failed", e);
+            }
+        }
+    }
+
+    // Returns {min, average, median, p95, max}; values are milliseconds.
+    private static double[] summarizeDoubles(List<Double> values) {
+        if (values == null || values.isEmpty()) {
+            return new double[]{0.0, 0.0, 0.0, 0.0, 0.0};
+        }
+
+        ArrayList<Double> sorted = new ArrayList<>(values);
+        Collections.sort(sorted);
+
+        double sum = 0.0;
+        for (Double value : sorted) {
+            sum += value;
+        }
+
+        int size = sorted.size();
+        double median = (size % 2 == 1)
+                ? sorted.get(size / 2)
+                : (sorted.get(size / 2 - 1) + sorted.get(size / 2)) / 2.0;
+
+        int p95Index = Math.max(
+                0,
+                (int) Math.ceil(size * 0.95) - 1
+        );
+
+        return new double[]{
+                sorted.get(0),
+                sum / size,
+                median,
+                sorted.get(p95Index),
+                sorted.get(size - 1)
+        };
+    }
+
+    /**
+     * Runs real accessibility taps at the currently configured target.
+     * Minimum interval is 50 ms and maximum attempts is 5000.
+     */
+    public boolean startCallbackBenchmark(
+            int requestedAttempts,
+            long intervalAfterCallbackMs,
+            CallbackBenchmarkListener listener
+    ) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            handler.post(() -> startCallbackBenchmark(
+                    requestedAttempts,
+                    intervalAfterCallbackMs,
+                    listener
+            ));
+            return true;
+        }
+
+        if (!serviceReady || callbackBenchmarkRunning
+                || dispatchTimingBenchmarkRunning
+                || gestureInProgress || pendingScheduledClick != null
+                || requestedAttempts < 1 || requestedAttempts > 5000
+                || intervalAfterCallbackMs < 50L) {
+            return false;
+        }
+
+        callbackBenchmarkRunning = true;
+        callbackBenchmarkCancelRequested = false;
+        benchmarkRequested = requestedAttempts;
+        benchmarkAttempted = 0;
+        benchmarkCallbacks = 0;
+        benchmarkSuccessful = 0;
+        benchmarkCancelled = 0;
+        benchmarkRejected = 0;
+        benchmarkIntervalAfterCallbackMs = intervalAfterCallbackMs;
+        benchmarkListener = listener;
+        benchmarkSamplesMs.clear();
+        lastCallbackBenchmarkResult = null;
+
+        final long generation = ++benchmarkGeneration;
+        pendingBenchmarkStep = () -> runCallbackBenchmarkAttempt(generation);
+        handler.post(pendingBenchmarkStep);
+        return true;
+    }
+
+    public void cancelCallbackBenchmark() {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            handler.post(this::cancelCallbackBenchmark);
+            return;
+        }
+
+        if (!callbackBenchmarkRunning) {
+            return;
+        }
+
+        callbackBenchmarkCancelRequested = true;
+        benchmarkGeneration++;
+
+        if (pendingBenchmarkStep != null) {
+            handler.removeCallbacks(pendingBenchmarkStep);
+            pendingBenchmarkStep = null;
+        }
+
+        // If a test gesture is in flight, wait for its Android callback.
+        // No new benchmark tap will be scheduled after that callback.
+        if (!activeBenchmarkAttempt) {
+            finishCallbackBenchmark(true);
+        }
+    }
+
+    private void runCallbackBenchmarkAttempt(long generation) {
+        pendingBenchmarkStep = null;
+
+        if (!callbackBenchmarkRunning
+                || callbackBenchmarkCancelRequested
+                || generation != benchmarkGeneration) {
+            if (callbackBenchmarkRunning && callbackBenchmarkCancelRequested
+                    && !activeBenchmarkAttempt) {
+                finishCallbackBenchmark(true);
+            }
+            return;
+        }
+
+        if (!serviceReady || gestureInProgress || pendingScheduledClick != null) {
+            benchmarkRejected++;
+            finishCallbackBenchmark(false);
+            return;
+        }
+
+        if (benchmarkAttempted >= benchmarkRequested) {
+            finishCallbackBenchmark(false);
+            return;
+        }
+
+        benchmarkAttempted++;
+        benchmarkAttemptStartNanos = SystemClock.elapsedRealtimeNanos();
+        activeBenchmarkAttempt = true;
+        benchmarkDispatchAccepted = false;
+
+        final int attemptNumber = benchmarkAttempted;
+        int dispatched = performClickBatch(1, 0L, () -> {
+            // A synchronous completion before dispatchGesture accepted the
+            // request means this attempt was rejected before a callback.
+            if (!benchmarkDispatchAccepted && activeBenchmarkAttempt) {
+                activeBenchmarkAttempt = false;
+                benchmarkRejected++;
+                scheduleNextBenchmarkAttempt(generation);
+            }
+        });
+
+        benchmarkDispatchAccepted = dispatched > 0;
+
+        // Defensive fallback for an early return that did not invoke completion.
+        if (dispatched <= 0 && activeBenchmarkAttempt && !gestureInProgress) {
+            activeBenchmarkAttempt = false;
+            benchmarkRejected++;
+            scheduleNextBenchmarkAttempt(generation);
+        }
+
+        Log.d(TAG, "Callback benchmark attempt " + attemptNumber
+                + " dispatched=" + dispatched);
+    }
+
+    private void onBenchmarkGestureFinished(boolean success, long latencyNanos) {
+        if (!activeBenchmarkAttempt) {
+            return;
+        }
+
+        activeBenchmarkAttempt = false;
+        benchmarkCallbacks++;
+
+        long elapsedMs = Math.max(0L, latencyNanos / NANOS_PER_MS);
+        benchmarkSamplesMs.add(elapsedMs);
+
+        if (success) {
+            benchmarkSuccessful++;
+        } else {
+            benchmarkCancelled++;
+        }
+
+        scheduleNextBenchmarkAttempt(benchmarkGeneration);
+    }
+
+    private void scheduleNextBenchmarkAttempt(long generation) {
+        if (!callbackBenchmarkRunning) {
+            return;
+        }
+
+        if (callbackBenchmarkCancelRequested
+                || benchmarkAttempted >= benchmarkRequested) {
+            finishCallbackBenchmark(callbackBenchmarkCancelRequested);
+            return;
+        }
+
+        pendingBenchmarkStep = () -> runCallbackBenchmarkAttempt(generation);
+        handler.postDelayed(
+                pendingBenchmarkStep,
+                benchmarkIntervalAfterCallbackMs
+        );
+    }
+
+    private void finishCallbackBenchmark(boolean cancelled) {
+        if (!callbackBenchmarkRunning) {
+            return;
+        }
+
+        callbackBenchmarkRunning = false;
+        callbackBenchmarkCancelRequested = false;
+        activeBenchmarkAttempt = false;
+
+        if (pendingBenchmarkStep != null) {
+            handler.removeCallbacks(pendingBenchmarkStep);
+            pendingBenchmarkStep = null;
+        }
+
+        ArrayList<Long> sorted = new ArrayList<>(benchmarkSamplesMs);
+        Collections.sort(sorted);
+
+        long min = 0L;
+        long median = 0L;
+        long p95 = 0L;
+        long max = 0L;
+        double average = 0.0;
+
+        if (!sorted.isEmpty()) {
+            min = sorted.get(0);
+            max = sorted.get(sorted.size() - 1);
+            long sum = 0L;
+            for (Long sample : sorted) {
+                sum += sample;
+            }
+            average = (double) sum / sorted.size();
+            int size = sorted.size();
+            median = (size % 2 == 1)
+                    ? sorted.get(size / 2)
+                    : (sorted.get(size / 2 - 1) + sorted.get(size / 2)) / 2L;
+            int p95Index = Math.max(0,
+                    (int) Math.ceil(size * 0.95) - 1);
+            p95 = sorted.get(p95Index);
+        }
+
+        CallbackBenchmarkResult result = new CallbackBenchmarkResult(
+                benchmarkRequested,
+                benchmarkAttempted,
+                benchmarkCallbacks,
+                benchmarkSuccessful,
+                benchmarkCancelled,
+                benchmarkRejected,
+                min,
+                average,
+                median,
+                p95,
+                max,
+                benchmarkSamplesMs,
+                cancelled
+        );
+
+        lastCallbackBenchmarkResult = result;
+        CallbackBenchmarkListener listener = benchmarkListener;
+        benchmarkListener = null;
+
+        if (listener != null) {
+            try {
+                listener.onBenchmarkFinished(result);
+            } catch (Exception e) {
+                Log.e(TAG, "Benchmark listener failed", e);
+            }
+        }
     }
 
     public long getFailedClicks() {
@@ -359,138 +970,155 @@ public class AutoClickService extends AccessibilityService {
     }
 
     public long getAverageGestureLatencyNanos() {
-        return measuredGestures == 0
-                ? 0L
-                : totalGestureLatencyNanos / measuredGestures;
+        if (measuredGestures == 0) {
+            return 0;
+        }
+
+        return totalGestureLatencyNanos / measuredGestures;
     }
 
     public long getMeasuredGestures() {
         return measuredGestures;
     }
 
-    // برای سازگاری با کدهای قبلی؛ زمان تطبیقی حذف شده است.
     public long getAdaptiveDispatchLeadNanos() {
-        return 0L;
+        return adaptiveDispatchLeadNanos;
     }
 
     public long getAdaptiveSamples() {
-        return 0L;
+        return adaptiveSamples;
+    }
+
+    public void cancelPendingScheduledClick() {
+        scheduledClickGeneration++;
+
+        if (pendingScheduledClick != null) {
+            handler.removeCallbacks(pendingScheduledClick);
+            pendingScheduledClick = null;
+        }
     }
 
     public boolean wasLastBatchRejectedForInterval() {
         return lastBatchRejectedForInterval;
     }
 
+    public int getLastBatchSkippedByDeadline() {
+        return lastBatchSkippedByDeadline;
+    }
+
     public int getLastBatchRejectedClickCount() {
         return lastBatchRejectedClickCount;
     }
 
-    public boolean isCallbackBenchmarkRunning() {
-        return callbackBenchmarkRunning;
-    }
-
-    public CallbackBenchmarkResult getLastCallbackBenchmarkResult() {
-        return lastCallbackBenchmarkResult;
-    }
-
-    public boolean isDispatchTimingBenchmarkRunning() {
-        return dispatchTimingBenchmarkRunning;
-    }
-
-    public DispatchTimingBenchmarkResult getLastDispatchTimingBenchmarkResult() {
-        return lastDispatchTimingBenchmarkResult;
-    }
-
-    // -------------------------------------------------
-    // Counters
-    // -------------------------------------------------
-
     public void resetClickCounters() {
         successfulClicks = 0;
         failedClicks = 0;
+
         lastGestureLatencyNanos = 0;
         totalGestureLatencyNanos = 0;
         maxGestureLatencyNanos = 0;
         measuredGestures = 0;
+
         nextAllowedClickNanos = 0;
+
+        averageCompletionOverheadNanos = 0;
+        adaptiveDispatchLeadNanos = 0;
+        adaptiveSamples = 0;
+
         lastBatchRejectedForInterval = false;
+        lastBatchSkippedByDeadline = 0;
         lastBatchRejectedClickCount = 0;
+
         lastError = "آماده";
     }
 
-    // -------------------------------------------------
+    // ---------------------------------------------------------
     // Batch capacity
-    // -------------------------------------------------
+    // ---------------------------------------------------------
 
     public long getEffectiveClickIntervalMs(long requestedIntervalMs) {
-        if (requestedIntervalMs < 0) return -1L;
-        return Math.max(1L, requestedIntervalMs);
+        if (requestedIntervalMs < 0) {
+            return -1;
+        }
+
+        return Math.max(
+                MIN_SEQUENTIAL_INTERVAL_MS,
+                requestedIntervalMs
+        );
     }
 
     public int getMaxBatchClickCount(long intervalMs) {
-        long interval = getEffectiveClickIntervalMs(intervalMs);
-        if (interval <= 0) return 0;
+        long effectiveInterval =
+                getEffectiveClickIntervalMs(intervalMs);
 
-        int strokes = GestureDescription.getMaxStrokeCount();
-        long duration = GestureDescription.getMaxGestureDuration();
+        if (effectiveInterval <= 0) {
+            return 0;
+        }
 
-        if (strokes <= 0 || duration < TAP_DURATION_MS) return 0;
+        int maxStrokes = GestureDescription.getMaxStrokeCount();
+        long maxDuration = GestureDescription.getMaxGestureDuration();
+
+        if (maxStrokes <= 0 || maxDuration < TAP_DURATION_MS) {
+            return 0;
+        }
 
         long maxByDuration =
-                ((duration - TAP_DURATION_MS) / interval) + 1L;
+                ((maxDuration - TAP_DURATION_MS) / effectiveInterval) + 1L;
+
+        long result = Math.min((long) maxStrokes, maxByDuration);
 
         return (int) Math.max(
                 1L,
-                Math.min(strokes, maxByDuration)
+                Math.min(result, Integer.MAX_VALUE)
         );
     }
 
-    // -------------------------------------------------
-    // Single and batch click
-    // -------------------------------------------------
+    // ---------------------------------------------------------
+    // Single click
+    // ---------------------------------------------------------
 
     public void performClick(Runnable completion) {
-        performClickBatch(1, 0L, completion);
+        performClickBatch(1, 0, completion);
+    }
+
+    // ---------------------------------------------------------
+    // Batch click
+    // ---------------------------------------------------------
+
+    public int performClickBatch(
+            int requestedCount,
+            long requestedIntervalMs,
+            Runnable completion
+    ) {
+        return performClickBatch(
+                requestedCount,
+                requestedIntervalMs,
+                Long.MAX_VALUE,
+                completion
+        );
     }
 
     public int performClickBatch(
-            int count,
-            long intervalMs,
-            Runnable completion
-    ) {
-        return performClickBatchInternal(
-                count, intervalMs, 0L, completion
-        );
-    }
-
-    public int performClickBatchAtTarget(
-            int count,
-            long intervalMs,
-            long targetNanos,
-            Runnable completion
-    ) {
-        return performClickBatchInternal(
-                count, intervalMs, targetNanos, completion
-        );
-    }
-
-    private int performClickBatchInternal(
             int requestedCount,
             long requestedIntervalMs,
-            long firstTargetNanos,
+            long deadlineElapsedRealtimeMs,
             Runnable completion
     ) {
         if (Looper.myLooper() != Looper.getMainLooper()) {
-            handler.post(() -> performClickBatchInternal(
-                    requestedCount,
-                    requestedIntervalMs,
-                    firstTargetNanos,
-                    completion
-            ));
+            handler.post(() ->
+                    performClickBatch(
+                            requestedCount,
+                            requestedIntervalMs,
+                            deadlineElapsedRealtimeMs,
+                            completion
+                    )
+            );
+
             return 0;
         }
 
         lastBatchRejectedForInterval = false;
+        lastBatchSkippedByDeadline = 0;
         lastBatchRejectedClickCount = 0;
 
         if (!serviceReady) {
@@ -502,7 +1130,7 @@ public class AutoClickService extends AccessibilityService {
         if ((callbackBenchmarkRunning && !activeBenchmarkAttempt)
                 || (dispatchTimingBenchmarkRunning
                 && !activeTimingBenchmarkAttempt)) {
-            lastError = "آزمایش زمان‌بندی در حال اجراست";
+            lastError = "تست Callback در حال اجراست";
             completeSafely(completion);
             return 0;
         }
@@ -520,102 +1148,176 @@ public class AutoClickService extends AccessibilityService {
             return 0;
         }
 
-        long interval = getEffectiveClickIntervalMs(requestedIntervalMs);
+        final long effectiveInterval =
+                getEffectiveClickIntervalMs(requestedIntervalMs);
 
-        if (interval <= 0 || interval > Long.MAX_VALUE / NANOS_PER_MS) {
+        if (effectiveInterval <= 0
+                || effectiveInterval > Long.MAX_VALUE / NANOS_PER_MS) {
             lastError = "فاصله مؤثر کلیک معتبر نیست";
             completeSafely(completion);
             return 0;
         }
 
-        long now = SystemClock.elapsedRealtimeNanos();
-        long offsetNanos = 0L;
+        final long intervalNanos = effectiveInterval * NANOS_PER_MS;
+        final long nowNanos = SystemClock.elapsedRealtimeNanos();
 
-        if (firstTargetNanos > now) {
-            long remaining = firstTargetNanos - now;
-            long guard = 18L * NANOS_PER_MS;
-            offsetNanos = Math.max(0L, remaining - guard);
-        }
+        if (nextAllowedClickNanos > 0
+                && nowNanos < nextAllowedClickNanos) {
 
-        long offsetMs = offsetNanos == 0
-                ? 0L
-                : (offsetNanos + NANOS_PER_MS - 1L) / NANOS_PER_MS;
-
-        if (nextAllowedClickNanos > 0 && now < nextAllowedClickNanos) {
             lastBatchRejectedForInterval = true;
             lastBatchRejectedClickCount = requestedCount;
             lastError = "کلیک به علت رعایت فاصله زمانی ارسال نشد";
+
             completeSafely(completion);
             return 0;
         }
 
-        int maxCount = getMaxBatchClickCount(interval);
-        long maxDuration = GestureDescription.getMaxGestureDuration();
+        final int maxBatchCount =
+                getMaxBatchClickCount(requestedIntervalMs);
 
-        int maxByDuration = (int) Math.max(
-                0L,
-                Math.min(
-                        Integer.MAX_VALUE,
-                        (maxDuration - offsetMs - TAP_DURATION_MS) / interval + 1L
-                )
-        );
-
-        int count = Math.min(
-                requestedCount,
-                Math.min(maxCount, maxByDuration)
-        );
-
-        if (count <= 0) {
-            lastError = "ظرفیت زمانی Gesture کافی نیست";
+        if (maxBatchCount <= 0) {
+            lastError = "ظرفیت اجرای Gesture معتبر نیست";
             completeSafely(completion);
             return 0;
         }
+
+        int deadlineAllowedCount = requestedCount;
+
+        if (deadlineElapsedRealtimeMs != Long.MAX_VALUE) {
+            long deadlineNanos =
+                    elapsedMsToNanos(deadlineElapsedRealtimeMs);
+
+            long remainingNanos = deadlineNanos - nowNanos;
+            long tapNanos = TAP_DURATION_MS * NANOS_PER_MS;
+
+            if (remainingNanos < tapNanos) {
+                deadlineAllowedCount = 0;
+            } else {
+                long countByDeadline =
+                        ((remainingNanos - tapNanos) / intervalNanos) + 1L;
+
+                deadlineAllowedCount = (int) Math.min(
+                        (long) requestedCount,
+                        Math.max(0L, countByDeadline)
+                );
+            }
+        }
+
+        if (deadlineAllowedCount < requestedCount) {
+            lastBatchSkippedByDeadline =
+                    requestedCount - deadlineAllowedCount;
+        }
+
+        final int batchCount = Math.min(
+                Math.min(requestedCount, maxBatchCount),
+                deadlineAllowedCount
+        );
+
+        if (batchCount <= 0) {
+            lastError = "زمان کافی تا پایان چرخه برای ارسال کلیک وجود ندارد";
+            completeSafely(completion);
+            return 0;
+        }
+
+        final int clickX = targetX;
+        final int clickY = targetY;
 
         GestureDescription.Builder builder =
                 new GestureDescription.Builder();
 
         try {
-            for (int i = 0; i < count; i++) {
-                long start = offsetMs + (long) i * interval;
+            for (int i = 0; i < batchCount; i++) {
+                long startOffset = safeMultiply(i, effectiveInterval);
 
                 Path path = new Path();
-                path.moveTo(targetX, targetY);
+                path.moveTo(clickX, clickY);
 
-                builder.addStroke(
+                GestureDescription.StrokeDescription stroke =
                         new GestureDescription.StrokeDescription(
-                                path, start, TAP_DURATION_MS
-                        )
-                );
+                                path,
+                                startOffset,
+                                TAP_DURATION_MS
+                        );
+
+                builder.addStroke(stroke);
             }
         } catch (Exception e) {
             lastError = "خطا در ساخت Gesture: " + e.getMessage();
-            lastBatchRejectedClickCount = count;
+            Log.e(TAG, lastError, e);
+
+            lastBatchRejectedClickCount = batchCount;
             completeSafely(completion);
             return 0;
         }
 
-        GestureDescription gesture;
+        final GestureDescription gesture;
 
         try {
             gesture = builder.build();
         } catch (Exception e) {
             lastError = "خطا در آماده‌سازی Gesture: " + e.getMessage();
-            lastBatchRejectedClickCount = count;
+            Log.e(TAG, lastError, e);
+
+            lastBatchRejectedClickCount = batchCount;
+            completeSafely(completion);
+            return 0;
+        }
+
+        final long dispatchCheckNanos =
+                SystemClock.elapsedRealtimeNanos();
+
+        if (!fitsDeadline(
+                dispatchCheckNanos,
+                batchCount,
+                intervalNanos,
+                deadlineElapsedRealtimeMs
+        )) {
+            lastBatchSkippedByDeadline = requestedCount;
+            lastError = "دسته کلیک به دلیل عبور از مهلت چرخه ارسال نشد";
+
             completeSafely(completion);
             return 0;
         }
 
         gestureInProgress = true;
         activeCompletion = completion;
-        activeBatchClickCount = count;
-        activeBatchIntervalMs = interval;
+        activeBatchClickCount = batchCount;
+        activeBatchIntervalMs = effectiveInterval;
+        activeIsScheduledSingleClick = false;
+        activeScheduledTargetNanos = 0L;
 
-        long id = ++activeGestureId;
+        final long gestureId = ++activeGestureId;
+
         dispatchStartNanos = SystemClock.elapsedRealtimeNanos();
 
-        nextAllowedClickNanos = dispatchStartNanos
-                + offsetMs * NANOS_PER_MS
-                + (long) count * interval * NANOS_PER_MS;
+        if (!fitsDeadline(
+                dispatchStartNanos,
+                batchCount,
+                intervalNanos,
+                deadlineElapsedRealtimeMs
+        )) {
+            clearActiveGestureState();
+
+            lastBatchSkippedByDeadline = requestedCount;
+            lastError = "دسته کلیک به دلیل عبور از مهلت چرخه ارسال نشد";
+
+            completeSafely(completion);
+            return 0;
+        }
+
+        nextAllowedClickNanos = safeAdd(
+                dispatchStartNanos,
+                safeMultiply(batchCount, intervalNanos)
+        );
+
+        Log.d(
+                TAG,
+                "Dispatch batch"
+                        + " | count=" + batchCount
+                        + " | interval=" + effectiveInterval
+                        + " | x=" + clickX
+                        + " | y=" + clickY
+        );
 
         boolean accepted = false;
 
@@ -624,13 +1326,29 @@ public class AutoClickService extends AccessibilityService {
                     gesture,
                     new GestureResultCallback() {
                         @Override
-                        public void onCompleted(GestureDescription description) {
-                            finishGesture(id, true, "دسته کلیک تکمیل شد");
+                        public void onCompleted(
+                                GestureDescription description
+                        ) {
+                            super.onCompleted(description);
+
+                            finishGesture(
+                                    gestureId,
+                                    true,
+                                    "دسته کلیک با موفقیت تکمیل شد"
+                            );
                         }
 
                         @Override
-                        public void onCancelled(GestureDescription description) {
-                            finishGesture(id, false, "اندروید دسته کلیک را لغو کرد");
+                        public void onCancelled(
+                                GestureDescription description
+                        ) {
+                            super.onCancelled(description);
+
+                            finishGesture(
+                                    gestureId,
+                                    false,
+                                    "اندروید دسته کلیک را لغو کرد"
+                            );
                         }
                     },
                     handler
@@ -645,29 +1363,57 @@ public class AutoClickService extends AccessibilityService {
         }
 
         if (!accepted) {
-            finishGesture(id, false, "dispatchGesture درخواست را نپذیرفت");
+            finishGesture(
+                    gestureId,
+                    false,
+                    "dispatchGesture درخواست را نپذیرفت"
+            );
+
             return 0;
         }
 
-        return count;
+        return batchCount;
     }
 
-    // -------------------------------------------------
-    // Absolute-time single click
-    // -------------------------------------------------
+    // ---------------------------------------------------------
+    // Absolute-time single click scheduling
+    // ---------------------------------------------------------
 
     public boolean performClickAtTarget(
             long targetElapsedRealtimeNanos,
+            long cycleStartElapsedRealtimeNanos,
+            long cycleDeadlineElapsedRealtimeNanos,
+            Runnable completion
+    ) {
+        return performClickAtTarget(
+                targetElapsedRealtimeNanos,
+                cycleStartElapsedRealtimeNanos,
+                cycleDeadlineElapsedRealtimeNanos,
+                null,
+                completion
+        );
+    }
+
+    public boolean performClickAtTarget(
+            long targetElapsedRealtimeNanos,
+            long cycleStartElapsedRealtimeNanos,
+            long cycleDeadlineElapsedRealtimeNanos,
+            DispatchListener dispatchListener,
             Runnable completion
     ) {
         if (Looper.myLooper() != Looper.getMainLooper()) {
             handler.post(() -> performClickAtTarget(
                     targetElapsedRealtimeNanos,
+                    cycleStartElapsedRealtimeNanos,
+                    cycleDeadlineElapsedRealtimeNanos,
+                    dispatchListener,
                     completion
             ));
+
             return true;
         }
 
+        lastBatchSkippedByDeadline = 0;
         lastBatchRejectedForInterval = false;
         lastBatchRejectedClickCount = 0;
 
@@ -677,34 +1423,84 @@ public class AutoClickService extends AccessibilityService {
             return false;
         }
 
-        if (callbackBenchmarkRunning || dispatchTimingBenchmarkRunning) {
-            lastError = "آزمایش زمان‌بندی در حال اجراست";
+        if (callbackBenchmarkRunning) {
+            lastError = "تست Callback در حال اجراست";
             completeSafely(completion);
             return false;
         }
 
         if (gestureInProgress || pendingScheduledClick != null) {
-            lastError = "کلیک قبلی هنوز در حال اجراست";
+            lastError = "کلیک قبلی هنوز در حال اجرا یا زمان‌بندی است";
             lastBatchRejectedForInterval = true;
             lastBatchRejectedClickCount = 1;
+
+            completeSafely(completion);
+            return false;
+        }
+
+        if (targetElapsedRealtimeNanos < cycleStartElapsedRealtimeNanos
+                || cycleDeadlineElapsedRealtimeNanos <= cycleStartElapsedRealtimeNanos
+                || targetElapsedRealtimeNanos >= cycleDeadlineElapsedRealtimeNanos) {
+
+            lastError = "زمان هدف کلیک خارج از محدوده چرخه است";
+            lastBatchSkippedByDeadline = 1;
+
             completeSafely(completion);
             return false;
         }
 
         final long generation = ++scheduledClickGeneration;
 
+        // No adaptive lead: schedule against the requested target itself.
+        final long desiredDispatchNanos = targetElapsedRealtimeNanos;
+
         pendingScheduledClick = new Runnable() {
             @Override
             public void run() {
-                if (generation != scheduledClickGeneration) return;
+                if (generation != scheduledClickGeneration) {
+                    return;
+                }
 
                 long now = SystemClock.elapsedRealtimeNanos();
 
-                if (now < targetElapsedRealtimeNanos) {
-                    handler.postDelayed(
-                            this,
-                            remainingDelayMs(targetElapsedRealtimeNanos, now)
-                    );
+                if (now < cycleStartElapsedRealtimeNanos) {
+                    postAgain(remainingDelayMs(
+                            cycleStartElapsedRealtimeNanos,
+                            now
+                    ));
+                    return;
+                }
+
+                if (now < desiredDispatchNanos) {
+                    postAgain(remainingDelayMs(
+                            desiredDispatchNanos,
+                            now
+                    ));
+                    return;
+                }
+
+                /*
+                 * تغییر مهم:
+                 * اگر Handler دیر بیدار شود، کلیک حذف نمی‌شود.
+                 * کلیک در اولین فرصت ارسال می‌شود، مشروط بر اینکه
+                 * مهلت چرخه هنوز اجازه اجرای آن را بدهد.
+                 */
+
+                long dispatchNow = SystemClock.elapsedRealtimeNanos();
+
+                long tapEnd = safeAdd(
+                        dispatchNow,
+                        TAP_DURATION_MS * NANOS_PER_MS
+                );
+
+                if (dispatchNow >= cycleDeadlineElapsedRealtimeNanos
+                        || tapEnd > cycleDeadlineElapsedRealtimeNanos) {
+
+                    pendingScheduledClick = null;
+                    lastBatchSkippedByDeadline = 1;
+                    lastError = "مهلت چرخه برای اجرای کلیک تمام شده است";
+
+                    completeSafely(completion);
                     return;
                 }
 
@@ -712,27 +1508,34 @@ public class AutoClickService extends AccessibilityService {
 
                 dispatchScheduledSingleClick(
                         targetElapsedRealtimeNanos,
+                        dispatchListener,
                         completion
                 );
+            }
+
+            private void postAgain(long delayMs) {
+                handler.postDelayed(this, delayMs);
             }
         };
 
         long now = SystemClock.elapsedRealtimeNanos();
 
-        if (targetElapsedRealtimeNanos <= now) {
+        long delayMs = desiredDispatchNanos <= now
+                ? 0L
+                : remainingDelayMs(desiredDispatchNanos, now);
+
+        if (delayMs == 0L) {
             pendingScheduledClick.run();
         } else {
-            handler.postDelayed(
-                    pendingScheduledClick,
-                    remainingDelayMs(targetElapsedRealtimeNanos, now)
-            );
+            handler.postDelayed(pendingScheduledClick, delayMs);
         }
 
         return true;
     }
 
     private void dispatchScheduledSingleClick(
-            long targetNanos,
+            long targetElapsedRealtimeNanos,
+            DispatchListener dispatchListener,
             Runnable completion
     ) {
         if (!serviceReady || gestureInProgress) {
@@ -741,10 +1544,14 @@ public class AutoClickService extends AccessibilityService {
             return;
         }
 
-        Path path = new Path();
-        path.moveTo(targetX, targetY);
+        final long now = SystemClock.elapsedRealtimeNanos();
+        final int clickX = targetX;
+        final int clickY = targetY;
 
-        GestureDescription gesture;
+        Path path = new Path();
+        path.moveTo(clickX, clickY);
+
+        final GestureDescription gesture;
 
         try {
             GestureDescription.Builder builder =
@@ -752,14 +1559,20 @@ public class AutoClickService extends AccessibilityService {
 
             builder.addStroke(
                     new GestureDescription.StrokeDescription(
-                            path, 0L, TAP_DURATION_MS
+                            path,
+                            0L,
+                            TAP_DURATION_MS
                     )
             );
 
             gesture = builder.build();
+
         } catch (Exception e) {
             lastError = "خطا در ساخت تک‌کلیک: " + e.getMessage();
             failedClicks++;
+
+            Log.e(TAG, lastError, e);
+
             completeSafely(completion);
             return;
         }
@@ -769,32 +1582,57 @@ public class AutoClickService extends AccessibilityService {
         activeBatchClickCount = 1;
         activeBatchIntervalMs = 0L;
 
-        dispatchStartNanos = SystemClock.elapsedRealtimeNanos();
-        nextAllowedClickNanos = dispatchStartNanos + NANOS_PER_MS;
+        activeScheduledTargetNanos = targetElapsedRealtimeNanos;
+        activeIsScheduledSingleClick = true;
 
-        long id = ++activeGestureId;
+        final long gestureId = ++activeGestureId;
 
-        Log.d(TAG,
-                "Dispatch click | target=" + targetNanos
-                        + " | actual=" + dispatchStartNanos
-                        + " | difference="
-                        + (dispatchStartNanos - targetNanos)
+        Log.d(
+                TAG,
+                "Dispatch scheduled single click"
+                        + " | targetNanos=" + targetElapsedRealtimeNanos
+                        + " | scheduledCheckNanos=" + now
+                        + " | latenessNanos="
+                        + Math.max(0L, now - targetElapsedRealtimeNanos)
+                        + " | x=" + clickX
+                        + " | y=" + clickY
         );
 
         boolean accepted = false;
+        long actualDispatchNanos = 0L;
 
         try {
+            // Capture immediately before dispatchGesture: this is the actual
+            // command-dispatch timestamp used by cycle reports.
+            actualDispatchNanos = SystemClock.elapsedRealtimeNanos();
+            dispatchStartNanos = actualDispatchNanos;
             accepted = dispatchGesture(
                     gesture,
                     new GestureResultCallback() {
                         @Override
-                        public void onCompleted(GestureDescription description) {
-                            finishGesture(id, true, "تک‌کلیک تکمیل شد");
+                        public void onCompleted(
+                                GestureDescription description
+                        ) {
+                            super.onCompleted(description);
+
+                            finishGesture(
+                                    gestureId,
+                                    true,
+                                    "تک‌کلیک زمان‌بندی‌شده تکمیل شد"
+                            );
                         }
 
                         @Override
-                        public void onCancelled(GestureDescription description) {
-                            finishGesture(id, false, "اندروید تک‌کلیک را لغو کرد");
+                        public void onCancelled(
+                                GestureDescription description
+                        ) {
+                            super.onCancelled(description);
+
+                            finishGesture(
+                                    gestureId,
+                                    false,
+                                    "اندروید تک‌کلیک را لغو کرد"
+                            );
                         }
                     },
                     handler
@@ -805,25 +1643,77 @@ public class AutoClickService extends AccessibilityService {
         }
 
         if (!accepted) {
-            finishGesture(id, false, "اندروید درخواست تک‌کلیک را نپذیرفت");
+            finishGesture(
+                    gestureId,
+                    false,
+                    "اندروید درخواست تک‌کلیک را نپذیرفت"
+            );
+            return;
+        }
+
+        nextAllowedClickNanos = safeAdd(
+                actualDispatchNanos,
+                TAP_DURATION_MS * NANOS_PER_MS
+        );
+
+        if (dispatchListener != null) {
+            try {
+                dispatchListener.onDispatched(actualDispatchNanos);
+            } catch (Exception e) {
+                Log.e(TAG, "Dispatch listener failed", e);
+            }
         }
     }
 
-    // -------------------------------------------------
+    // ---------------------------------------------------------
+    // Adaptive timing
+    // ---------------------------------------------------------
+
+    private void updateAdaptiveTimingEstimate(long wakeupLatenessNanos) {
+        long lateness = Math.max(0L, wakeupLatenessNanos);
+
+        if (adaptiveSamples == 0) {
+            averageCompletionOverheadNanos = lateness;
+        } else {
+            averageCompletionOverheadNanos =
+                    (averageCompletionOverheadNanos * 3L + lateness) / 4L;
+        }
+
+        adaptiveSamples++;
+
+        long recommendedLead = safeAdd(
+                safeMultiply(averageCompletionOverheadNanos, 2L),
+                ADAPTIVE_SAFETY_NANOS
+        );
+
+        adaptiveDispatchLeadNanos = Math.max(
+                MIN_ADAPTIVE_LEAD_NANOS,
+                Math.min(
+                        MAX_ADAPTIVE_LEAD_NANOS,
+                        recommendedLead
+                )
+        );
+    }
+
+    // ---------------------------------------------------------
     // Gesture completion
-    // -------------------------------------------------
+    // ---------------------------------------------------------
 
     private void finishGesture(
-            long id,
+            long gestureId,
             boolean success,
             String message
     ) {
         if (Looper.myLooper() != Looper.getMainLooper()) {
-            handler.post(() -> finishGesture(id, success, message));
+            handler.post(() ->
+                    finishGesture(gestureId, success, message)
+            );
             return;
         }
 
-        if (!gestureInProgress || id != activeGestureId) return;
+        if (!gestureInProgress || gestureId != activeGestureId) {
+            return;
+        }
 
         long latency = Math.max(
                 0L,
@@ -836,20 +1726,31 @@ public class AutoClickService extends AccessibilityService {
         if (!benchmarkGesture) {
             lastGestureLatencyNanos = latency;
             measuredGestures++;
-            totalGestureLatencyNanos += latency;
-            maxGestureLatencyNanos = Math.max(maxGestureLatencyNanos, latency);
+
+            if (totalGestureLatencyNanos <= Long.MAX_VALUE - latency) {
+                totalGestureLatencyNanos += latency;
+            }
+
+            maxGestureLatencyNanos = Math.max(
+                    maxGestureLatencyNanos,
+                    latency
+            );
         }
 
-        int count = activeBatchClickCount;
-
-        gestureInProgress = false;
-        activeBatchClickCount = 0;
-        activeBatchIntervalMs = 0L;
-
-        Runnable callback = activeCompletion;
-        activeCompletion = null;
+        int completedBatchCount = activeBatchClickCount;
 
         if (activeBenchmarkAttempt) {
+            // Benchmark measurements are deliberately isolated from normal
+            // click totals and normal gesture-latency aggregates.
+            gestureInProgress = false;
+            activeBatchClickCount = 0;
+            activeBatchIntervalMs = 0L;
+            activeIsScheduledSingleClick = false;
+            activeScheduledTargetNanos = 0L;
+
+            Runnable benchmarkCompletion = activeCompletion;
+            activeCompletion = null;
+
             if (benchmarkDispatchAccepted) {
                 onBenchmarkGestureFinished(success, latency);
             } else {
@@ -858,583 +1759,78 @@ public class AutoClickService extends AccessibilityService {
                 scheduleNextBenchmarkAttempt(benchmarkGeneration);
             }
 
-            completeSafely(callback);
+            completeSafely(benchmarkCompletion);
             return;
         }
 
         if (activeTimingBenchmarkAttempt) {
+            gestureInProgress = false;
+            activeBatchClickCount = 0;
+            activeBatchIntervalMs = 0L;
+            activeIsScheduledSingleClick = false;
+            activeScheduledTargetNanos = 0L;
+
+            Runnable timingCompletion = activeCompletion;
+            activeCompletion = null;
+
             onDispatchTimingGestureFinished(success);
-            completeSafely(callback);
+            completeSafely(timingCompletion);
             return;
         }
 
         if (success) {
-            successfulClicks += count;
+            successfulClicks += completedBatchCount;
             lastError = message;
+
+            Log.d(
+                    TAG,
+                    message
+                            + " | batchClicks=" + completedBatchCount
+                            + " | interval=" + activeBatchIntervalMs
+                            + " | latencyNanos=" + latency
+            );
         } else {
-            failedClicks += count;
+            failedClicks += completedBatchCount;
             lastError = message;
+
+            Log.e(
+                    TAG,
+                    message
+                            + " | batchClicks=" + completedBatchCount
+                            + " | latencyNanos=" + latency
+            );
         }
 
-        Log.d(TAG,
-                message + " | clicks=" + count
-                        + " | latencyMs=" + latency / NANOS_PER_MS
-        );
+        gestureInProgress = false;
+
+        activeBatchClickCount = 0;
+        activeBatchIntervalMs = 0L;
+        activeIsScheduledSingleClick = false;
+        activeScheduledTargetNanos = 0L;
+
+        Runnable callback = activeCompletion;
+        activeCompletion = null;
 
         completeSafely(callback);
     }
 
-    // -------------------------------------------------
-    // Scheduled click cancellation
-    // -------------------------------------------------
-
-    public void cancelPendingScheduledClick() {
-        scheduledClickGeneration++;
-
-        if (pendingScheduledClick != null) {
-            handler.removeCallbacks(pendingScheduledClick);
-            pendingScheduledClick = null;
-        }
+    private void clearActiveGestureState() {
+        gestureInProgress = false;
+        activeCompletion = null;
+        activeBatchClickCount = 0;
+        activeBatchIntervalMs = 0L;
+        activeIsScheduledSingleClick = false;
+        activeScheduledTargetNanos = 0L;
     }
 
-    // -------------------------------------------------
-    // Callback benchmark
-    // -------------------------------------------------
-
-    public boolean startCallbackBenchmark(
-            int attempts,
-            long intervalAfterCallbackMs,
-            CallbackBenchmarkListener listener
-    ) {
-        if (Looper.myLooper() != Looper.getMainLooper()) {
-            handler.post(() -> startCallbackBenchmark(
-                    attempts, intervalAfterCallbackMs, listener
-            ));
-            return true;
-        }
-
-        if (!serviceReady
-                || callbackBenchmarkRunning
-                || dispatchTimingBenchmarkRunning
-                || gestureInProgress
-                || pendingScheduledClick != null
-                || attempts < 1
-                || attempts > 5000
-                || intervalAfterCallbackMs < 50) {
-            return false;
-        }
-
-        callbackBenchmarkRunning = true;
-        callbackBenchmarkCancelRequested = false;
-
-        benchmarkRequested = attempts;
-        benchmarkAttempted = 0;
-        benchmarkCallbacks = 0;
-        benchmarkSuccessful = 0;
-        benchmarkCancelled = 0;
-        benchmarkRejected = 0;
-        benchmarkIntervalAfterCallbackMs = intervalAfterCallbackMs;
-        benchmarkListener = listener;
-
-        benchmarkSamplesMs.clear();
-        lastCallbackBenchmarkResult = null;
-
-        long generation = ++benchmarkGeneration;
-
-        pendingBenchmarkStep = () ->
-                runCallbackBenchmarkAttempt(generation);
-
-        handler.post(pendingBenchmarkStep);
-        return true;
-    }
-
-    public void cancelCallbackBenchmark() {
-        if (Looper.myLooper() != Looper.getMainLooper()) {
-            handler.post(this::cancelCallbackBenchmark);
-            return;
-        }
-
-        if (!callbackBenchmarkRunning) return;
-
-        callbackBenchmarkCancelRequested = true;
-        benchmarkGeneration++;
-
-        if (pendingBenchmarkStep != null) {
-            handler.removeCallbacks(pendingBenchmarkStep);
-            pendingBenchmarkStep = null;
-        }
-
-        if (!activeBenchmarkAttempt) {
-            finishCallbackBenchmark(true);
-        }
-    }
-
-    private void runCallbackBenchmarkAttempt(long generation) {
-        pendingBenchmarkStep = null;
-
-        if (!callbackBenchmarkRunning
-                || callbackBenchmarkCancelRequested
-                || generation != benchmarkGeneration) {
-            if (callbackBenchmarkRunning
-                    && callbackBenchmarkCancelRequested
-                    && !activeBenchmarkAttempt) {
-                finishCallbackBenchmark(true);
-            }
-            return;
-        }
-
-        if (!serviceReady || gestureInProgress
-                || pendingScheduledClick != null) {
-            benchmarkRejected++;
-            finishCallbackBenchmark(false);
-            return;
-        }
-
-        if (benchmarkAttempted >= benchmarkRequested) {
-            finishCallbackBenchmark(false);
-            return;
-        }
-
-        benchmarkAttempted++;
-        benchmarkAttemptStartNanos = SystemClock.elapsedRealtimeNanos();
-        activeBenchmarkAttempt = true;
-        benchmarkDispatchAccepted = false;
-
-        int attempt = benchmarkAttempted;
-
-        int dispatched = performClickBatch(1, 0L, () -> {
-            if (!benchmarkDispatchAccepted && activeBenchmarkAttempt) {
-                activeBenchmarkAttempt = false;
-                benchmarkRejected++;
-                scheduleNextBenchmarkAttempt(generation);
-            }
-        });
-
-        benchmarkDispatchAccepted = dispatched > 0;
-
-        if (dispatched <= 0
-                && activeBenchmarkAttempt
-                && !gestureInProgress) {
-            activeBenchmarkAttempt = false;
-            benchmarkRejected++;
-            scheduleNextBenchmarkAttempt(generation);
-        }
-
-        Log.d(TAG, "Callback benchmark attempt " + attempt
-                + " dispatched=" + dispatched);
-    }
-
-    private void onBenchmarkGestureFinished(
-            boolean success,
-            long latencyNanos
-    ) {
-        if (!activeBenchmarkAttempt) return;
-
-        activeBenchmarkAttempt = false;
-        benchmarkCallbacks++;
-
-        benchmarkSamplesMs.add(
-                Math.max(0L, latencyNanos / NANOS_PER_MS)
-        );
-
-        if (success) benchmarkSuccessful++;
-        else benchmarkCancelled++;
-
-        scheduleNextBenchmarkAttempt(benchmarkGeneration);
-    }
-
-    private void scheduleNextBenchmarkAttempt(long generation) {
-        if (!callbackBenchmarkRunning) return;
-
-        if (callbackBenchmarkCancelRequested
-                || benchmarkAttempted >= benchmarkRequested) {
-            finishCallbackBenchmark(callbackBenchmarkCancelRequested);
-            return;
-        }
-
-        pendingBenchmarkStep = () ->
-                runCallbackBenchmarkAttempt(generation);
-
-        handler.postDelayed(
-                pendingBenchmarkStep,
-                benchmarkIntervalAfterCallbackMs
-        );
-    }
-
-    private void finishCallbackBenchmark(boolean cancelled) {
-        if (!callbackBenchmarkRunning) return;
-
-        callbackBenchmarkRunning = false;
-        callbackBenchmarkCancelRequested = false;
-        activeBenchmarkAttempt = false;
-
-        if (pendingBenchmarkStep != null) {
-            handler.removeCallbacks(pendingBenchmarkStep);
-            pendingBenchmarkStep = null;
-        }
-
-        ArrayList<Long> sorted = new ArrayList<>(benchmarkSamplesMs);
-        Collections.sort(sorted);
-
-        long min = 0, median = 0, p95 = 0, max = 0;
-        double average = 0;
-
-        if (!sorted.isEmpty()) {
-            int size = sorted.size();
-
-            min = sorted.get(0);
-            max = sorted.get(size - 1);
-
-            long sum = 0;
-            for (long value : sorted) sum += value;
-            average = (double) sum / size;
-
-            median = size % 2 == 1
-                    ? sorted.get(size / 2)
-                    : (sorted.get(size / 2 - 1)
-                    + sorted.get(size / 2)) / 2L;
-
-            p95 = sorted.get(Math.max(
-                    0,
-                    (int) Math.ceil(size * 0.95) - 1
-            ));
-        }
-
-        CallbackBenchmarkResult result =
-                new CallbackBenchmarkResult(
-                        benchmarkRequested,
-                        benchmarkAttempted,
-                        benchmarkCallbacks,
-                        benchmarkSuccessful,
-                        benchmarkCancelled,
-                        benchmarkRejected,
-                        min,
-                        average,
-                        median,
-                        p95,
-                        max,
-                        benchmarkSamplesMs,
-                        cancelled
-                );
-
-        lastCallbackBenchmarkResult = result;
-
-        CallbackBenchmarkListener listener = benchmarkListener;
-        benchmarkListener = null;
-
-        if (listener != null) {
-            try {
-                listener.onBenchmarkFinished(result);
-            } catch (Exception e) {
-                Log.e(TAG, "Benchmark listener failed", e);
-            }
-        }
-    }
-
-    // -------------------------------------------------
-    // Dispatch timing benchmark
-    // -------------------------------------------------
-
-    public boolean startDispatchTimingBenchmark(
-            int attempts,
-            long intervalMs,
-            DispatchTimingBenchmarkListener listener
-    ) {
-        if (Looper.myLooper() != Looper.getMainLooper()) {
-            handler.post(() -> startDispatchTimingBenchmark(
-                    attempts, intervalMs, listener
-            ));
-            return true;
-        }
-
-        if (!serviceReady
-                || dispatchTimingBenchmarkRunning
-                || callbackBenchmarkRunning
-                || gestureInProgress
-                || pendingScheduledClick != null
-                || attempts < 2
-                || attempts > 2000
-                || intervalMs < 10
-                || intervalMs > 60000) {
-            return false;
-        }
-
-        dispatchTimingBenchmarkRunning = true;
-        dispatchTimingBenchmarkCancelRequested = false;
-        activeTimingBenchmarkAttempt = false;
-        timingDispatchAccepted = false;
-
-        timingBenchmarkRequested = attempts;
-        timingBenchmarkAttempted = 0;
-        timingBenchmarkAccepted = 0;
-        timingBenchmarkCallbacks = 0;
-        timingBenchmarkSuccessful = 0;
-        timingBenchmarkCancelled = 0;
-        timingBenchmarkRejected = 0;
-        timingBenchmarkInterruptions = 0;
-        timingBenchmarkCancellationReason = "";
-
-        timingBenchmarkIntervalNanos = intervalMs * NANOS_PER_MS;
-        timingBenchmarkStartNanos =
-                SystemClock.elapsedRealtimeNanos() + 300L * NANOS_PER_MS;
-        timingBenchmarkPreviousDispatchNanos = 0;
-        timingBenchmarkListener = listener;
-
-        timingActualIntervalsMs.clear();
-        timingIntervalErrorsMs.clear();
-        timingAbsoluteIntervalErrorsMs.clear();
-        timingDispatchLatenessMs.clear();
-
-        lastDispatchTimingBenchmarkResult = null;
-
-        long generation = ++timingBenchmarkGeneration;
-        scheduleDispatchTimingAttempt(generation);
-        return true;
-    }
-
-    public void cancelDispatchTimingBenchmark() {
-        cancelDispatchTimingBenchmark("لغو به درخواست کاربر");
-    }
-
-    private void cancelDispatchTimingBenchmark(String reason) {
-        if (Looper.myLooper() != Looper.getMainLooper()) {
-            handler.post(() -> cancelDispatchTimingBenchmark(reason));
-            return;
-        }
-
-        if (!dispatchTimingBenchmarkRunning) return;
-
-        if (timingBenchmarkCancellationReason.isEmpty()) {
-            timingBenchmarkCancellationReason = reason;
-        }
-
-        dispatchTimingBenchmarkCancelRequested = true;
-        timingBenchmarkGeneration++;
-
-        if (pendingTimingBenchmarkStep != null) {
-            handler.removeCallbacks(pendingTimingBenchmarkStep);
-            pendingTimingBenchmarkStep = null;
-        }
-
-        if (!activeTimingBenchmarkAttempt) {
-            finishDispatchTimingBenchmark(true);
-        }
-    }
-
-    private void scheduleDispatchTimingAttempt(long generation) {
-        if (!dispatchTimingBenchmarkRunning) return;
-
-        if (dispatchTimingBenchmarkCancelRequested
-                || timingBenchmarkAttempted >= timingBenchmarkRequested) {
-            finishDispatchTimingBenchmark(
-                    dispatchTimingBenchmarkCancelRequested
-            );
-            return;
-        }
-
-        timingBenchmarkTargetNanos = timingBenchmarkStartNanos
-                + (long) timingBenchmarkAttempted
-                * timingBenchmarkIntervalNanos;
-
-        pendingTimingBenchmarkStep = new Runnable() {
-            @Override
-            public void run() {
-                if (!dispatchTimingBenchmarkRunning
-                        || generation != timingBenchmarkGeneration
-                        || dispatchTimingBenchmarkCancelRequested) {
-                    return;
-                }
-
-                long now = SystemClock.elapsedRealtimeNanos();
-
-                if (now < timingBenchmarkTargetNanos) {
-                    handler.postDelayed(
-                            this,
-                            remainingDelayMs(timingBenchmarkTargetNanos, now)
-                    );
-                    return;
-                }
-
-                pendingTimingBenchmarkStep = null;
-                runDispatchTimingAttempt(generation);
-            }
-        };
-
-        long now = SystemClock.elapsedRealtimeNanos();
-        long delay = remainingDelayMs(timingBenchmarkTargetNanos, now);
-
-        if (delay == 0) pendingTimingBenchmarkStep.run();
-        else handler.postDelayed(pendingTimingBenchmarkStep, delay);
-    }
-
-    private void runDispatchTimingAttempt(long generation) {
-        if (!dispatchTimingBenchmarkRunning
-                || generation != timingBenchmarkGeneration
-                || dispatchTimingBenchmarkCancelRequested) {
-            return;
-        }
-
-        if (!serviceReady || gestureInProgress
-                || pendingScheduledClick != null) {
-            timingBenchmarkRejected++;
-            timingBenchmarkAttempted++;
-            scheduleDispatchTimingAttempt(generation);
-            return;
-        }
-
-        timingBenchmarkAttempted++;
-        activeTimingBenchmarkAttempt = true;
-        timingDispatchAccepted = false;
-
-        int dispatched = performClickBatch(1, 0L, null);
-
-        if (dispatched > 0) {
-            timingDispatchAccepted = true;
-            timingBenchmarkAccepted++;
-
-            long actual = dispatchStartNanos;
-
-            timingDispatchLatenessMs.add(
-                    (actual - timingBenchmarkTargetNanos)
-                            / (double) NANOS_PER_MS
-            );
-
-            if (timingBenchmarkPreviousDispatchNanos > 0) {
-                double actualInterval =
-                        (actual - timingBenchmarkPreviousDispatchNanos)
-                                / (double) NANOS_PER_MS;
-
-                double error = actualInterval
-                        - timingBenchmarkIntervalNanos
-                        / (double) NANOS_PER_MS;
-
-                timingActualIntervalsMs.add(actualInterval);
-                timingIntervalErrorsMs.add(error);
-                timingAbsoluteIntervalErrorsMs.add(Math.abs(error));
-            }
-
-            timingBenchmarkPreviousDispatchNanos = actual;
-
-        } else if (activeTimingBenchmarkAttempt) {
-            activeTimingBenchmarkAttempt = false;
-            timingBenchmarkRejected++;
-            scheduleDispatchTimingAttempt(generation);
-        }
-    }
-
-    private void onDispatchTimingGestureFinished(boolean success) {
-        if (!activeTimingBenchmarkAttempt) return;
-
-        activeTimingBenchmarkAttempt = false;
-
-        if (timingDispatchAccepted) {
-            timingBenchmarkCallbacks++;
-            if (success) timingBenchmarkSuccessful++;
-            else timingBenchmarkCancelled++;
-        } else {
-            timingBenchmarkRejected++;
-        }
-
-        timingDispatchAccepted = false;
-        scheduleDispatchTimingAttempt(timingBenchmarkGeneration);
-    }
-
-    private void finishDispatchTimingBenchmark(boolean cancelled) {
-        if (!dispatchTimingBenchmarkRunning) return;
-
-        dispatchTimingBenchmarkRunning = false;
-        dispatchTimingBenchmarkCancelRequested = false;
-        activeTimingBenchmarkAttempt = false;
-
-        if (pendingTimingBenchmarkStep != null) {
-            handler.removeCallbacks(pendingTimingBenchmarkStep);
-            pendingTimingBenchmarkStep = null;
-        }
-
-        double[] actual = summarizeDoubles(timingActualIntervalsMs);
-        double[] errors = summarizeDoubles(timingAbsoluteIntervalErrorsMs);
-        double[] lateness = summarizeDoubles(timingDispatchLatenessMs);
-
-        double averageError = 0;
-
-        if (!timingIntervalErrorsMs.isEmpty()) {
-            double sum = 0;
-            for (double value : timingIntervalErrorsMs) sum += value;
-            averageError = sum / timingIntervalErrorsMs.size();
-        }
-
-        DispatchTimingBenchmarkResult result =
-                new DispatchTimingBenchmarkResult(
-                        timingBenchmarkRequested,
-                        timingBenchmarkAttempted,
-                        timingBenchmarkAccepted,
-                        timingBenchmarkCallbacks,
-                        timingBenchmarkSuccessful,
-                        timingBenchmarkCancelled,
-                        timingBenchmarkRejected,
-                        timingBenchmarkIntervalNanos / (double) NANOS_PER_MS,
-                        actual[0],
-                        actual[1],
-                        actual[2],
-                        actual[3],
-                        actual[4],
-                        averageError,
-                        errors[3],
-                        lateness[1],
-                        lateness[3],
-                        cancelled,
-                        cancelled ? timingBenchmarkCancellationReason : "",
-                        timingBenchmarkInterruptions
-                );
-
-        lastDispatchTimingBenchmarkResult = result;
-
-        DispatchTimingBenchmarkListener listener = timingBenchmarkListener;
-        timingBenchmarkListener = null;
-
-        if (listener != null) {
-            try {
-                listener.onBenchmarkFinished(result);
-            } catch (Exception e) {
-                Log.e(TAG, "Dispatch benchmark listener failed", e);
-            }
-        }
-    }
-
-    private static double[] summarizeDoubles(List<Double> values) {
-        if (values == null || values.isEmpty()) {
-            return new double[]{0, 0, 0, 0, 0};
-        }
-
-        ArrayList<Double> sorted = new ArrayList<>(values);
-        Collections.sort(sorted);
-
-        double sum = 0;
-        for (double value : sorted) sum += value;
-
-        int size = sorted.size();
-        double median = size % 2 == 1
-                ? sorted.get(size / 2)
-                : (sorted.get(size / 2 - 1)
-                + sorted.get(size / 2)) / 2.0;
-
-        int p95 = Math.max(0, (int) Math.ceil(size * 0.95) - 1);
-
-        return new double[]{
-                sorted.get(0),
-                sum / size,
-                median,
-                sorted.get(p95),
-                sorted.get(size - 1)
-        };
-    }
-
-    // -------------------------------------------------
+    // ---------------------------------------------------------
     // Helpers
-    // -------------------------------------------------
+    // ---------------------------------------------------------
 
     private void completeSafely(Runnable completion) {
-        if (completion == null) return;
+        if (completion == null) {
+            return;
+        }
 
         try {
             completion.run();
@@ -1443,14 +1839,104 @@ public class AutoClickService extends AccessibilityService {
         }
     }
 
+    private long elapsedMsToNanos(long elapsedMs) {
+        if (elapsedMs == Long.MAX_VALUE) {
+            return Long.MAX_VALUE;
+        }
+
+        if (elapsedMs <= 0L) {
+            return 0L;
+        }
+
+        if (elapsedMs > Long.MAX_VALUE / NANOS_PER_MS) {
+            return Long.MAX_VALUE;
+        }
+
+        return elapsedMs * NANOS_PER_MS;
+    }
+
+    private long safeAdd(long first, long second) {
+        if (second > 0L && first > Long.MAX_VALUE - second) {
+            return Long.MAX_VALUE;
+        }
+
+        if (second < 0L && first < Long.MIN_VALUE - second) {
+            return Long.MIN_VALUE;
+        }
+
+        return first + second;
+    }
+
+    private long safeMultiply(long first, long second) {
+        if (first == 0L || second == 0L) {
+            return 0L;
+        }
+
+        if (first > 0L && second > 0L
+                && first > Long.MAX_VALUE / second) {
+            return Long.MAX_VALUE;
+        }
+
+        if (first < 0L && second < 0L
+                && first < Long.MAX_VALUE / second) {
+            return Long.MAX_VALUE;
+        }
+
+        if (first > 0L && second < 0L
+                && second < Long.MIN_VALUE / first) {
+            return Long.MIN_VALUE;
+        }
+
+        if (first < 0L && second > 0L
+                && first < Long.MIN_VALUE / second) {
+            return Long.MIN_VALUE;
+        }
+
+        return first * second;
+    }
+
     private long remainingDelayMs(long targetNanos, long nowNanos) {
-        if (targetNanos <= nowNanos) return 0;
+        if (targetNanos <= nowNanos) {
+            return 0L;
+        }
 
         long difference = targetNanos - nowNanos;
 
-        return Math.max(
-                1L,
-                (difference + NANOS_PER_MS - 1L) / NANOS_PER_MS
+        if (difference <= 0L) {
+            return 0L;
+        }
+
+        long rounded = safeAdd(difference, NANOS_PER_MS - 1L);
+
+        return Math.max(1L, rounded / NANOS_PER_MS);
+    }
+
+    private boolean fitsDeadline(
+            long dispatchNanos,
+            int count,
+            long intervalNanos,
+            long deadlineElapsedRealtimeMs
+    ) {
+        if (deadlineElapsedRealtimeMs == Long.MAX_VALUE) {
+            return true;
+        }
+
+        long deadlineNanos =
+                elapsedMsToNanos(deadlineElapsedRealtimeMs);
+
+        long lastStrokeOffset = safeMultiply(
+                count - 1L,
+                intervalNanos
         );
+
+        long lastStrokeEndNanos = safeAdd(
+                safeAdd(
+                        dispatchNanos,
+                        lastStrokeOffset
+                ),
+                TAP_DURATION_MS * NANOS_PER_MS
+        );
+
+        return lastStrokeEndNanos <= deadlineNanos;
     }
 }
