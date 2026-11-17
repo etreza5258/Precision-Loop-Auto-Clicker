@@ -11,7 +11,6 @@ import android.os.SystemClock;
 import android.view.accessibility.AccessibilityEvent;
 
 import java.util.ArrayList;
-import java.util.Comparator;
 
 public class AutoClickService extends AccessibilityService {
 
@@ -22,9 +21,7 @@ public class AutoClickService extends AccessibilityService {
     private static volatile AutoClickService instance;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
-
     private final ArrayList<ClickRequest> pending = new ArrayList<>();
-    private final ArrayList<ClickRequest> ready = new ArrayList<>();
     private final ArrayList<ClickRequest> activeRequests = new ArrayList<>();
 
     private int targetX = 350;
@@ -190,6 +187,11 @@ public class AutoClickService extends AccessibilityService {
         return true;
     }
 
+    /*
+     * هر درخواست زمان‌بندی مستقل دارد.
+     * از تأخیر صحیحِ رو به پایین استفاده می‌شود؛
+     * اگر Handler زود بیدار شود، زمان هدف دوباره بررسی می‌شود.
+     */
     private void scheduleRequest(ClickRequest request) {
         if (!pending.contains(request)) {
             return;
@@ -206,54 +208,46 @@ public class AutoClickService extends AccessibilityService {
 
         long delayMs = remaining / 1_000_000L;
 
-        if (remaining % 1_000_000L != 0) {
-            delayMs++;
+        if (delayMs > 0) {
+            handler.postDelayed(request.runnable, delayMs);
+        } else {
+            handler.post(request.runnable);
         }
-
-        handler.postDelayed(request.runnable, delayMs);
     }
 
     private void executeRequest(ClickRequest request) {
-        if (!pending.remove(request)) {
+        if (!pending.contains(request)) {
             return;
         }
 
         long now = SystemClock.elapsedRealtimeNanos();
 
         if (now < request.targetNanos) {
-            pending.add(request);
             scheduleRequest(request);
             return;
         }
 
-        ready.add(request);
+        pending.remove(request);
 
-        ready.sort(Comparator.comparingLong(
-                item -> item.targetNanos
-        ));
+        long touchNanos = request.touchDurationMs * 1_000_000L;
 
-        pumpReadyQueue();
-    }
-
-    private void pumpReadyQueue() {
-        if (!serviceReady) {
+        if (now >= request.deadlineNanos ||
+                touchNanos > request.deadlineNanos - now) {
+            notifyCompletion(request, false, true);
             return;
         }
 
-        while (!ready.isEmpty()) {
-            ClickRequest request = ready.remove(0);
-
-            if (!dispatchRequest(request)) {
-                notifyCompletion(request, false, false);
-            }
+        if (!dispatchRequest(request)) {
+            notifyCompletion(request, false, false);
         }
     }
 
+    /*
+     * ارسال مستقیم؛ هیچ وابستگی‌ای به Callback درخواست قبلی ندارد.
+     */
     private boolean dispatchRequest(ClickRequest request) {
         try {
             Path path = new Path();
-
-            // لمس ثابت؛ بدون حرکت یک‌پیکسلی
             path.moveTo(request.x, request.y);
             path.lineTo(request.x, request.y);
 
@@ -337,23 +331,18 @@ public class AutoClickService extends AccessibilityService {
         runOnMain(this::cancelPendingInternal);
     }
 
+    /*
+     * فقط درخواست‌های هنوز ارسال‌نشده لغو می‌شوند.
+     * ژست‌های فعال با این متد دست‌کاری نمی‌شوند.
+     */
     private void cancelPendingInternal() {
-        ArrayList<ClickRequest> pendingCopy =
+        ArrayList<ClickRequest> copy =
                 new ArrayList<>(pending);
 
         pending.clear();
 
-        for (ClickRequest request : pendingCopy) {
+        for (ClickRequest request : copy) {
             handler.removeCallbacks(request.runnable);
-            notifyCompletion(request, false, true);
-        }
-
-        ArrayList<ClickRequest> readyCopy =
-                new ArrayList<>(ready);
-
-        ready.clear();
-
-        for (ClickRequest request : readyCopy) {
             notifyCompletion(request, false, true);
         }
     }
@@ -366,3 +355,4 @@ public class AutoClickService extends AccessibilityService {
         }
     }
 }
+
