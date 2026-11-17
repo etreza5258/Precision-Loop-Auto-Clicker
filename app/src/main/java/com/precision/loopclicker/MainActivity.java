@@ -19,6 +19,7 @@ import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.RadioButton;
 import android.widget.RadioGroup;
+import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -63,7 +64,6 @@ public class MainActivity extends Activity {
     private EditText intervalSecondsInput, intervalMillisInput;
     private EditText clickCountInput, touchMillisInput;
 
-    // ورودی‌های جدید
     private EditText cycleDurationInput;
     private EditText cycleCountInput;
     private EditText compensationInput;
@@ -153,7 +153,7 @@ public class MainActivity extends Activity {
     }
 
     // ---------------------------------------------------------
-    // ایجاد ورودی‌های جدید بدون نیاز به تغییر XML
+    // ایجاد ورودی‌های جدید داخل LinearLayout
     // ---------------------------------------------------------
 
     private void addCycleInputs() {
@@ -183,10 +183,39 @@ public class MainActivity extends Activity {
     ) {
         if (anchor == null) return null;
 
-        View parent = (View) anchor.getParent();
-        if (!(parent.getParent() instanceof ViewGroup)) return null;
+        LinearLayout container = null;
+        View current = anchor;
 
-        ViewGroup container = (ViewGroup) parent.getParent();
+        // پیدا کردن LinearLayout داخلی ScrollView
+        while (current.getParent() instanceof ViewGroup) {
+            ViewGroup parent = (ViewGroup) current.getParent();
+
+            if (parent instanceof ScrollView) {
+                if (current instanceof LinearLayout) {
+                    container = (LinearLayout) current;
+                }
+                break;
+            }
+
+            current = parent;
+        }
+
+        if (container == null) return null;
+
+        // پیدا کردن ردیفی که ورودی اصلی داخل آن قرار دارد
+        View directChild = anchor;
+
+        while (directChild.getParent() != container) {
+            if (!(directChild.getParent() instanceof View)) {
+                return null;
+            }
+
+            directChild = (View) directChild.getParent();
+        }
+
+        int index = container.indexOfChild(directChild);
+
+        if (index < 0) return null;
 
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.VERTICAL);
@@ -196,6 +225,7 @@ public class MainActivity extends Activity {
         title.setText(label);
         title.setTextColor(0xFFFFFFFF);
         title.setTextSize(14);
+
         row.addView(title);
 
         EditText input = new EditText(this);
@@ -210,7 +240,6 @@ public class MainActivity extends Activity {
 
         row.addView(input);
 
-        int index = container.indexOfChild(parent);
         container.addView(row, index + 1);
 
         return input;
@@ -695,7 +724,6 @@ public class MainActivity extends Activity {
                 return;
             }
 
-            // آخرین کلیک باید قبل از مرز چرخه باشد.
             long lastClickOffset = safeMultiply(
                     clicksPerCycle - 1, interval
             );
@@ -708,7 +736,6 @@ public class MainActivity extends Activity {
                 return;
             }
 
-            // کنترل سرریز زمان کل اجرا
             long totalDuration = safeMultiply(cycleCount, cycleDuration);
 
             if (totalDuration <= 0) {
@@ -792,11 +819,9 @@ public class MainActivity extends Activity {
                 return;
             }
 
-            // ثبت شمارش معکوس
             countdownActive = true;
             scheduledStartElapsed = targetElapsed;
 
-            // ارسال تنظیمات به FloatingService
             Intent service = new Intent(this, FloatingService.class);
             service.setAction(FloatingService.ACTION_START);
 
@@ -813,18 +838,15 @@ public class MainActivity extends Activity {
                 );
             }
 
-            // اطلاعات قدیمی برای سازگاری
             service.putExtra("click_count", clicksPerCycle);
             service.putExtra("click_interval_ms", interval);
             service.putExtra("touch_duration_ms", touchMillis);
 
-            // اطلاعات جدید چرخه
             service.putExtra("clicks_per_cycle", clicksPerCycle);
             service.putExtra("cycle_count", cycleCount);
             service.putExtra("cycle_duration_ms", cycleDuration);
             service.putExtra("total_duration_ms", totalDuration);
 
-            // جبران دستی؛ صفر یعنی غیرفعال
             service.putExtra("compensation_ms", compensation);
             service.putExtra("dispatch_lead_ms", compensation);
 
