@@ -30,7 +30,7 @@ public class AutoClickService extends AccessibilityService {
     private int targetX = 350;
     private int targetY = 700;
 
-    private boolean serviceReady;
+    private volatile boolean serviceReady;
     private long nextRequestId;
 
     private static class ClickRequest {
@@ -76,12 +76,12 @@ public class AutoClickService extends AccessibilityService {
         runOnMain(() -> {
             cancelPendingInternal();
 
-            ArrayList<ClickRequest> activeCopy =
+            ArrayList<ClickRequest> copy =
                     new ArrayList<>(activeRequests);
 
             activeRequests.clear();
 
-            for (ClickRequest request : activeCopy) {
+            for (ClickRequest request : copy) {
                 notifyCompletion(request, false, false);
             }
 
@@ -185,7 +185,6 @@ public class AutoClickService extends AccessibilityService {
         request.runnable = () -> executeRequest(request);
 
         pending.add(request);
-
         scheduleRequest(request);
 
         return true;
@@ -241,14 +240,10 @@ public class AutoClickService extends AccessibilityService {
             return;
         }
 
-        // تمام درخواست‌های آماده ارسال می‌شوند.
-        // هیچ ژستی منتظر Callback ژست قبلی نمی‌ماند.
         while (!ready.isEmpty()) {
             ClickRequest request = ready.remove(0);
 
-            boolean accepted = dispatchRequest(request);
-
-            if (!accepted) {
+            if (!dispatchRequest(request)) {
                 notifyCompletion(request, false, false);
             }
         }
@@ -258,8 +253,9 @@ public class AutoClickService extends AccessibilityService {
         try {
             Path path = new Path();
 
+            // لمس ثابت؛ بدون حرکت یک‌پیکسلی
             path.moveTo(request.x, request.y);
-            path.lineTo(request.x + 1f, request.y);
+            path.lineTo(request.x, request.y);
 
             GestureDescription.StrokeDescription stroke =
                     new GestureDescription.StrokeDescription(
@@ -273,7 +269,6 @@ public class AutoClickService extends AccessibilityService {
                             .addStroke(stroke)
                             .build();
 
-            // هر درخواست فعال به صورت مستقل نگهداری می‌شود.
             activeRequests.add(request);
 
             boolean accepted = dispatchGesture(
@@ -315,7 +310,6 @@ public class AutoClickService extends AccessibilityService {
             boolean success,
             boolean expired
     ) {
-        // Callback هر درخواست فقط همان درخواست را تکمیل می‌کند.
         if (!activeRequests.remove(request)) {
             return;
         }
