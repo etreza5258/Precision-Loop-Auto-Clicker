@@ -23,13 +23,9 @@ public class AutoClickService extends AccessibilityService {
 
     private final Handler handler = new Handler(Looper.getMainLooper());
 
-    // درخواست‌هایی که هنوز زمان هدفشان نرسیده است.
     private final ArrayList<ClickRequest> pending = new ArrayList<>();
-
-    // درخواست‌هایی که زمان هدفشان رسیده است.
     private final ArrayList<ClickRequest> ready = new ArrayList<>();
 
-    // فقط یک ژست در هر لحظه ارسال می‌شود.
     private ClickRequest activeRequest;
 
     private int targetX = 350;
@@ -176,8 +172,7 @@ public class AutoClickService extends AccessibilityService {
 
         request.id = ++nextRequestId;
         request.targetNanos = targetElapsedRealtimeNanos;
-        request.deadlineNanos =
-                cycleDeadlineElapsedRealtimeNanos;
+        request.deadlineNanos = cycleDeadlineElapsedRealtimeNanos;
         request.touchDurationMs = touchDurationMs;
 
         request.x = targetX;
@@ -188,7 +183,7 @@ public class AutoClickService extends AccessibilityService {
 
         pending.add(request);
 
-        // زمان‌بندی مستقل؛ بدون انتظار برای Callback درخواست قبلی.
+        // زمان‌بندی هر درخواست مستقل از Callback درخواست قبلی است.
         scheduleRequest(request);
 
         return true;
@@ -224,15 +219,13 @@ public class AutoClickService extends AccessibilityService {
 
         long now = SystemClock.elapsedRealtimeNanos();
 
-        // اگر به علت دقت Handler زود اجرا شده، دوباره زمان‌بندی می‌شود.
         if (now < request.targetNanos) {
             pending.add(request);
             scheduleRequest(request);
             return;
         }
 
-        // رسیدن زمان هدف فقط درخواست را آماده ارسال می‌کند.
-        // این مرحله به Callback ژست قبلی وابسته نیست.
+        // درخواست آماده می‌شود؛ منتظر ژست قبلی نمی‌ماند.
         ready.add(request);
 
         ready.sort(Comparator.comparingLong(
@@ -248,10 +241,9 @@ public class AutoClickService extends AccessibilityService {
         }
 
         while (!ready.isEmpty() && activeRequest == null) {
-
             ClickRequest request = ready.remove(0);
 
-            // درخواست آماده‌شده به دلیل گذشت زمان چرخه حذف نمی‌شود.
+            // درخواست آماده‌شده به دلیل پایان چرخه حذف نمی‌شود.
             boolean accepted = dispatchRequest(request);
 
             if (accepted) {
@@ -263,24 +255,29 @@ public class AutoClickService extends AccessibilityService {
     }
 
     private boolean dispatchRequest(ClickRequest request) {
-        Path path = new Path();
-        path.moveTo(request.x, request.y);
-
-        GestureDescription.StrokeDescription stroke =
-                new GestureDescription.StrokeDescription(
-                        path,
-                        0,
-                        request.touchDurationMs
-                );
-
-        GestureDescription gesture =
-                new GestureDescription.Builder()
-                        .addStroke(stroke)
-                        .build();
-
-        activeRequest = request;
-
         try {
+            Path path = new Path();
+
+            // شروع لمس در مختصات هدف
+            path.moveTo(request.x, request.y);
+
+            // حرکت بسیار کوتاه برای ایجاد Stroke مشخص
+            path.lineTo(request.x + 1f, request.y);
+
+            GestureDescription.StrokeDescription stroke =
+                    new GestureDescription.StrokeDescription(
+                            path,
+                            0,
+                            request.touchDurationMs
+                    );
+
+            GestureDescription gesture =
+                    new GestureDescription.Builder()
+                            .addStroke(stroke)
+                            .build();
+
+            activeRequest = request;
+
             boolean accepted = dispatchGesture(
                     gesture,
                     new GestureResultCallback() {
@@ -332,8 +329,7 @@ public class AutoClickService extends AccessibilityService {
 
         notifyCompletion(request, success, expired);
 
-        // پس از پایان ژست فعلی، درخواست آماده بعدی ارسال می‌شود.
-        // زمان‌بندی آن درخواست قبلاً و مستقل انجام شده است.
+        // ارسال درخواست آماده بعدی پس از پایان ژست فعلی
         pumpReadyQueue();
     }
 
@@ -386,3 +382,4 @@ public class AutoClickService extends AccessibilityService {
         }
     }
 }
+
