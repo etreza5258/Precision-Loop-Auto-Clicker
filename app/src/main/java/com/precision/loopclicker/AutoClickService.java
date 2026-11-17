@@ -11,6 +11,7 @@ import android.os.SystemClock;
 import android.view.accessibility.AccessibilityEvent;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 
 public class AutoClickService extends AccessibilityService {
 
@@ -22,14 +23,12 @@ public class AutoClickService extends AccessibilityService {
 
     private final Handler handler = new Handler(Looper.getMainLooper());
 
-    // درخواست‌هایی که هنوز زمان هدفشان نرسیده است.
+    // درخواست‌هایی که هنوز زمان ارسالشان نرسیده است.
     private final ArrayList<ClickRequest> pending = new ArrayList<>();
 
-    // درخواست‌هایی که زمان هدفشان رسیده و منتظر ارسال هستند.
-    private final ArrayList<ClickRequest> ready = new ArrayList<>();
-
-    // در هر لحظه فقط یک ژست فعال نگه داشته می‌شود.
-    private ClickRequest activeRequest;
+    // تمام ژست‌های ارسال‌شده که هنوز Callback نگرفته‌اند.
+    private final HashMap<Long, ClickRequest> active =
+            new HashMap<>();
 
     private int targetX = 350;
     private int targetY = 700;
@@ -68,7 +67,6 @@ public class AutoClickService extends AccessibilityService {
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-        // رویداد اضافی لازم نیست.
     }
 
     @Override
@@ -80,6 +78,13 @@ public class AutoClickService extends AccessibilityService {
     public void onDestroy() {
         runOnMain(() -> {
             cancelPendingInternal();
+
+            for (ClickRequest request :
+                    new ArrayList<>(active.values())) {
+                notifyCompletion(request, false, false);
+            }
+
+            active.clear();
             serviceReady = false;
 
             if (instance == this) {
@@ -99,7 +104,7 @@ public class AutoClickService extends AccessibilityService {
     }
 
     public boolean isGestureInProgress() {
-        return activeRequest != null;
+        return !active.isEmpty();
     }
 
     public int getTargetX() {
@@ -126,11 +131,8 @@ public class AutoClickService extends AccessibilityService {
     }
 
     /**
-     * درخواست مستقل ثبت می‌شود.
-     * ثبت درخواست بعدی منتظر callback درخواست قبلی نمی‌ماند.
-     *
-     * خروجی false یعنی درخواست از ابتدا پذیرفته نشده است
-     * و callback آن اجرا نخواهد شد.
+     * ثبت مستقل هر درخواست کلیک.
+     * هیچ بررسی برای فعال بودن ژست قبلی انجام نمی‌شود.
      */
     public boolean performClickAtTarget(
             long targetElapsedRealtimeNanos,
@@ -177,10 +179,10 @@ public class AutoClickService extends AccessibilityService {
 
         request.id = ++nextRequestId;
         request.targetNanos = targetElapsedRealtimeNanos;
-        request.deadlineNanos = cycleDeadlineElapsedRealtimeNanos;
+        request.deadlineNanos =
+                cycleDeadlineElapsedRealtimeNanos;
         request.touchDurationMs = touchDurationMs;
 
-        // مختصات هر درخواست هنگام ثبت آن ثابت می‌شود.
         request.x = targetX;
         request.y = targetY;
 
@@ -202,7 +204,8 @@ public class AutoClickService extends AccessibilityService {
         }
 
         long now = SystemClock.elapsedRealtimeNanos();
-        long touchNanos = request.touchDurationMs * 1_000_000L;
+        long touchNanos =
+                request.touchDurationMs * 1_000_000L;
 
         if (request.deadlineNanos - now < touchNanos) {
             finishPending(request, false, true);
@@ -226,8 +229,8 @@ public class AutoClickService extends AccessibilityService {
     }
 
     /**
-     * وقتی زمان هدف رسید، درخواست وارد صف آماده می‌شود.
-     * اگر ژست دیگری فعال باشد، درخواست حذف نمی‌شود.
+     * در زمان هدف، ژست مستقیماً ارسال می‌شود.
+     * فعال بودن ژست‌های دیگر مانع ارسال نیست.
      */
     private void executeRequest(ClickRequest request) {
         if (!pending.remove(request)) {
@@ -235,13 +238,11 @@ public class AutoClickService extends AccessibilityService {
         }
 
         long now = SystemClock.elapsedRealtimeNanos();
-
         long touchNanos =
                 request.touchDurationMs * 1_000_000L;
 
         if (request.deadlineNanos - now < touchNanos) {
             notifyCompletion(request, false, true);
-            dispatchNextReady();
             return;
         }
 
@@ -251,47 +252,18 @@ public class AutoClickService extends AccessibilityService {
             return;
         }
 
-        ready.add(request);
-        dispatchNextReady();
-    }
+        // بدون انتظار برای پایان ژست قبلی
+        // مستقیماً درخواست جدید ارسال می‌شود.
+        boolean accepted = dispatchRequest(request);
 
-    /**
-     * ارسال ژست‌ها به‌صورت متوالی.
-     * ثبت درخواست‌ها مستقل است، اما ارسال ژست جدید
-     * تا پایان ژست فعال قبلی صبر می‌کند تا لغو رخ ندهد.
-     */
-    private void dispatchNextReady() {
-        if (!serviceReady || activeRequest != null) {
-            return;
-        }
-
-        while (!ready.isEmpty()) {
-            ClickRequest request = ready.remove(0);
-
-            long now = SystemClock.elapsedRealtimeNanos();
-            long touchNanos =
-                    request.touchDurationMs * 1_000_000L;
-
-            if (request.deadlineNanos - now < touchNanos) {
-                notifyCompletion(request, false, true);
-                continue;
-            }
-
-            if (now < request.targetNanos) {
-                pending.add(request);
-                scheduleRequest(request);
-                continue;
-            }
-
-            if (dispatchRequest(request)) {
-                return;
-            }
-
-            // اگر سیستم درخواست را نپذیرد، نتیجه شکست ثبت می‌شود.
+        if (!accepted) {
             notifyCompletion(request, false, false);
         }
     }
 
+    /**
+     * ارسال مستقیم ژست؛ بدون شرط هم‌پوشانی.
+     */
     private boolean dispatchRequest(ClickRequest request) {
         Path path = new Path();
         path.moveTo(request.x, request.y);
@@ -308,7 +280,7 @@ public class AutoClickService extends AccessibilityService {
                         .addStroke(stroke)
                         .build();
 
-        activeRequest = request;
+        active.put(request.id, request);
 
         try {
             boolean accepted = dispatchGesture(
@@ -333,18 +305,14 @@ public class AutoClickService extends AccessibilityService {
             );
 
             if (!accepted) {
-                if (activeRequest == request) {
-                    activeRequest = null;
-                }
+                active.remove(request.id);
                 return false;
             }
 
             return true;
 
         } catch (Exception e) {
-            if (activeRequest == request) {
-                activeRequest = null;
-            }
+            active.remove(request.id);
             return false;
         }
     }
@@ -367,16 +335,15 @@ public class AutoClickService extends AccessibilityService {
             boolean success,
             boolean expired
     ) {
-        if (activeRequest != request) {
+        ClickRequest current = active.get(request.id);
+
+        if (current != request) {
             return;
         }
 
-        activeRequest = null;
+        active.remove(request.id);
 
         notifyCompletion(request, success, expired);
-
-        // پس از پایان ژست قبلی، درخواست بعدی بررسی می‌شود.
-        dispatchNextReady();
     }
 
     private void notifyCompletion(
@@ -396,28 +363,18 @@ public class AutoClickService extends AccessibilityService {
     }
 
     /**
-     * درخواست‌های ارسال‌نشده لغو می‌شوند.
-     * ژست فعال عمداً قطع نمی‌شود.
+     * فقط درخواست‌های ارسال‌نشده لغو می‌شوند.
      */
     public void cancelPendingScheduledClick() {
         runOnMain(this::cancelPendingInternal);
     }
 
     private void cancelPendingInternal() {
-        ArrayList<ClickRequest> pendingCopy =
+        ArrayList<ClickRequest> copy =
                 new ArrayList<>(pending);
 
-        for (ClickRequest request : pendingCopy) {
+        for (ClickRequest request : copy) {
             finishPending(request, false, true);
-        }
-
-        ArrayList<ClickRequest> readyCopy =
-                new ArrayList<>(ready);
-
-        ready.clear();
-
-        for (ClickRequest request : readyCopy) {
-            notifyCompletion(request, false, true);
         }
     }
 
