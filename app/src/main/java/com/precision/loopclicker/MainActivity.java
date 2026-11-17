@@ -1,4 +1,3 @@
-
 package com.precision.loopclicker;
 
 import android.app.Activity;
@@ -66,7 +65,6 @@ public class MainActivity extends Activity {
 
     private EditText cycleDurationInput;
     private EditText cycleCountInput;
-    private EditText compensationInput;
 
     private TextView phoneClock, internetClock;
     private TextView clockDifference, syncStatus;
@@ -145,7 +143,7 @@ public class MainActivity extends Activity {
     }
 
     // ---------------------------------------------------------
-    // ایجاد ورودی‌های جدید داخل LinearLayout
+    // ایجاد ورودی‌های چرخه
     // ---------------------------------------------------------
 
     private void addCycleInputs() {
@@ -159,12 +157,6 @@ public class MainActivity extends Activity {
                 cycleDurationInput,
                 "تعداد چرخه‌ها",
                 "1"
-        );
-
-        compensationInput = addInputAfter(
-                cycleCountInput,
-                "جبران دستی تأخیر ارسال (میلی‌ثانیه)",
-                "50"
         );
     }
 
@@ -685,15 +677,13 @@ public class MainActivity extends Activity {
 
             long cycleDuration = readNumber(cycleDurationInput, 1000);
             long cycleCount = readNumber(cycleCountInput, 1);
-            long compensation = readNumber(compensationInput, 50);
 
             if (intervalSeconds < 0 || intervalMillis < 0
                     || clicksPerCycle <= 0
                     || clicksPerCycle > Integer.MAX_VALUE
                     || touchMillis <= 0
                     || cycleDuration <= 0
-                    || cycleCount <= 0
-                    || compensation < 0) {
+                    || cycleCount <= 0) {
                 showError("یکی از مقادیر تنظیمات معتبر نیست.");
                 return;
             }
@@ -831,9 +821,6 @@ public class MainActivity extends Activity {
             service.putExtra("cycle_count", cycleCount);
             service.putExtra("cycle_duration_ms", cycleDuration);
             service.putExtra("total_duration_ms", totalDuration);
-
-            service.putExtra("compensation_ms", compensation);
-            service.putExtra("dispatch_lead_ms", compensation);
 
             service.putExtra("clock_source", source);
 
