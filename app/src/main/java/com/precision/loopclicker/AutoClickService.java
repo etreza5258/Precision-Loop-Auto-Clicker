@@ -189,8 +189,8 @@ public class AutoClickService extends AccessibilityService {
 
     /*
      * هر درخواست زمان‌بندی مستقل دارد.
-     * از تأخیر صحیحِ رو به پایین استفاده می‌شود؛
-     * اگر Handler زود بیدار شود، زمان هدف دوباره بررسی می‌شود.
+     * زمان هدف با ساعت elapsedRealtimeNanos بررسی می‌شود.
+     * هیچ درخواستی منتظر Callback درخواست قبلی نمی‌ماند.
      */
     private void scheduleRequest(ClickRequest request) {
         if (!pending.contains(request)) {
@@ -208,11 +208,11 @@ public class AutoClickService extends AccessibilityService {
 
         long delayMs = remaining / 1_000_000L;
 
-        if (delayMs > 0) {
-            handler.postDelayed(request.runnable, delayMs);
-        } else {
-            handler.post(request.runnable);
+        if (delayMs < 1) {
+            delayMs = 1;
         }
+
+        handler.postDelayed(request.runnable, delayMs);
     }
 
     private void executeRequest(ClickRequest request) {
@@ -243,7 +243,8 @@ public class AutoClickService extends AccessibilityService {
     }
 
     /*
-     * ارسال مستقیم؛ هیچ وابستگی‌ای به Callback درخواست قبلی ندارد.
+     * ارسال مستقیم ژست.
+     * ارسال درخواست بعدی به Callback این درخواست وابسته نیست.
      */
     private boolean dispatchRequest(ClickRequest request) {
         try {
@@ -332,7 +333,7 @@ public class AutoClickService extends AccessibilityService {
     }
 
     /*
-     * فقط درخواست‌های هنوز ارسال‌نشده لغو می‌شوند.
+     * فقط درخواست‌هایی که هنوز ارسال نشده‌اند لغو می‌شوند.
      * ژست‌های فعال با این متد دست‌کاری نمی‌شوند.
      */
     private void cancelPendingInternal() {
