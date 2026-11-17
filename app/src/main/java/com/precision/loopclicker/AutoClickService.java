@@ -11,9 +11,6 @@ import android.os.SystemClock;
 import android.view.accessibility.AccessibilityEvent;
 
 import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.Map;
 
 public class AutoClickService extends AccessibilityService {
 
@@ -25,8 +22,14 @@ public class AutoClickService extends AccessibilityService {
 
     private final Handler handler = new Handler(Looper.getMainLooper());
 
+    // درخواست‌هایی که هنوز زمان هدفشان نرسیده است.
     private final ArrayList<ClickRequest> pending = new ArrayList<>();
-    private final HashMap<Long, ClickRequest> active = new HashMap<>();
+
+    // درخواست‌هایی که زمان هدفشان رسیده و منتظر ارسال هستند.
+    private final ArrayList<ClickRequest> ready = new ArrayList<>();
+
+    // در هر لحظه فقط یک ژست فعال نگه داشته می‌شود.
+    private ClickRequest activeRequest;
 
     private int targetX = 350;
     private int targetY = 700;
@@ -39,6 +42,7 @@ public class AutoClickService extends AccessibilityService {
         long targetNanos;
         long deadlineNanos;
         long touchDurationMs;
+
         int x;
         int y;
 
@@ -95,7 +99,7 @@ public class AutoClickService extends AccessibilityService {
     }
 
     public boolean isGestureInProgress() {
-        return !active.isEmpty();
+        return activeRequest != null;
     }
 
     public int getTargetX() {
@@ -122,17 +126,11 @@ public class AutoClickService extends AccessibilityService {
     }
 
     /**
-     * هر درخواست مستقل زمان‌بندی می‌شود.
-     * ارسال درخواست جدید به پایان Gesture قبلی وابسته نیست.
+     * درخواست مستقل ثبت می‌شود.
+     * ثبت درخواست بعدی منتظر callback درخواست قبلی نمی‌ماند.
      *
-     * success=true:
-     * ژست با موفقیت کامل شده است.
-     *
-     * expired=true:
-     * فرصت اجرای ژست تا پایان چرخه از دست رفته است.
-     *
-     * false بودن خروجی متد:
-     * درخواست از ابتدا پذیرفته نشده و callback اجرا نمی‌شود.
+     * خروجی false یعنی درخواست از ابتدا پذیرفته نشده است
+     * و callback آن اجرا نخواهد شد.
      */
     public boolean performClickAtTarget(
             long targetElapsedRealtimeNanos,
@@ -181,21 +179,22 @@ public class AutoClickService extends AccessibilityService {
         request.targetNanos = targetElapsedRealtimeNanos;
         request.deadlineNanos = cycleDeadlineElapsedRealtimeNanos;
         request.touchDurationMs = touchDurationMs;
+
+        // مختصات هر درخواست هنگام ثبت آن ثابت می‌شود.
         request.x = targetX;
         request.y = targetY;
-        request.completion = completion;
 
+        request.completion = completion;
         request.runnable = () -> executeRequest(request);
 
         pending.add(request);
-
         scheduleRequest(request);
 
         return true;
     }
 
     /**
-     * زمان‌بندی مستقل هر کلیک.
+     * زمان‌بندی مستقل هر درخواست.
      */
     private void scheduleRequest(ClickRequest request) {
         if (!pending.contains(request)) {
@@ -203,9 +202,7 @@ public class AutoClickService extends AccessibilityService {
         }
 
         long now = SystemClock.elapsedRealtimeNanos();
-
-        long touchNanos =
-                request.touchDurationMs * 1_000_000L;
+        long touchNanos = request.touchDurationMs * 1_000_000L;
 
         if (request.deadlineNanos - now < touchNanos) {
             finishPending(request, false, true);
@@ -219,14 +216,18 @@ public class AutoClickService extends AccessibilityService {
             return;
         }
 
-        long delayMs =
-                (remaining + 999_999L) / 1_000_000L;
+        long delayMs = remaining / 1_000_000L;
+
+        if (remaining % 1_000_000L != 0) {
+            delayMs++;
+        }
 
         handler.postDelayed(request.runnable, delayMs);
     }
 
     /**
-     * اجرای درخواست بدون انتظار برای Gestureهای فعال دیگر.
+     * وقتی زمان هدف رسید، درخواست وارد صف آماده می‌شود.
+     * اگر ژست دیگری فعال باشد، درخواست حذف نمی‌شود.
      */
     private void executeRequest(ClickRequest request) {
         if (!pending.remove(request)) {
@@ -240,24 +241,58 @@ public class AutoClickService extends AccessibilityService {
 
         if (request.deadlineNanos - now < touchNanos) {
             notifyCompletion(request, false, true);
+            dispatchNextReady();
             return;
         }
 
-        // اگر زمان هدف گذشته ولی هنوز در محدوده چرخه هستیم،
-        // درخواست بلافاصله ارسال می‌شود.
         if (now < request.targetNanos) {
             pending.add(request);
             scheduleRequest(request);
             return;
         }
 
-        dispatchRequest(request);
+        ready.add(request);
+        dispatchNextReady();
     }
 
     /**
-     * عمداً بررسی نمی‌کنیم که Gesture دیگری فعال است یا نه.
+     * ارسال ژست‌ها به‌صورت متوالی.
+     * ثبت درخواست‌ها مستقل است، اما ارسال ژست جدید
+     * تا پایان ژست فعال قبلی صبر می‌کند تا لغو رخ ندهد.
      */
-    private void dispatchRequest(ClickRequest request) {
+    private void dispatchNextReady() {
+        if (!serviceReady || activeRequest != null) {
+            return;
+        }
+
+        while (!ready.isEmpty()) {
+            ClickRequest request = ready.remove(0);
+
+            long now = SystemClock.elapsedRealtimeNanos();
+            long touchNanos =
+                    request.touchDurationMs * 1_000_000L;
+
+            if (request.deadlineNanos - now < touchNanos) {
+                notifyCompletion(request, false, true);
+                continue;
+            }
+
+            if (now < request.targetNanos) {
+                pending.add(request);
+                scheduleRequest(request);
+                continue;
+            }
+
+            if (dispatchRequest(request)) {
+                return;
+            }
+
+            // اگر سیستم درخواست را نپذیرد، نتیجه شکست ثبت می‌شود.
+            notifyCompletion(request, false, false);
+        }
+    }
+
+    private boolean dispatchRequest(ClickRequest request) {
         Path path = new Path();
         path.moveTo(request.x, request.y);
 
@@ -273,12 +308,10 @@ public class AutoClickService extends AccessibilityService {
                         .addStroke(stroke)
                         .build();
 
-        active.put(request.id, request);
-
-        boolean accepted;
+        activeRequest = request;
 
         try {
-            accepted = dispatchGesture(
+            boolean accepted = dispatchGesture(
                     gesture,
                     new GestureResultCallback() {
 
@@ -286,33 +319,33 @@ public class AutoClickService extends AccessibilityService {
                         public void onCompleted(
                                 GestureDescription description
                         ) {
-                            finishActive(
-                                    request,
-                                    true,
-                                    false
-                            );
+                            finishActive(request, true, false);
                         }
 
                         @Override
                         public void onCancelled(
                                 GestureDescription description
                         ) {
-                            finishActive(
-                                    request,
-                                    false,
-                                    false
-                            );
+                            finishActive(request, false, false);
                         }
                     },
                     handler
             );
 
-        } catch (Exception e) {
-            accepted = false;
-        }
+            if (!accepted) {
+                if (activeRequest == request) {
+                    activeRequest = null;
+                }
+                return false;
+            }
 
-        if (!accepted) {
-            finishActive(request, false, false);
+            return true;
+
+        } catch (Exception e) {
+            if (activeRequest == request) {
+                activeRequest = null;
+            }
+            return false;
         }
     }
 
@@ -326,7 +359,6 @@ public class AutoClickService extends AccessibilityService {
         }
 
         handler.removeCallbacks(request.runnable);
-
         notifyCompletion(request, success, expired);
     }
 
@@ -335,11 +367,16 @@ public class AutoClickService extends AccessibilityService {
             boolean success,
             boolean expired
     ) {
-        if (active.remove(request.id) == null) {
+        if (activeRequest != request) {
             return;
         }
 
+        activeRequest = null;
+
         notifyCompletion(request, success, expired);
+
+        // پس از پایان ژست قبلی، درخواست بعدی بررسی می‌شود.
+        dispatchNextReady();
     }
 
     private void notifyCompletion(
@@ -359,23 +396,28 @@ public class AutoClickService extends AccessibilityService {
     }
 
     /**
-     * فقط درخواست‌های زمان‌بندی‌شده و هنوز ارسال‌نشده را لغو می‌کند.
-     * Gestureهای ارسال‌شده عمداً قطع نمی‌شوند.
+     * درخواست‌های ارسال‌نشده لغو می‌شوند.
+     * ژست فعال عمداً قطع نمی‌شود.
      */
     public void cancelPendingScheduledClick() {
         runOnMain(this::cancelPendingInternal);
     }
 
     private void cancelPendingInternal() {
-        if (pending.isEmpty()) {
-            return;
-        }
-
-        ArrayList<ClickRequest> copy =
+        ArrayList<ClickRequest> pendingCopy =
                 new ArrayList<>(pending);
 
-        for (ClickRequest request : copy) {
+        for (ClickRequest request : pendingCopy) {
             finishPending(request, false, true);
+        }
+
+        ArrayList<ClickRequest> readyCopy =
+                new ArrayList<>(ready);
+
+        ready.clear();
+
+        for (ClickRequest request : readyCopy) {
+            notifyCompletion(request, false, true);
         }
     }
 
