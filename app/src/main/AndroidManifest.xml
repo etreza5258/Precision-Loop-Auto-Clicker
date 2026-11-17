@@ -8,6 +8,8 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
+
+    android:name=".CrashLoggerApplication" 
         android:allowBackup="false"
         android:label="Precision Loop Auto Clicker"
         android:supportsRtl="true"
