@@ -31,6 +31,15 @@ public final class NtpTimeSync {
 
     private static final long NTP_EPOCH_OFFSET = 2208988800L;
 
+    private static final long NANOS_PER_SECOND = 1_000_000_000L;
+    private static final long NANOS_PER_MILLI = 1_000_000L;
+
+    private static final long MIN_VALID_EPOCH_MS =
+            1577836800000L;
+
+    private static final long MAX_VALID_EPOCH_MS =
+            4102444800000L;
+
     private NtpTimeSync() {
     }
 
@@ -75,21 +84,24 @@ public final class NtpTimeSync {
             List<Double> hostOffsets = new ArrayList<>();
 
             for (HostResult host : hostResults) {
-                hostOffsets.add(host.medianOffset);
+                hostOffsets.add(host.medianOffsetNanos);
             }
 
-            double centerOffset = median(hostOffsets);
+            double centerOffsetNanos = median(hostOffsets);
 
             List<Double> deviations = new ArrayList<>();
 
             for (double offset : hostOffsets) {
-                deviations.add(Math.abs(offset - centerOffset));
+
+                deviations.add(
+                        Math.abs(offset - centerOffsetNanos)
+                );
             }
 
             double mad = median(deviations);
 
-            double rejectionLimit = Math.max(
-                    15.0,
+            double rejectionLimitNanos = Math.max(
+                    15.0 * NANOS_PER_MILLI,
                     mad * 3.0
             );
 
@@ -97,8 +109,9 @@ public final class NtpTimeSync {
 
             for (HostResult host : hostResults) {
 
-                if (Math.abs(host.medianOffset - centerOffset)
-                        <= rejectionLimit) {
+                if (Math.abs(
+                        host.medianOffsetNanos - centerOffsetNanos
+                ) <= rejectionLimitNanos) {
 
                     acceptedHosts.add(host);
                 }
@@ -114,59 +127,132 @@ public final class NtpTimeSync {
 
             for (HostResult host : acceptedHosts) {
 
-                acceptedOffsets.add(host.medianOffset);
+                acceptedOffsets.add(host.medianOffsetNanos);
 
                 acceptedSamples.addAll(host.samples);
             }
 
-            double finalOffset = median(acceptedOffsets);
+            double finalOffsetNanos = median(acceptedOffsets);
 
-            double minOffset = Collections.min(acceptedOffsets);
-            double maxOffset = Collections.max(acceptedOffsets);
+            double minOffsetNanos =
+                    Collections.min(acceptedOffsets);
 
-            double spread = maxOffset - minOffset;
+            double maxOffsetNanos =
+                    Collections.max(acceptedOffsets);
+
+            double spreadNanos =
+                    maxOffsetNanos - minOffsetNanos;
 
             Sample bestSample = Collections.min(
                     acceptedSamples,
                     Comparator.comparingLong(
-                            sample -> sample.networkRoundTripMs
+                            sample -> sample.networkRoundTripNanos
                     )
             );
 
-            long nowWall = System.currentTimeMillis();
-            long nowElapsed = SystemClock.elapsedRealtime();
+            /*
+             * ثبت یک جفت زمانی نزدیک به هم برای ساخت مرجع ساعت.
+             * زمان سپری‌شده از ساعت monotonic گرفته می‌شود.
+             */
+            long receiveElapsedBefore =
+                    SystemClock.elapsedRealtimeNanos();
 
-            long finalOffsetMs = Math.round(finalOffset);
+            long receiveWallMs =
+                    System.currentTimeMillis();
 
-            long estimatedEpoch =
-                    nowWall + finalOffsetMs;
+            long receiveElapsedAfter =
+                    SystemClock.elapsedRealtimeNanos();
 
-            long uncertainty = (long) Math.ceil(
-                    bestSample.networkRoundTripMs / 2.0
-                            + maxDeviation(acceptedOffsets, finalOffset)
-                            + 1.0
-            );
+            long receivedElapsedNanos =
+                    receiveElapsedBefore
+                            + (receiveElapsedAfter
+                            - receiveElapsedBefore) / 2L;
+
+            long receiveWallEpochNanos =
+                    receiveWallMs * NANOS_PER_MILLI;
+
+            long estimatedEpochAtReceiveNanos =
+                    receiveWallEpochNanos
+                            + Math.round(finalOffsetNanos);
+
+            /*
+             * عدم‌قطعیت تخمینی:
+             * نصف RTT + اختلاف سرورها + یک میلی‌ثانیه
+             * برای درنظرگرفتن دقت ساعت دیوایس.
+             */
+            double uncertaintyNanos =
+                    bestSample.networkRoundTripNanos / 2.0
+                            + maxDeviation(
+                                    acceptedOffsets,
+                                    finalOffsetNanos
+                            )
+                            + NANOS_PER_MILLI;
+
+            long uncertaintyEstimateNanos =
+                    (long) Math.ceil(uncertaintyNanos);
 
             boolean crossChecked =
                     acceptedHosts.size() >= 2;
 
             boolean withinTarget =
                     crossChecked
-                            && spread <= 50.0
-                            && uncertainty <= 50L;
+                            && spreadNanos
+                            <= 50.0 * NANOS_PER_MILLI
+                            && uncertaintyEstimateNanos
+                            <= 50L * NANOS_PER_MILLI;
+
+            /*
+             * فیلدهای قدیمی میلی‌ثانیه‌ای حفظ شده‌اند
+             * تا MainActivity فعلی نیاز به تغییر نداشته باشد.
+             */
+            long offsetMs = Math.round(
+                    finalOffsetNanos / NANOS_PER_MILLI
+            );
+
+            long estimatedEpochAtReceiveMs =
+                    Math.round(
+                            estimatedEpochAtReceiveNanos
+                                    / (double) NANOS_PER_MILLI
+                    );
+
+            long receivedElapsedRealtimeMs =
+                    receivedElapsedNanos / NANOS_PER_MILLI;
+
+            long networkRoundTripMs =
+                    Math.round(
+                            bestSample.networkRoundTripNanos
+                                    / (double) NANOS_PER_MILLI
+                    );
+
+            long uncertaintyEstimateMs =
+                    (long) Math.ceil(
+                            uncertaintyEstimateNanos
+                                    / (double) NANOS_PER_MILLI
+                    );
+
+            long maxOffsetSpreadMs =
+                    (long) Math.ceil(
+                            spreadNanos / NANOS_PER_MILLI
+                    );
 
             return new Result(
-                    finalOffsetMs,
-                    estimatedEpoch,
-                    nowElapsed,
-                    bestSample.networkRoundTripMs,
-                    uncertainty,
-                    (long) Math.ceil(spread),
+                    offsetMs,
+                    estimatedEpochAtReceiveMs,
+                    receivedElapsedRealtimeMs,
+                    networkRoundTripMs,
+                    uncertaintyEstimateMs,
+                    maxOffsetSpreadMs,
                     acceptedHosts.size(),
                     acceptedSamples.size(),
                     bestSample.server,
                     crossChecked,
-                    withinTarget
+                    withinTarget,
+                    Math.round(finalOffsetNanos),
+                    estimatedEpochAtReceiveNanos,
+                    receivedElapsedNanos,
+                    bestSample.networkRoundTripNanos,
+                    uncertaintyEstimateNanos,
+                    (long) Math.ceil(spreadNanos)
             );
 
         } finally {
@@ -205,7 +291,7 @@ public final class NtpTimeSync {
         List<Double> offsets = new ArrayList<>();
 
         for (Sample sample : samples) {
-            offsets.add(sample.offsetMs);
+            offsets.add(sample.offsetNanos);
         }
 
         return new HostResult(
@@ -230,14 +316,34 @@ public final class NtpTimeSync {
 
             socket.setSoTimeout(TIMEOUT_MS);
 
-            // اتصال سوکت قبل از شروع اندازه‌گیری زمان
             socket.connect(address, NTP_PORT);
 
-            // ثبت زمان دقیق کلاینت درست پیش از ارسال
-            long t1Wall = System.currentTimeMillis();
-            long t1Nanos = SystemClock.elapsedRealtimeNanos();
+            /*
+             * ثبت جفت زمانی قبل از ارسال.
+             * زمان wall برای epoch و elapsed برای اندازه‌گیری فاصله.
+             */
+            long t1ElapsedBefore =
+                    SystemClock.elapsedRealtimeNanos();
 
-            writeTimestamp(request, 40, t1Wall);
+            long t1WallMs =
+                    System.currentTimeMillis();
+
+            long t1ElapsedAfter =
+                    SystemClock.elapsedRealtimeNanos();
+
+            long t1ElapsedNanos =
+                    t1ElapsedBefore
+                            + (t1ElapsedAfter
+                            - t1ElapsedBefore) / 2L;
+
+            long t1EpochNanos =
+                    t1WallMs * NANOS_PER_MILLI;
+
+            writeTimestamp(
+                    request,
+                    40,
+                    t1EpochNanos
+            );
 
             byte[] clientTransmit = new byte[8];
 
@@ -266,7 +372,8 @@ public final class NtpTimeSync {
             socket.receive(incoming);
 
             // ثبت زمان دریافت بلافاصله پس از دریافت پاسخ
-            long t4Nanos = SystemClock.elapsedRealtimeNanos();
+            long t4ElapsedNanos =
+                    SystemClock.elapsedRealtimeNanos();
 
             if (incoming.getLength() < PACKET_SIZE) {
                 return null;
@@ -299,67 +406,105 @@ public final class NtpTimeSync {
                 }
             }
 
-            long t2 = readTimestamp(response, 32);
-            long t3 = readTimestamp(response, 40);
+            long t2EpochNanos =
+                    readTimestampNanos(response, 32);
 
-            if (t2 <= 0 || t3 <= 0 || t3 < t2) {
+            long t3EpochNanos =
+                    readTimestampNanos(response, 40);
+
+            if (t2EpochNanos <= 0
+                    || t3EpochNanos <= 0
+                    || t3EpochNanos < t2EpochNanos) {
+
                 return null;
             }
 
             long elapsedNanos = Math.max(
                     0L,
-                    t4Nanos - t1Nanos
+                    t4ElapsedNanos - t1ElapsedNanos
             );
 
-            double elapsedMs = elapsedNanos / 1_000_000.0;
+            /*
+             * تخمین زمان epoch در لحظه دریافت پاسخ.
+             * از ساعت monotonic برای گذشت زمان استفاده می‌شود.
+             */
+            long t4EpochNanos =
+                    t1EpochNanosToEpoch(
+                            t1EpochNanos,
+                            elapsedNanos
+                    );
 
-            long t4 = t1Wall + Math.round(elapsedMs);
+            /*
+             * فرمول استاندارد offset در NTP:
+             *
+             * offset = ((t2 - t1) + (t3 - t4)) / 2
+             */
+            double offsetNanos =
+                    (
+                            (double) (t2EpochNanos - t1EpochNanos)
+                                    + (double) (t3EpochNanos - t4EpochNanos)
+                    ) / 2.0;
 
-            double offset =
-                    ((double) (t2 - t1Wall)
-                            + (double) (t3 - t4)) / 2.0;
+            long serverProcessingNanos =
+                    t3EpochNanos - t2EpochNanos;
 
-            long serverProcessing = t3 - t2;
-
-            long networkRoundTrip = Math.max(
+            long networkRoundTripNanos = Math.max(
                     0L,
-                    Math.round(elapsedMs - serverProcessing)
+                    elapsedNanos - serverProcessingNanos
             );
 
-            long estimatedEpoch =
-                    t4 + Math.round(offset);
+            long estimatedEpochNanos =
+                    t4EpochNanos + Math.round(offsetNanos);
 
-            if (estimatedEpoch < 1577836800000L
-                    || estimatedEpoch > 4102444800000L) {
+            long estimatedEpochMs =
+                    estimatedEpochNanos / NANOS_PER_MILLI;
+
+            if (estimatedEpochMs < MIN_VALID_EPOCH_MS
+                    || estimatedEpochMs > MAX_VALID_EPOCH_MS) {
 
                 return null;
             }
 
             return new Sample(
                     server,
-                    offset,
-                    estimatedEpoch,
-                    SystemClock.elapsedRealtime(),
-                    networkRoundTrip
+                    offsetNanos,
+                    estimatedEpochNanos,
+                    t4ElapsedNanos,
+                    networkRoundTripNanos
             );
         }
     }
 
+    private static long t1EpochNanosToEpoch(
+            long t1EpochNanos,
+            long elapsedNanos
+    ) {
+
+        return t1EpochNanos + elapsedNanos;
+    }
+
+    /*
+     * تبدیل timestamp یونیکس نانوثانیه‌ای به قالب NTP.
+     */
     private static void writeTimestamp(
             byte[] data,
             int offset,
-            long unixMillis
+            long unixEpochNanos
     ) {
 
-        long seconds =
-                unixMillis / 1000L + NTP_EPOCH_OFFSET;
+        long unixSeconds =
+                unixEpochNanos / NANOS_PER_SECOND;
 
-        long millis = unixMillis % 1000L;
+        long nanos =
+                unixEpochNanos % NANOS_PER_SECOND;
+
+        long ntpSeconds =
+                unixSeconds + NTP_EPOCH_OFFSET;
 
         long fraction =
-                (millis << 32) / 1000L;
+                (nanos << 32) / NANOS_PER_SECOND;
 
-        writeUnsignedInt(data, offset, seconds);
+        writeUnsignedInt(data, offset, ntpSeconds);
         writeUnsignedInt(data, offset + 4, fraction);
     }
 
@@ -375,21 +520,28 @@ public final class NtpTimeSync {
         data[offset + 3] = (byte) value;
     }
 
-    private static long readTimestamp(
+    /*
+     * خواندن timestamp NTP و تبدیل آن به نانوثانیه یونیکس.
+     */
+    private static long readTimestampNanos(
             byte[] data,
             int offset
     ) {
 
-        long seconds = readUnsignedInt(data, offset);
-        long fraction = readUnsignedInt(data, offset + 4);
+        long seconds =
+                readUnsignedInt(data, offset);
+
+        long fraction =
+                readUnsignedInt(data, offset + 4);
 
         long unixSeconds =
                 seconds - NTP_EPOCH_OFFSET;
 
-        long fractionMillis =
-                (fraction * 1000L) >>> 32;
+        long fractionNanos =
+                (fraction * NANOS_PER_SECOND) >>> 32;
 
-        return unixSeconds * 1000L + fractionMillis;
+        return unixSeconds * NANOS_PER_SECOND
+                + fractionNanos;
     }
 
     private static long readUnsignedInt(
@@ -444,24 +596,24 @@ public final class NtpTimeSync {
     private static class Sample {
 
         final String server;
-        final double offsetMs;
-        final long estimatedEpochMs;
-        final long receivedElapsedMs;
-        final long networkRoundTripMs;
+        final double offsetNanos;
+        final long estimatedEpochNanos;
+        final long receivedElapsedNanos;
+        final long networkRoundTripNanos;
 
         Sample(
                 String server,
-                double offsetMs,
-                long estimatedEpochMs,
-                long receivedElapsedMs,
-                long networkRoundTripMs
+                double offsetNanos,
+                long estimatedEpochNanos,
+                long receivedElapsedNanos,
+                long networkRoundTripNanos
         ) {
 
             this.server = server;
-            this.offsetMs = offsetMs;
-            this.estimatedEpochMs = estimatedEpochMs;
-            this.receivedElapsedMs = receivedElapsedMs;
-            this.networkRoundTripMs = networkRoundTripMs;
+            this.offsetNanos = offsetNanos;
+            this.estimatedEpochNanos = estimatedEpochNanos;
+            this.receivedElapsedNanos = receivedElapsedNanos;
+            this.networkRoundTripNanos = networkRoundTripNanos;
         }
     }
 
@@ -469,33 +621,43 @@ public final class NtpTimeSync {
 
         final String server;
         final List<Sample> samples;
-        final double medianOffset;
+        final double medianOffsetNanos;
 
         HostResult(
                 String server,
                 List<Sample> samples,
-                double medianOffset
+                double medianOffsetNanos
         ) {
 
             this.server = server;
             this.samples = samples;
-            this.medianOffset = medianOffset;
+            this.medianOffsetNanos = medianOffsetNanos;
         }
     }
 
     public static class Result {
 
+        // فیلدهای قبلی برای سازگاری با MainActivity
         public final long offsetMs;
         public final long estimatedEpochAtReceiveMs;
         public final long receivedElapsedRealtimeMs;
         public final long networkRoundTripMs;
         public final long uncertaintyEstimateMs;
         public final long maxOffsetSpreadMs;
+
         public final int independentServerCount;
         public final int sampleCount;
         public final String server;
         public final boolean isCrossChecked;
         public final boolean withinTarget50ms;
+
+        // فیلدهای جدید با واحد نانوثانیه
+        public final long offsetNanos;
+        public final long estimatedEpochAtReceiveNanos;
+        public final long receivedElapsedRealtimeNanos;
+        public final long networkRoundTripNanos;
+        public final long uncertaintyEstimateNanos;
+        public final long maxOffsetSpreadNanos;
 
         Result(
                 long offsetMs,
@@ -508,7 +670,13 @@ public final class NtpTimeSync {
                 int sampleCount,
                 String server,
                 boolean isCrossChecked,
-                boolean withinTarget50ms
+                boolean withinTarget50ms,
+                long offsetNanos,
+                long estimatedEpochAtReceiveNanos,
+                long receivedElapsedRealtimeNanos,
+                long networkRoundTripNanos,
+                long uncertaintyEstimateNanos,
+                long maxOffsetSpreadNanos
         ) {
 
             this.offsetMs = offsetMs;
@@ -518,12 +686,14 @@ public final class NtpTimeSync {
             this.receivedElapsedRealtimeMs =
                     receivedElapsedRealtimeMs;
 
-            this.networkRoundTripMs = networkRoundTripMs;
+            this.networkRoundTripMs =
+                    networkRoundTripMs;
 
             this.uncertaintyEstimateMs =
                     uncertaintyEstimateMs;
 
-            this.maxOffsetSpreadMs = maxOffsetSpreadMs;
+            this.maxOffsetSpreadMs =
+                    maxOffsetSpreadMs;
 
             this.independentServerCount =
                     independentServerCount;
@@ -532,6 +702,23 @@ public final class NtpTimeSync {
             this.server = server;
             this.isCrossChecked = isCrossChecked;
             this.withinTarget50ms = withinTarget50ms;
+
+            this.offsetNanos = offsetNanos;
+
+            this.estimatedEpochAtReceiveNanos =
+                    estimatedEpochAtReceiveNanos;
+
+            this.receivedElapsedRealtimeNanos =
+                    receivedElapsedRealtimeNanos;
+
+            this.networkRoundTripNanos =
+                    networkRoundTripNanos;
+
+            this.uncertaintyEstimateNanos =
+                    uncertaintyEstimateNanos;
+
+            this.maxOffsetSpreadNanos =
+                    maxOffsetSpreadNanos;
         }
     }
 }
