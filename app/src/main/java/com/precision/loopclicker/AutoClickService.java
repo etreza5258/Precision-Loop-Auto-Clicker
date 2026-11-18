@@ -10,28 +10,58 @@ import android.os.SystemClock;
 import android.view.accessibility.AccessibilityEvent;
 
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.List;
+import java.util.concurrent.locks.LockSupport;
 
 public class AutoClickService extends AccessibilityService {
 
     private static final long NANOS_PER_MS = 1_000_000L;
-    private static final long NO_SCHEDULE = Long.MAX_VALUE;
+    private static final String TARGET_PREFS_NAME = "auto_click_target";
+    private static final String TARGET_X_KEY = "target_x";
+    private static final String TARGET_Y_KEY = "target_y";
+    private static final int DEFAULT_TARGET_X = 350;
+    private static final int DEFAULT_TARGET_Y = 700;
+
+    private static final int INITIAL_PENDING_CAPACITY = 64;
+    private static final int INITIAL_ACTIVE_CAPACITY = 32;
+    private static final long MAX_GESTURE_DURATION_MS =
+            GestureDescription.getMaxGestureDuration();
+
     private static volatile AutoClickService instance;
 
     public interface GestureCompletion {
         void onFinished(boolean success, boolean expired);
     }
 
-    private final Handler handler = new Handler(Looper.getMainLooper());
-    private final ArrayDeque<ClickRequest> pending = new ArrayDeque<>();
-    private final HashSet<ClickRequest> activeRequests = new HashSet<>();
-    private final Runnable schedulerRunnable = this::processDueRequests;
+    /*
+     * Gesture callbacks and client completion callbacks are delivered on the
+     * service main thread. The timing worker itself never blocks that thread.
+     */
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
-    private int targetX = 350;
-    private int targetY = 700;
+    /*
+     * FIFO order is intentionally preserved. Requests are not sorted or
+     * coalesced, so the existing click ordering semantics remain unchanged.
+     */
+    private final Object queueLock = new Object();
+
+    private final ArrayDeque<ClickRequest> pending =
+            new ArrayDeque<>(INITIAL_PENDING_CAPACITY);
+
+    private final HashSet<ClickRequest> activeRequests =
+            new HashSet<>(INITIAL_ACTIVE_CAPACITY);
+
     private volatile boolean serviceReady;
-    private long scheduledTargetNanos = NO_SCHEDULE;
+    private volatile boolean schedulerStopping;
+    private volatile Thread schedulerThread;
+
+    private volatile int targetX = DEFAULT_TARGET_X;
+    private volatile int targetY = DEFAULT_TARGET_Y;
+
+    private SharedPreferences targetPreferences;
 
     private static final class ClickRequest
             extends AccessibilityService.GestureResultCallback {
@@ -42,11 +72,21 @@ public class AutoClickService extends AccessibilityService {
         final long touchDurationMs;
         final int x;
         final int y;
+
+        /*
+         * Accessed only from the main thread when completion is delivered.
+         */
         GestureCompletion completion;
 
-        ClickRequest(AutoClickService owner, long targetNanos,
-                     long deadlineNanos, long touchDurationMs,
-                     int x, int y, GestureCompletion completion) {
+        ClickRequest(
+                AutoClickService owner,
+                long targetNanos,
+                long deadlineNanos,
+                long touchDurationMs,
+                int x,
+                int y,
+                GestureCompletion completion) {
+
             this.owner = owner;
             this.targetNanos = targetNanos;
             this.deadlineNanos = deadlineNanos;
@@ -65,22 +105,105 @@ public class AutoClickService extends AccessibilityService {
         public void onCancelled(GestureDescription gesture) {
             owner.completeRequest(this, false);
         }
-
     }
 
     @Override
     protected void onServiceConnected() {
         super.onServiceConnected();
-        SharedPreferences prefs =
-                getSharedPreferences("auto_click_target", MODE_PRIVATE);
-        targetX = prefs.getInt("target_x", 350);
-        targetY = prefs.getInt("target_y", 700);
-        instance = this;
+
+        targetPreferences = getSharedPreferences(
+                TARGET_PREFS_NAME,
+                MODE_PRIVATE
+        );
+
+        targetX = targetPreferences.getInt(
+                TARGET_X_KEY,
+                DEFAULT_TARGET_X
+        );
+
+        targetY = targetPreferences.getInt(
+                TARGET_Y_KEY,
+                DEFAULT_TARGET_Y
+        );
+
+        schedulerStopping = false;
         serviceReady = true;
+        instance = this;
+
+        startNanoScheduler();
+    }
+
+    private void startNanoScheduler() {
+        Thread existing = schedulerThread;
+
+        if (existing != null && existing.isAlive()) {
+            return;
+        }
+
+        Thread worker = new Thread(
+                this::schedulerLoop,
+                "PrecisionClickNanoScheduler"
+        );
+
+        schedulerThread = worker;
+        worker.start();
+    }
+
+    /*
+     * Waits against elapsedRealtimeNanos() using a dedicated worker thread.
+     *
+     * parkNanos() accepts a nanosecond duration. It does not promise that the
+     * operating system will wake the thread at that exact nanosecond; it only
+     * removes Handler.postDelayed()'s millisecond delay conversion.
+     *
+     * No busy-spin loop is used: while the target is in the future, the worker
+     * parks and is unparked when a new head request arrives or the service stops.
+     */
+    private void schedulerLoop() {
+        while (!schedulerStopping) {
+            ClickRequest request;
+
+            synchronized (queueLock) {
+                request = pending.peekFirst();
+            }
+
+            if (request == null) {
+                LockSupport.park(this);
+                continue;
+            }
+
+            long remainingNanos =
+                    request.targetNanos - SystemClock.elapsedRealtimeNanos();
+
+            if (remainingNanos > 0L) {
+                LockSupport.parkNanos(this, remainingNanos);
+                continue;
+            }
+
+            synchronized (queueLock) {
+                /*
+                 * Cancellation may have removed the head while this thread
+                 * was parked. Re-check identity before removing it.
+                 */
+                if (pending.peekFirst() != request) {
+                    continue;
+                }
+
+                pending.pollFirst();
+            }
+
+            if (schedulerStopping || !serviceReady) {
+                postCompletion(request, false, true);
+                continue;
+            }
+
+            dispatchReadyRequest(request);
+        }
     }
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
+        // No event processing is required by this click service.
     }
 
     @Override
@@ -91,21 +214,44 @@ public class AutoClickService extends AccessibilityService {
     @Override
     public void onDestroy() {
         serviceReady = false;
-        handler.removeCallbacks(schedulerRunnable);
-        scheduledTargetNanos = NO_SCHEDULE;
+        schedulerStopping = true;
 
-        while (!pending.isEmpty()) {
-            notifyCompletion(pending.pollFirst(), false, true);
+        Thread worker = schedulerThread;
+        schedulerThread = null;
+
+        if (worker != null) {
+            LockSupport.unpark(worker);
+            worker.interrupt();
         }
 
-        Iterator<ClickRequest> iterator = activeRequests.iterator();
-        while (iterator.hasNext()) {
-            ClickRequest request = iterator.next();
-            iterator.remove();
+        List<ClickRequest> pendingToFinish = new ArrayList<>();
+        List<ClickRequest> activeToFinish = new ArrayList<>();
+
+        synchronized (queueLock) {
+            while (!pending.isEmpty()) {
+                pendingToFinish.add(pending.pollFirst());
+            }
+
+            Iterator<ClickRequest> iterator = activeRequests.iterator();
+            while (iterator.hasNext()) {
+                activeToFinish.add(iterator.next());
+                iterator.remove();
+            }
+        }
+
+        for (ClickRequest request : pendingToFinish) {
+            notifyCompletion(request, false, true);
+        }
+
+        for (ClickRequest request : activeToFinish) {
             notifyCompletion(request, false, false);
         }
 
-        if (instance == this) instance = null;
+        if (instance == this) {
+            instance = null;
+        }
+
+        targetPreferences = null;
         super.onDestroy();
     }
 
@@ -118,7 +264,9 @@ public class AutoClickService extends AccessibilityService {
     }
 
     public boolean isGestureInProgress() {
-        return !activeRequests.isEmpty();
+        synchronized (queueLock) {
+            return !activeRequests.isEmpty();
+        }
     }
 
     public int getTargetX() {
@@ -132,21 +280,36 @@ public class AutoClickService extends AccessibilityService {
     public void setTarget(int x, int y) {
         final int newX = Math.max(0, x);
         final int newY = Math.max(0, y);
+
         runOnMain(() -> {
-            if (!serviceReady || (targetX == newX && targetY == newY)) return;
+            if (!serviceReady || (targetX == newX && targetY == newY)) {
+                return;
+            }
+
             targetX = newX;
             targetY = newY;
-            getSharedPreferences("auto_click_target", MODE_PRIVATE)
-                    .edit()
-                    .putInt("target_x", newX)
-                    .putInt("target_y", newY)
-                    .apply();
+
+            SharedPreferences prefs = targetPreferences;
+            if (prefs != null) {
+                prefs.edit()
+                        .putInt(TARGET_X_KEY, newX)
+                        .putInt(TARGET_Y_KEY, newY)
+                        .apply();
+            }
         });
     }
 
     /**
-     * touchDurationNanos با نانوثانیه دریافت می‌شود.
-     * مقدار صفر نیز پذیرفته می‌شود؛ برای API اندروید به ۱ms تبدیل می‌شود.
+     * touchDurationNanos is received in nanoseconds.
+     *
+     * Existing cycle rules are preserved:
+     * - target time must be inside the cycle;
+     * - dispatch must begin before the cycle deadline;
+     * - after dispatch begins in time, Android may complete the gesture
+     *   after the cycle deadline.
+     *
+     * This method can now be called from any thread. Queue access is protected
+     * by queueLock and the timing worker performs the actual dispatch.
      */
     public boolean performClickAtTarget(
             long targetElapsedRealtimeNanos,
@@ -155,21 +318,22 @@ public class AutoClickService extends AccessibilityService {
             long touchDurationNanos,
             GestureCompletion completion) {
 
-        if (Looper.myLooper() != Looper.getMainLooper()
-                || !serviceReady
+        if (!serviceReady
+                || schedulerStopping
                 || completion == null
                 || touchDurationNanos < 0
                 || cycleDeadlineElapsedRealtimeNanos
-                    <= cycleStartElapsedRealtimeNanos
+                        <= cycleStartElapsedRealtimeNanos
                 || targetElapsedRealtimeNanos
-                    < cycleStartElapsedRealtimeNanos
+                        < cycleStartElapsedRealtimeNanos
                 || targetElapsedRealtimeNanos
-                    >= cycleDeadlineElapsedRealtimeNanos) {
+                        >= cycleDeadlineElapsedRealtimeNanos) {
             return false;
         }
 
         long touchDurationMs = toGestureDurationMs(touchDurationNanos);
-        if (touchDurationMs > GestureDescription.getMaxGestureDuration()) {
+
+        if (touchDurationMs > MAX_GESTURE_DURATION_MS) {
             return false;
         }
 
@@ -183,71 +347,58 @@ public class AutoClickService extends AccessibilityService {
                 completion
         );
 
-        ClickRequest head = pending.peekFirst();
-        if (head == null
-                && targetElapsedRealtimeNanos
-                    <= SystemClock.elapsedRealtimeNanos()) {
-            dispatchReadyRequest(request);
-            return true;
+        boolean wasEmpty;
+
+        synchronized (queueLock) {
+            if (!serviceReady || schedulerStopping) {
+                return false;
+            }
+
+            wasEmpty = pending.isEmpty();
+            pending.offerLast(request);
         }
 
-        pending.offerLast(request);
-        if (head == null) scheduleHead();
+        /*
+         * Wake the worker only when the queue changes from empty to non-empty.
+         * FIFO ordering is unchanged, so a later appended request cannot
+         * replace the current head's target.
+         */
+        if (wasEmpty) {
+            Thread worker = schedulerThread;
+            if (worker != null) {
+                LockSupport.unpark(worker);
+            }
+        }
+
         return true;
     }
 
     private static long toGestureDurationMs(long durationNanos) {
-        if (durationNanos <= 0) return 1L;
+        if (durationNanos <= 0L) {
+            return 1L;
+        }
+
         long millis = durationNanos / NANOS_PER_MS;
-        if (durationNanos % NANOS_PER_MS != 0) millis++;
+
+        if (durationNanos % NANOS_PER_MS != 0L) {
+            millis++;
+        }
+
         return Math.max(1L, millis);
     }
 
-    private void scheduleHead() {
-        ClickRequest head = pending.peekFirst();
-        if (head == null) {
-            if (scheduledTargetNanos != NO_SCHEDULE) {
-                handler.removeCallbacks(schedulerRunnable);
-                scheduledTargetNanos = NO_SCHEDULE;
-            }
+    private void dispatchReadyRequest(ClickRequest request) {
+        /*
+         * Preserve the original deadline rule. Only the dispatch start must
+         * occur before the deadline; gesture completion may occur afterward.
+         */
+        if (SystemClock.elapsedRealtimeNanos() >= request.deadlineNanos) {
+            postCompletion(request, false, true);
             return;
         }
 
-        if (scheduledTargetNanos == head.targetNanos) return;
-
-        handler.removeCallbacks(schedulerRunnable);
-        scheduledTargetNanos = head.targetNanos;
-
-        long remaining =
-                head.targetNanos - SystemClock.elapsedRealtimeNanos();
-
-        if (remaining <= 0) {
-            handler.post(schedulerRunnable);
-        } else {
-            long delayMs = 1L + (remaining - 1L) / NANOS_PER_MS;
-            handler.postDelayed(schedulerRunnable, delayMs);
-        }
-    }
-
-    private void processDueRequests() {
-        scheduledTargetNanos = NO_SCHEDULE;
-        long now = SystemClock.elapsedRealtimeNanos();
-        ClickRequest request;
-
-        while ((request = pending.peekFirst()) != null
-                && now >= request.targetNanos) {
-            pending.pollFirst();
-            dispatchReadyRequest(request);
-            now = SystemClock.elapsedRealtimeNanos();
-        }
-        scheduleHead();
-    }
-
-    private void dispatchReadyRequest(ClickRequest request) {
-        if (SystemClock.elapsedRealtimeNanos() >= request.deadlineNanos) {
-            notifyCompletion(request, false, true);
-        } else if (!dispatchRequest(request)) {
-            notifyCompletion(request, false, false);
+        if (!dispatchRequest(request)) {
+            postCompletion(request, false, false);
         }
     }
 
@@ -260,34 +411,102 @@ public class AutoClickService extends AccessibilityService {
             GestureDescription gesture =
                     new GestureDescription.Builder()
                             .addStroke(new GestureDescription.StrokeDescription(
-                                    path, 0, request.touchDurationMs))
+                                    path,
+                                    0L,
+                                    request.touchDurationMs
+                            ))
                             .build();
 
-            activeRequests.add(request);
-            if (dispatchGesture(gesture, request, handler)) return true;
+            /*
+             * Register before dispatch so a fast callback cannot arrive before
+             * the request is known as active. The lock also prevents onDestroy()
+             * from clearing the service while dispatch is being initiated.
+             */
+            synchronized (queueLock) {
+                if (!serviceReady || schedulerStopping) {
+                    return false;
+                }
 
-            activeRequests.remove(request);
+                activeRequests.add(request);
+
+                boolean accepted;
+                try {
+                    /*
+                     * dispatchGesture is initiated by the dedicated timing
+                     * worker. Its result callback is explicitly delivered on
+                     * the main thread through mainHandler.
+                     */
+                    accepted = dispatchGesture(
+                            gesture,
+                            request,
+                            mainHandler
+                    );
+                } catch (Exception ignored) {
+                    activeRequests.remove(request);
+                    return false;
+                }
+
+                if (!accepted) {
+                    activeRequests.remove(request);
+                }
+
+                return accepted;
+            }
         } catch (Exception ignored) {
-            activeRequests.remove(request);
+            synchronized (queueLock) {
+                activeRequests.remove(request);
+            }
+            return false;
         }
-        return false;
     }
 
     private void completeRequest(ClickRequest request, boolean success) {
-        if (activeRequests.remove(request)) {
+        boolean wasActive;
+
+        synchronized (queueLock) {
+            wasActive = activeRequests.remove(request);
+        }
+
+        if (wasActive) {
             notifyCompletion(request, success, false);
         }
     }
 
+    /*
+     * Worker-thread outcomes are posted to the main thread so callers continue
+     * receiving completion callbacks on the same thread as before.
+     */
+    private void postCompletion(
+            ClickRequest request,
+            boolean success,
+            boolean expired) {
+
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            notifyCompletion(request, success, expired);
+        } else {
+            mainHandler.post(
+                    () -> notifyCompletion(request, success, expired)
+            );
+        }
+    }
+
     private void notifyCompletion(
-            ClickRequest request, boolean success, boolean expired) {
-        if (request == null) return;
+            ClickRequest request,
+            boolean success,
+            boolean expired) {
+
+        if (request == null) {
+            return;
+        }
+
         GestureCompletion callback = request.completion;
         request.completion = null;
+
         if (callback != null) {
             try {
                 callback.onFinished(success, expired);
             } catch (Exception ignored) {
+                // A client callback must not interrupt service scheduling.
             }
         }
     }
@@ -297,15 +516,29 @@ public class AutoClickService extends AccessibilityService {
     }
 
     private void cancelPendingInternal() {
-        handler.removeCallbacks(schedulerRunnable);
-        scheduledTargetNanos = NO_SCHEDULE;
-        while (!pending.isEmpty()) {
-            notifyCompletion(pending.pollFirst(), false, true);
+        List<ClickRequest> cancelled = new ArrayList<>();
+
+        synchronized (queueLock) {
+            while (!pending.isEmpty()) {
+                cancelled.add(pending.pollFirst());
+            }
+        }
+
+        Thread worker = schedulerThread;
+        if (worker != null) {
+            LockSupport.unpark(worker);
+        }
+
+        for (ClickRequest request : cancelled) {
+            notifyCompletion(request, false, true);
         }
     }
 
     private void runOnMain(Runnable action) {
-        if (Looper.myLooper() == Looper.getMainLooper()) action.run();
-        else handler.post(action);
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            action.run();
+        } else {
+            mainHandler.post(action);
+        }
     }
 }
