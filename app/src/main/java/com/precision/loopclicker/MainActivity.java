@@ -1,3 +1,4 @@
+
 package com.precision.loopclicker;
 
 import android.app.Activity;
@@ -31,10 +32,15 @@ import java.util.Locale;
 import java.util.TimeZone;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 
 public class MainActivity extends Activity {
 
     private static final ZoneId IRAN_ZONE = ZoneId.of("Asia/Tehran");
+
+    private static final long NANOS_PER_MILLI = 1_000_000L;
+    private static final long SYNC_INTERVAL_NANOS = 1_000_000_000L;
+    private static final long SYNC_RETRY_INTERVAL_NANOS = 1_000_000_000L;
 
     private static final String PREF_NAME = "precision_loop_settings";
     private static final String PREF_CLOCK_SOURCE = "clock_source";
@@ -47,10 +53,6 @@ public class MainActivity extends Activity {
 
     private static final String ACTION_CLOCK_SOURCE_CHANGED =
             "com.precision.loopclicker.ACTION_CLOCK_SOURCE_CHANGED";
-
-    // تلاش برای همگام‌سازی ساعت اینترنتی هر یک ثانیه؛ هم‌زمان فقط یک درخواست فعال است.
-    private static final long SYNC_INTERVAL_MS = 1000L;
-    private static final long SYNC_RETRY_INTERVAL_MS = 1000L;
 
     private final android.os.Handler handler =
             new android.os.Handler(android.os.Looper.getMainLooper());
@@ -90,21 +92,27 @@ public class MainActivity extends Activity {
     private volatile boolean syncCrossChecked = false;
     private volatile boolean syncWithinTarget50ms = false;
 
-    private volatile long lastSyncElapsed = 0;
-    private volatile long lastSyncAttemptElapsed = 0;
+    // زمان‌های کنترل همگام‌سازی با ساعت یکنواخت نانوثانیه‌ای
+    private volatile long lastSyncElapsedNanos = 0;
+    private volatile long lastSyncAttemptElapsedNanos = 0;
 
     private final Runnable clockRunnable = new Runnable() {
         @Override
         public void run() {
             updateClocks();
 
-            long now = SystemClock.elapsedRealtime();
+            long nowNanos = SystemClock.elapsedRealtimeNanos();
 
-            boolean retryPassed = lastSyncAttemptElapsed <= 0
-                    || now - lastSyncAttemptElapsed >= SYNC_RETRY_INTERVAL_MS;
+            boolean retryPassed =
+                    lastSyncAttemptElapsedNanos <= 0
+                            || nowNanos - lastSyncAttemptElapsedNanos
+                            >= SYNC_RETRY_INTERVAL_NANOS;
 
-            boolean syncDue = !timeSynced
-                    || now - lastSyncElapsed >= SYNC_INTERVAL_MS;
+            boolean syncDue =
+                    !timeSynced
+                            || lastSyncElapsedNanos <= 0
+                            || nowNanos - lastSyncElapsedNanos
+                            >= SYNC_INTERVAL_NANOS;
 
             if (!syncInProgress && syncDue && retryPassed) {
                 syncInternetTime();
@@ -272,26 +280,38 @@ public class MainActivity extends Activity {
         long elapsed = preferences.getLong(PREF_INTERNET_ELAPSED, 0);
         long savedWall = preferences.getLong(PREF_INTERNET_SAVED_WALL, 0);
 
-        if (epoch <= 0 || elapsed <= 0 || savedWall <= 0) return false;
+        if (epoch <= 0 || elapsed <= 0 || savedWall <= 0) {
+            return false;
+        }
 
         long currentElapsed = SystemClock.elapsedRealtime();
         long currentWall = System.currentTimeMillis();
 
-        if (currentElapsed < elapsed || currentWall < savedWall) return false;
+        if (currentElapsed < elapsed || currentWall < savedWall) {
+            return false;
+        }
 
         long elapsedDifference = currentElapsed - elapsed;
         long wallDifference = currentWall - savedWall;
 
+        // تشخیص تغییر ساعت گوشی یا راه‌اندازی مجدد دستگاه
         if (Math.abs(wallDifference - elapsedDifference) > 120000L) {
             return false;
         }
 
-        if (epoch > Long.MAX_VALUE - elapsedDifference) return false;
+        if (epoch > Long.MAX_VALUE - elapsedDifference) {
+            return false;
+        }
+
+        if (elapsed > Long.MAX_VALUE / NANOS_PER_MILLI) {
+            return false;
+        }
 
         trustedEpochAtSync = epoch;
         elapsedAtSync = elapsed;
         timeSynced = true;
-        lastSyncElapsed = elapsed;
+
+        lastSyncElapsedNanos = elapsed * NANOS_PER_MILLI;
 
         syncServerName = "مرجع ذخیره‌شده";
         syncUncertaintyMs = 0;
@@ -322,7 +342,9 @@ public class MainActivity extends Activity {
             clockSourceGroup.check(R.id.radioInternetClock);
         } else {
             int id = findPhoneClockRadioId();
-            if (id != -1) clockSourceGroup.check(id);
+            if (id != -1) {
+                clockSourceGroup.check(id);
+            }
         }
 
         saveClockSource(internet ? CLOCK_INTERNET : CLOCK_PHONE);
@@ -493,22 +515,37 @@ public class MainActivity extends Activity {
 
         long phoneEpoch = System.currentTimeMillis();
 
-        phoneClock.setText("ساعت گوشی: " + formatIranTime(phoneEpoch));
+        phoneClock.setText(
+                "ساعت گوشی: " + formatIranTime(phoneEpoch)
+        );
 
         if (!timeSynced) {
-            internetClock.setText("ساعت اینترنتی ایران: در انتظار همگام‌سازی");
-            clockDifference.setText("اختلاف ساعت گوشی با اینترنت: -- ms");
+            internetClock.setText(
+                    "ساعت اینترنتی ایران: در انتظار همگام‌سازی"
+            );
+
+            clockDifference.setText(
+                    "اختلاف ساعت گوشی با اینترنت: -- ms"
+            );
+
             syncStatus.setText(syncInProgress
                     ? "در حال دریافت زمان اینترنتی..."
                     : "زمان اینترنتی هنوز دریافت نشده است");
+
             return;
         }
 
         long internetEpoch = getTrustedNow();
 
         if (internetEpoch <= 0) {
-            internetClock.setText("ساعت اینترنتی ایران: مرجع نامعتبر");
-            clockDifference.setText("اختلاف ساعت گوشی با اینترنت: -- ms");
+            internetClock.setText(
+                    "ساعت اینترنتی ایران: مرجع نامعتبر"
+            );
+
+            clockDifference.setText(
+                    "اختلاف ساعت گوشی با اینترنت: -- ms"
+            );
+
             syncStatus.setText("در انتظار همگام‌سازی مجدد");
             return;
         }
@@ -519,8 +556,11 @@ public class MainActivity extends Activity {
 
         clockDifference.setText(
                 "اختلاف ساعت گوشی با اینترنت: "
-                        + String.format(Locale.US, "%+d ms",
-                        phoneEpoch - internetEpoch)
+                        + String.format(
+                        Locale.US,
+                        "%+d ms",
+                        phoneEpoch - internetEpoch
+                )
         );
 
         String quality = syncServerCount == 0
@@ -549,17 +589,46 @@ public class MainActivity extends Activity {
         return format.format(new Date(epochMillis));
     }
 
+    // ساعت اینترنتی برای نمایش با دقت میلی‌ثانیه
     private long getTrustedNow() {
-        if (!timeSynced) return 0;
+        long nowNanos = getTrustedNowEpochNanos();
 
-        long delta = SystemClock.elapsedRealtime() - elapsedAtSync;
+        if (nowNanos <= 0) return 0;
 
-        if (delta < 0 || trustedEpochAtSync <= 0
-                || trustedEpochAtSync > Long.MAX_VALUE - delta) {
+        return nowNanos / NANOS_PER_MILLI;
+    }
+
+    // محاسبه ساعت اینترنتی با استفاده از زمان یکنواخت نانوثانیه‌ای
+    private long getTrustedNowEpochNanos() {
+        if (!timeSynced || trustedEpochAtSync <= 0 || elapsedAtSync <= 0) {
             return 0;
         }
 
-        return trustedEpochAtSync + delta;
+        if (elapsedAtSync > Long.MAX_VALUE / NANOS_PER_MILLI) {
+            return 0;
+        }
+
+        long anchorElapsedNanos = elapsedAtSync * NANOS_PER_MILLI;
+        long currentElapsedNanos = SystemClock.elapsedRealtimeNanos();
+
+        if (currentElapsedNanos < anchorElapsedNanos) {
+            return 0;
+        }
+
+        long deltaNanos = currentElapsedNanos - anchorElapsedNanos;
+
+        if (trustedEpochAtSync > Long.MAX_VALUE / NANOS_PER_MILLI) {
+            return 0;
+        }
+
+        long anchorEpochNanos =
+                trustedEpochAtSync * NANOS_PER_MILLI;
+
+        if (anchorEpochNanos > Long.MAX_VALUE - deltaNanos) {
+            return 0;
+        }
+
+        return anchorEpochNanos + deltaNanos;
     }
 
     // ---------------------------------------------------------
@@ -567,70 +636,92 @@ public class MainActivity extends Activity {
     // ---------------------------------------------------------
 
     private void syncInternetTime() {
-        if (syncInProgress || isFinishing()) return;
+        // این متد از UI thread فراخوانی می‌شود.
+        if (syncInProgress || isFinishing() || isDestroyed()) {
+            return;
+        }
 
-        lastSyncAttemptElapsed = SystemClock.elapsedRealtime();
+        lastSyncAttemptElapsedNanos =
+                SystemClock.elapsedRealtimeNanos();
+
         syncInProgress = true;
         handler.post(this::updateClocks);
 
-        networkExecutor.execute(() -> {
-            NtpTimeSync.Result result = null;
+        try {
+            networkExecutor.execute(() -> {
+                NtpTimeSync.Result result = null;
 
-            try {
-                result = NtpTimeSync.synchronize();
-            } catch (Exception ignored) {
-            }
-
-            NtpTimeSync.Result finalResult = result;
-
-            runOnUiThread(() -> {
-                syncInProgress = false;
-
-                if (isFinishing() || isDestroyed()) return;
-
-                if (finalResult != null) {
-                    trustedEpochAtSync =
-                            finalResult.estimatedEpochAtReceiveMs;
-
-                    elapsedAtSync =
-                            finalResult.receivedElapsedRealtimeMs;
-
-                    syncUncertaintyMs =
-                            finalResult.uncertaintyEstimateMs;
-
-                    syncRoundTripMs =
-                            finalResult.networkRoundTripMs;
-
-                    syncSpreadMs =
-                            finalResult.maxOffsetSpreadMs;
-
-                    syncServerCount =
-                            finalResult.independentServerCount;
-
-                    syncSampleCount =
-                            finalResult.sampleCount;
-
-                    syncServerName = finalResult.server;
-                    syncCrossChecked = finalResult.isCrossChecked;
-                    syncWithinTarget50ms = finalResult.withinTarget50ms;
-
-                    lastSyncElapsed =
-                            finalResult.receivedElapsedRealtimeMs;
-
-                    timeSynced = true;
-
-                    saveInternetTimeAnchor(
-                            trustedEpochAtSync, elapsedAtSync
-                    );
-
-                    if (CLOCK_INTERNET.equals(getSavedClockSource())) {
-                        notifyFloatingClockSourceChanged(CLOCK_INTERNET);
-                    }
+                try {
+                    result = NtpTimeSync.synchronize();
+                } catch (Exception ignored) {
+                    // تلاش بعدی طبق زمان‌بندی مجدد انجام خواهد شد.
                 }
 
-                updateClocks();
+                NtpTimeSync.Result finalResult = result;
+
+                runOnUiThread(() -> {
+                    syncInProgress = false;
+
+                    if (isFinishing() || isDestroyed()) {
+                        return;
+                    }
+
+                    if (finalResult != null
+                            && finalResult.estimatedEpochAtReceiveMs > 0
+                            && finalResult.receivedElapsedRealtimeMs > 0) {
+
+                        trustedEpochAtSync =
+                                finalResult.estimatedEpochAtReceiveMs;
+
+                        elapsedAtSync =
+                                finalResult.receivedElapsedRealtimeMs;
+
+                        syncUncertaintyMs =
+                                finalResult.uncertaintyEstimateMs;
+
+                        syncRoundTripMs =
+                                finalResult.networkRoundTripMs;
+
+                        syncSpreadMs =
+                                finalResult.maxOffsetSpreadMs;
+
+                        syncServerCount =
+                                finalResult.independentServerCount;
+
+                        syncSampleCount =
+                                finalResult.sampleCount;
+
+                        syncServerName = finalResult.server;
+                        syncCrossChecked = finalResult.isCrossChecked;
+                        syncWithinTarget50ms =
+                                finalResult.withinTarget50ms;
+
+                        // فاصله همگام‌سازی بعدی از زمان دریافت نتیجه
+                        // در UI thread محاسبه می‌شود.
+                        lastSyncElapsedNanos =
+                                SystemClock.elapsedRealtimeNanos();
+
+                        timeSynced = true;
+
+                        saveInternetTimeAnchor(
+                                trustedEpochAtSync,
+                                elapsedAtSync
+                        );
+
+                        if (CLOCK_INTERNET.equals(getSavedClockSource())) {
+                            notifyFloatingClockSourceChanged(
+                                    CLOCK_INTERNET
+                            );
+                        }
+                    }
+
+                    updateClocks();
+                });
             });
-        });
+
+        } catch (RejectedExecutionException ignored) {
+            syncInProgress = false;
+        }
     }
 
     // ---------------------------------------------------------
@@ -651,10 +742,14 @@ public class MainActivity extends Activity {
 
         boolean useInternet = isInternetClockSelected();
         String source = useInternet ? CLOCK_INTERNET : CLOCK_PHONE;
+
         saveClockSource(source);
 
         if (useInternet && (!timeSynced || getTrustedNow() <= 0)) {
-            showError("زمان اینترنتی معتبر نیست؛ در حال همگام‌سازی...");
+            showError(
+                    "زمان اینترنتی معتبر نیست؛ در حال همگام‌سازی..."
+            );
+
             syncInternetTime();
             return;
         }
@@ -665,92 +760,174 @@ public class MainActivity extends Activity {
             int second = (int) readNumber(startSecondInput, 0);
             int millis = (int) readNumber(startMillisInput, 0);
 
-            if (hour < 0 || hour > 23 || minute < 0 || minute > 59
-                    || second < 0 || second > 59 || millis < 0 || millis > 999) {
+            if (hour < 0 || hour > 23
+                    || minute < 0 || minute > 59
+                    || second < 0 || second > 59
+                    || millis < 0 || millis > 999) {
+
                 showError("زمان شروع معتبر نیست.");
                 return;
             }
 
-            // فاصله و مدت لمس مستقیماً برحسب نانوثانیه دریافت می‌شوند.
-            long intervalNanos = readNumber(intervalNanosInput, 20_000_000L);
-            long clicksPerCycle = readNumber(clickCountInput, 2);
-            long touchNanos = readNumber(touchNanosInput, 5_000_000L);
+            // فاصله کلیک و مدت لمس برحسب نانوثانیه
+            long intervalNanos =
+                    readNumber(intervalNanosInput, 20_000_000L);
 
-            // مدت چرخه و مکث همچنان از ورودی میلی‌ثانیه‌ای فعلی خوانده می‌شوند،
-            // اما از این نقطه به بعد تمام محاسبات زمان‌بندی نانوثانیه‌ای است.
-            long cycleDurationMs = readNumber(cycleDurationInput, 1000);
-            long cycleCount = readNumber(cycleCountInput, 1);
-            long cyclePauseMs = readNumber(cyclePauseInput, 0);
+            long clicksPerCycle =
+                    readNumber(clickCountInput, 2);
 
-            if (intervalNanos < 0 || clicksPerCycle <= 0
-                    || clicksPerCycle > Integer.MAX_VALUE || touchNanos < 0
-                    || cycleDurationMs <= 0 || cycleCount <= 0 || cyclePauseMs < 0) {
+            long touchNanos =
+                    readNumber(touchNanosInput, 5_000_000L);
+
+            // ورودی مدت چرخه و مکث همچنان میلی‌ثانیه‌ای است.
+            long cycleDurationMs =
+                    readNumber(cycleDurationInput, 1000);
+
+            long cycleCount =
+                    readNumber(cycleCountInput, 1);
+
+            long cyclePauseMs =
+                    readNumber(cyclePauseInput, 0);
+
+            if (intervalNanos < 0
+                    || clicksPerCycle <= 0
+                    || clicksPerCycle > Integer.MAX_VALUE
+                    || touchNanos < 0
+                    || cycleDurationMs <= 0
+                    || cycleCount <= 0
+                    || cyclePauseMs < 0) {
+
                 showError("یکی از مقادیر تنظیمات معتبر نیست.");
                 return;
             }
 
-            long cycleDurationNanos = safeMultiply(cycleDurationMs, 1_000_000L);
-            long cyclePauseNanos = safeMultiply(cyclePauseMs, 1_000_000L);
-            long lastClickOffsetNanos = safeMultiply(clicksPerCycle - 1, intervalNanos);
+            long cycleDurationNanos =
+                    safeMultiply(cycleDurationMs, NANOS_PER_MILLI);
+
+            long cyclePauseNanos =
+                    safeMultiply(cyclePauseMs, NANOS_PER_MILLI);
+
+            long lastClickOffsetNanos =
+                    safeMultiply(clicksPerCycle - 1, intervalNanos);
 
             if (lastClickOffsetNanos > Long.MAX_VALUE - touchNanos) {
                 showError("مدت لمس خارج از محدوده مجاز است.");
                 return;
             }
 
-            long lastTouchEndNanos = lastClickOffsetNanos + touchNanos;
+            long lastTouchEndNanos =
+                    lastClickOffsetNanos + touchNanos;
+
             if (lastTouchEndNanos > cycleDurationNanos) {
-                showError("تعداد کلیک‌ها، فاصله و مدت لمس در چرخه جا نمی‌شوند.\nپایان آخرین لمس باید قبل از پایان چرخه باشد.");
+                showError(
+                        "تعداد کلیک‌ها، فاصله و مدت لمس در چرخه جا نمی‌شوند.\n"
+                                + "پایان آخرین لمس باید قبل از پایان چرخه باشد."
+                );
                 return;
             }
 
-            long totalCycleNanos = safeMultiply(cycleCount, cycleDurationNanos);
-            long totalPauseNanos = safeMultiply(cycleCount - 1, cyclePauseNanos);
+            long totalCycleNanos =
+                    safeMultiply(cycleCount, cycleDurationNanos);
+
+            long totalPauseNanos =
+                    safeMultiply(cycleCount - 1, cyclePauseNanos);
+
             if (totalCycleNanos > Long.MAX_VALUE - totalPauseNanos) {
                 throw new ArithmeticException();
             }
-            long totalDurationNanos = totalCycleNanos + totalPauseNanos;
+
+            long totalDurationNanos =
+                    totalCycleNanos + totalPauseNanos;
+
             if (totalDurationNanos <= 0) {
                 showError("مدت کل اجرا معتبر نیست.");
                 return;
             }
 
-            final long sourceNow;
+            // -------------------------------------------------
+            // محاسبه زمان مرجع با دقت نانوثانیه‌ای
+            // -------------------------------------------------
+
+            final long sourceNowEpochNanos;
+
             if (useInternet) {
-                long delta = SystemClock.elapsedRealtime() - elapsedAtSync;
-                if (delta < 0 || trustedEpochAtSync <= 0
-                        || trustedEpochAtSync > Long.MAX_VALUE - delta) {
+                sourceNowEpochNanos = getTrustedNowEpochNanos();
+
+                if (sourceNowEpochNanos <= 0) {
                     showError("مرجع زمانی اینترنتی معتبر نیست.");
                     return;
                 }
-                sourceNow = trustedEpochAtSync + delta;
+
             } else {
-                sourceNow = System.currentTimeMillis();
+                long phoneEpochMs = System.currentTimeMillis();
+
+                sourceNowEpochNanos =
+                        safeMultiply(phoneEpochMs, NANOS_PER_MILLI);
             }
 
-            LocalDateTime nowIran = Instant.ofEpochMilli(sourceNow)
-                    .atZone(IRAN_ZONE).toLocalDateTime();
-            LocalDateTime requested = nowIran.withHour(hour).withMinute(minute)
-                    .withSecond(second).withNano(millis * 1_000_000);
-            long targetEpoch = requested.atZone(IRAN_ZONE).toInstant().toEpochMilli();
-            long startDelayMs = targetEpoch - sourceNow;
+            // تبدیل زمان فعلی به میلی‌ثانیه فقط برای ساخت زمان محلی
+            long sourceNowEpochMs =
+                    sourceNowEpochNanos / NANOS_PER_MILLI;
 
-            if (startDelayMs <= 0) {
-                showError("زمان شروع باید از زمان فعلی جلوتر باشد.");
+            LocalDateTime nowIran =
+                    Instant.ofEpochMilli(sourceNowEpochMs)
+                            .atZone(IRAN_ZONE)
+                            .toLocalDateTime();
+
+            LocalDateTime requested =
+                    nowIran.withHour(hour)
+                            .withMinute(minute)
+                            .withSecond(second)
+                            .withNano(millis * 1_000_000);
+
+            long targetEpoch =
+                    requested.atZone(IRAN_ZONE)
+                            .toInstant()
+                            .toEpochMilli();
+
+            // زمان هدف انتخاب‌شده همچنان دقت ورودی میلی‌ثانیه دارد.
+            // اما محاسبه فاصله تا آن بدون گرد کردن میلی‌ثانیه‌ای انجام می‌شود.
+            long targetEpochNanos =
+                    safeMultiply(targetEpoch, NANOS_PER_MILLI);
+
+            if (targetEpochNanos <= sourceNowEpochNanos) {
+                showError(
+                        "زمان شروع باید از زمان فعلی جلوتر باشد."
+                );
                 return;
             }
 
-            long startDelayNanos = safeMultiply(startDelayMs, 1_000_000L);
-            long nowElapsedNanos = SystemClock.elapsedRealtimeNanos();
+            long startDelayNanos =
+                    targetEpochNanos - sourceNowEpochNanos;
+
+            if (startDelayNanos <= 0) {
+                showError("زمان شروع معتبر نیست.");
+                return;
+            }
+
+            long nowElapsedNanos =
+                    SystemClock.elapsedRealtimeNanos();
+
             if (nowElapsedNanos > Long.MAX_VALUE - startDelayNanos) {
                 throw new ArithmeticException();
             }
-            long targetElapsedNanos = nowElapsedNanos + startDelayNanos;
+
+            long targetElapsedNanos =
+                    nowElapsedNanos + startDelayNanos;
+
+            // -------------------------------------------------
+            // ارسال اطلاعات به FloatingService
+            // -------------------------------------------------
 
             Intent service = new Intent(this, FloatingService.class);
             service.setAction(FloatingService.ACTION_START);
+
             service.putExtra("start_time_epoch_ms", targetEpoch);
-            service.putExtra("start_elapsed_realtime_ns", targetElapsedNanos);
+            service.putExtra(
+                    "start_elapsed_realtime_ns",
+                    targetElapsedNanos
+            );
+
             service.putExtra("start_delay_ns", startDelayNanos);
             service.putExtra("click_count", clicksPerCycle);
             service.putExtra("click_interval_ns", intervalNanos);
@@ -763,8 +940,15 @@ public class MainActivity extends Activity {
             service.putExtra("clock_source", source);
 
             if (useInternet) {
-                service.putExtra("internet_epoch_at_sync_ms", trustedEpochAtSync);
-                service.putExtra("internet_elapsed_at_sync_ms", elapsedAtSync);
+                service.putExtra(
+                        "internet_epoch_at_sync_ms",
+                        trustedEpochAtSync
+                );
+
+                service.putExtra(
+                        "internet_elapsed_at_sync_ms",
+                        elapsedAtSync
+                );
             }
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -773,15 +957,24 @@ public class MainActivity extends Activity {
                 startService(service);
             }
 
-            Toast.makeText(this, "زمان‌بندی " + cycleCount + " چرخه ثبت شد.",
-                    Toast.LENGTH_SHORT).show();
+            Toast.makeText(
+                    this,
+                    "زمان‌بندی " + cycleCount + " چرخه ثبت شد.",
+                    Toast.LENGTH_SHORT
+            ).show();
 
         } catch (NumberFormatException e) {
             showError("لطفاً مقادیر عددی را بررسی کن.");
+
         } catch (ArithmeticException e) {
-            showError("یکی از محاسبات زمانی خارج از محدوده مجاز است.");
+            showError(
+                    "یکی از محاسبات زمانی خارج از محدوده مجاز است."
+            );
+
         } catch (Exception e) {
-            showError("خطا در ثبت زمان شروع: " + e.getMessage());
+            showError(
+                    "خطا در ثبت زمان شروع: " + e.getMessage()
+            );
         }
     }
 
@@ -789,7 +982,10 @@ public class MainActivity extends Activity {
         if (input == null) return defaultValue;
 
         String value = input.getText().toString().trim();
-        return value.isEmpty() ? defaultValue : Long.parseLong(value);
+
+        return value.isEmpty()
+                ? defaultValue
+                : Long.parseLong(value);
     }
 
     private long safeMultiply(long a, long b) {
@@ -802,7 +998,11 @@ public class MainActivity extends Activity {
     }
 
     private void showError(String message) {
-        Toast.makeText(this, message, Toast.LENGTH_LONG).show();
+        Toast.makeText(
+                this,
+                message,
+                Toast.LENGTH_LONG
+        ).show();
     }
 
     // ---------------------------------------------------------
@@ -819,7 +1019,11 @@ public class MainActivity extends Activity {
             startService(intent);
         }
 
-        Toast.makeText(this, "درخواست توقف ارسال شد.", Toast.LENGTH_SHORT).show();
+        Toast.makeText(
+                this,
+                "درخواست توقف ارسال شد.",
+                Toast.LENGTH_SHORT
+        ).show();
     }
 
     private void showFloatingPanel() {
@@ -864,7 +1068,8 @@ public class MainActivity extends Activity {
         if (enabled == null) return false;
 
         ComponentName component = new ComponentName(
-                this, AutoClickService.class
+                this,
+                AutoClickService.class
         );
 
         String expected = component.flattenToString();
