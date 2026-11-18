@@ -19,6 +19,12 @@ import java.util.concurrent.locks.LockSupport;
 public class AutoClickService extends AccessibilityService {
 
     private static final long NANOS_PER_MS = 1_000_000L;
+
+    /*
+     * Park until close to the target, then use a very short final spin.
+     * This reduces avoidable wake-up lateness without dispatching early.
+     */
+    private static final long FINAL_SPIN_WINDOW_NANOS = 300_000L;
     private static final String TARGET_PREFS_NAME = "auto_click_target";
     private static final String TARGET_X_KEY = "target_x";
     private static final String TARGET_Y_KEY = "target_y";
@@ -70,6 +76,7 @@ public class AutoClickService extends AccessibilityService {
         final long targetNanos;
         final long deadlineNanos;
         final long touchDurationMs;
+        volatile GestureDescription gesture;
         final int x;
         final int y;
 
@@ -94,6 +101,20 @@ public class AutoClickService extends AccessibilityService {
             this.x = x;
             this.y = y;
             this.completion = completion;
+
+        }
+
+        void prepareGesture() {
+            if (gesture != null) {
+                return;
+            }
+            Path path = new Path();
+            path.moveTo(x, y);
+            path.lineTo(x, y);
+            gesture = new GestureDescription.Builder()
+                    .addStroke(new GestureDescription.StrokeDescription(
+                            path, 0L, touchDurationMs))
+                    .build();
         }
 
         @Override
@@ -156,8 +177,8 @@ public class AutoClickService extends AccessibilityService {
      * operating system will wake the thread at that exact nanosecond; it only
      * removes Handler.postDelayed()'s millisecond delay conversion.
      *
-     * No busy-spin loop is used: while the target is in the future, the worker
-     * parks and is unparked when a new head request arrives or the service stops.
+     * The worker parks for the coarse part of the wait and spins only for a
+     * bounded final window. It never intentionally dispatches before target.
      */
     private void schedulerLoop() {
         while (!schedulerStopping) {
@@ -172,12 +193,41 @@ public class AutoClickService extends AccessibilityService {
                 continue;
             }
 
+            // Prepare the immutable gesture while there is still time before
+            // its target, keeping allocation out of the deadline-critical path.
+            try {
+                request.prepareGesture();
+            } catch (Exception ignored) {
+                synchronized (queueLock) {
+                    if (pending.peekFirst() == request) {
+                        pending.pollFirst();
+                    } else {
+                        continue;
+                    }
+                }
+                postCompletion(request, false, false);
+                continue;
+            }
+
             long remainingNanos =
                     request.targetNanos - SystemClock.elapsedRealtimeNanos();
 
-            if (remainingNanos > 0L) {
-                LockSupport.parkNanos(this, remainingNanos);
+            if (remainingNanos > FINAL_SPIN_WINDOW_NANOS) {
+                // Leave only a short interval for the final precision wait.
+                LockSupport.parkNanos(
+                        this, remainingNanos - FINAL_SPIN_WINDOW_NANOS);
                 continue;
+            }
+
+            // Never dispatch before the absolute target. The spin is bounded
+            // by FINAL_SPIN_WINDOW_NANOS and is used only for the final wait.
+            while (!schedulerStopping
+                    && SystemClock.elapsedRealtimeNanos() < request.targetNanos) {
+                // Intentionally empty: a sub-millisecond final wait.
+            }
+
+            if (schedulerStopping) {
+                break;
             }
 
             synchronized (queueLock) {
@@ -404,18 +454,7 @@ public class AutoClickService extends AccessibilityService {
 
     private boolean dispatchRequest(ClickRequest request) {
         try {
-            Path path = new Path();
-            path.moveTo(request.x, request.y);
-            path.lineTo(request.x, request.y);
-
-            GestureDescription gesture =
-                    new GestureDescription.Builder()
-                            .addStroke(new GestureDescription.StrokeDescription(
-                                    path,
-                                    0L,
-                                    request.touchDurationMs
-                            ))
-                            .build();
+            GestureDescription gesture = request.gesture;
 
             /*
              * Register before dispatch so a fast callback cannot arrive before
