@@ -24,18 +24,24 @@ public class AutoClickService extends AccessibilityService {
 
     private static volatile AutoClickService instance;
 
-    private final Handler handler = new Handler(Looper.getMainLooper());
+    private final Handler handler =
+            new Handler(Looper.getMainLooper());
 
-    private final ArrayDeque<ClickRequest> pending = new ArrayDeque<>();
-    private final HashSet<ClickRequest> activeRequests = new HashSet<>();
+    private final ArrayDeque<ClickRequest> pending =
+            new ArrayDeque<>();
+
+    private final HashSet<ClickRequest> activeRequests =
+            new HashSet<>();
 
     private int targetX = 350;
     private int targetY = 700;
 
     private volatile boolean serviceReady;
+
     private long scheduledTargetNanos = Long.MAX_VALUE;
 
-    private static class ClickRequest {
+    private static final class ClickRequest {
+
         long targetNanos;
         long deadlineNanos;
         long touchDurationMs;
@@ -46,7 +52,8 @@ public class AutoClickService extends AccessibilityService {
         GestureCompletion completion;
     }
 
-    private final Runnable schedulerRunnable = this::processDueRequests;
+    private final Runnable schedulerRunnable =
+            this::processDueRequests;
 
     @Override
     protected void onServiceConnected() {
@@ -75,21 +82,34 @@ public class AutoClickService extends AccessibilityService {
 
     @Override
     public void onDestroy() {
+
         serviceReady = false;
 
         handler.removeCallbacks(schedulerRunnable);
         scheduledTargetNanos = Long.MAX_VALUE;
 
         while (!pending.isEmpty()) {
-            notifyCompletion(pending.pollFirst(), false, true);
+            notifyCompletion(
+                    pending.pollFirst(),
+                    false,
+                    true
+            );
         }
 
-        Iterator<ClickRequest> iterator = activeRequests.iterator();
+        Iterator<ClickRequest> iterator =
+                activeRequests.iterator();
 
         while (iterator.hasNext()) {
+
             ClickRequest request = iterator.next();
+
             iterator.remove();
-            notifyCompletion(request, false, false);
+
+            notifyCompletion(
+                    request,
+                    false,
+                    false
+            );
         }
 
         if (instance == this) {
@@ -120,10 +140,12 @@ public class AutoClickService extends AccessibilityService {
     }
 
     public void setTarget(int x, int y) {
+
         final int newX = Math.max(0, x);
         final int newY = Math.max(0, y);
 
         runOnMain(() -> {
+
             if (targetX == newX && targetY == newY) {
                 return;
             }
@@ -148,6 +170,7 @@ public class AutoClickService extends AccessibilityService {
             long touchDurationMs,
             GestureCompletion completion
     ) {
+
         if (Looper.myLooper() != Looper.getMainLooper()) {
             return false;
         }
@@ -167,6 +190,7 @@ public class AutoClickService extends AccessibilityService {
             return false;
         }
 
+        // زمان شروع لمس باید در محدوده چرخه باشد.
         if (targetElapsedRealtimeNanos <
                 cycleStartElapsedRealtimeNanos ||
                 targetElapsedRealtimeNanos >=
@@ -174,34 +198,32 @@ public class AutoClickService extends AccessibilityService {
             return false;
         }
 
-        long touchNanos = touchDurationMs * NANOS_PER_MS;
-
-        if (touchNanos >
-                cycleDeadlineElapsedRealtimeNanos -
-                        targetElapsedRealtimeNanos) {
-            return false;
-        }
-
         ClickRequest request = new ClickRequest();
 
         request.targetNanos = targetElapsedRealtimeNanos;
-        request.deadlineNanos = cycleDeadlineElapsedRealtimeNanos;
+        request.deadlineNanos =
+                cycleDeadlineElapsedRealtimeNanos;
+
         request.touchDurationMs = touchDurationMs;
+
         request.x = targetX;
         request.y = targetY;
+
         request.completion = completion;
 
         ClickRequest head = pending.peekFirst();
 
+        // ارسال مستقیم درخواست سررسیدشده.
         if (head == null &&
                 targetElapsedRealtimeNanos <=
                         SystemClock.elapsedRealtimeNanos()) {
 
             dispatchReadyRequest(request);
+
             return true;
         }
 
-        // قرارداد صف: درخواست‌ها باید به ترتیب زمان هدف وارد شوند.
+        // حفظ ترتیب زمانی درخواست‌ها.
         pending.offerLast(request);
 
         if (head == null) {
@@ -212,11 +234,18 @@ public class AutoClickService extends AccessibilityService {
     }
 
     private void scheduleHead() {
+
         ClickRequest head = pending.peekFirst();
 
         if (head == null) {
-            handler.removeCallbacks(schedulerRunnable);
-            scheduledTargetNanos = Long.MAX_VALUE;
+
+            if (scheduledTargetNanos != Long.MAX_VALUE) {
+
+                handler.removeCallbacks(schedulerRunnable);
+
+                scheduledTargetNanos = Long.MAX_VALUE;
+            }
+
             return;
         }
 
@@ -225,6 +254,7 @@ public class AutoClickService extends AccessibilityService {
         }
 
         handler.removeCallbacks(schedulerRunnable);
+
         scheduledTargetNanos = head.targetNanos;
 
         long remaining =
@@ -232,7 +262,9 @@ public class AutoClickService extends AccessibilityService {
                         SystemClock.elapsedRealtimeNanos();
 
         if (remaining <= 0) {
+
             handler.post(schedulerRunnable);
+
             return;
         }
 
@@ -242,13 +274,18 @@ public class AutoClickService extends AccessibilityService {
             delayMs++;
         }
 
-        handler.postDelayed(schedulerRunnable, delayMs);
+        handler.postDelayed(
+                schedulerRunnable,
+                delayMs
+        );
     }
 
     private void processDueRequests() {
+
         scheduledTargetNanos = Long.MAX_VALUE;
 
         while (true) {
+
             ClickRequest request = pending.peekFirst();
 
             if (request == null) {
@@ -263,6 +300,7 @@ public class AutoClickService extends AccessibilityService {
 
             pending.pollFirst();
 
+            // هیچ انتظاری برای تکمیل ژست قبلی وجود ندارد.
             dispatchReadyRequest(request);
         }
 
@@ -270,23 +308,38 @@ public class AutoClickService extends AccessibilityService {
     }
 
     private void dispatchReadyRequest(ClickRequest request) {
-        long now = SystemClock.elapsedRealtimeNanos();
-        long touchNanos = request.touchDurationMs * NANOS_PER_MS;
 
-        if (now >= request.deadlineNanos ||
-                touchNanos > request.deadlineNanos - now) {
-            notifyCompletion(request, false, true);
+        long now = SystemClock.elapsedRealtimeNanos();
+
+        // فقط زمان شروع ارسال اهمیت دارد.
+        // مدت لمس می‌تواند از پایان چرخه عبور کند.
+        if (now >= request.deadlineNanos) {
+
+            notifyCompletion(
+                    request,
+                    false,
+                    true
+            );
+
             return;
         }
 
         if (!dispatchRequest(request)) {
-            notifyCompletion(request, false, false);
+
+            notifyCompletion(
+                    request,
+                    false,
+                    false
+            );
         }
     }
 
     private boolean dispatchRequest(ClickRequest request) {
+
         try {
+
             Path path = new Path();
+
             path.moveTo(request.x, request.y);
             path.lineTo(request.x, request.y);
 
@@ -311,28 +364,42 @@ public class AutoClickService extends AccessibilityService {
                         public void onCompleted(
                                 GestureDescription description
                         ) {
-                            finishRequest(request, true, false);
+
+                            finishRequest(
+                                    request,
+                                    true,
+                                    false
+                            );
                         }
 
                         @Override
                         public void onCancelled(
                                 GestureDescription description
                         ) {
-                            finishRequest(request, false, false);
+
+                            finishRequest(
+                                    request,
+                                    false,
+                                    false
+                            );
                         }
                     },
                     handler
             );
 
             if (!accepted) {
+
                 activeRequests.remove(request);
+
                 return false;
             }
 
             return true;
 
         } catch (Exception e) {
+
             activeRequests.remove(request);
+
             return false;
         }
     }
@@ -342,8 +409,14 @@ public class AutoClickService extends AccessibilityService {
             boolean success,
             boolean expired
     ) {
+
         if (activeRequests.remove(request)) {
-            notifyCompletion(request, success, expired);
+
+            notifyCompletion(
+                    request,
+                    success,
+                    expired
+            );
         }
     }
 
@@ -352,10 +425,13 @@ public class AutoClickService extends AccessibilityService {
             boolean success,
             boolean expired
     ) {
+
         GestureCompletion callback = request.completion;
+
         request.completion = null;
 
         if (callback != null) {
+
             try {
                 callback.onFinished(success, expired);
             } catch (Exception ignored) {
@@ -364,14 +440,18 @@ public class AutoClickService extends AccessibilityService {
     }
 
     public void cancelPendingScheduledClick() {
+
         runOnMain(this::cancelPendingInternal);
     }
 
     private void cancelPendingInternal() {
+
         handler.removeCallbacks(schedulerRunnable);
+
         scheduledTargetNanos = Long.MAX_VALUE;
 
         while (!pending.isEmpty()) {
+
             notifyCompletion(
                     pending.pollFirst(),
                     false,
@@ -381,9 +461,13 @@ public class AutoClickService extends AccessibilityService {
     }
 
     private void runOnMain(Runnable action) {
+
         if (Looper.myLooper() == Looper.getMainLooper()) {
+
             action.run();
+
         } else {
+
             handler.post(action);
         }
     }
