@@ -37,10 +37,6 @@ public class AutoClickService extends AccessibilityService {
 
     private final Runnable schedulerRunnable = this::processDueRequests;
 
-    /*
-     * هر درخواست، Callback ژست خودش را نیز مدیریت می‌کند.
-     * به این ترتیب برای هر کلیک یک Callback جداگانه ساخته نمی‌شود.
-     */
     private static final class ClickRequest
             extends AccessibilityService.GestureResultCallback {
 
@@ -72,12 +68,12 @@ public class AutoClickService extends AccessibilityService {
         }
 
         @Override
-        public void onCompleted(GestureDescription description) {
+        public void onCompleted(GestureDescription gesture) {
             owner.finishRequest(this, true);
         }
 
         @Override
-        public void onCancelled(GestureDescription description) {
+        public void onCancelled(GestureDescription gesture) {
             owner.finishRequest(this, false);
         }
     }
@@ -86,9 +82,8 @@ public class AutoClickService extends AccessibilityService {
     protected void onServiceConnected() {
         super.onServiceConnected();
 
-        SharedPreferences prefs = getSharedPreferences(
-                "auto_click_target", MODE_PRIVATE
-        );
+        SharedPreferences prefs =
+                getSharedPreferences("auto_click_target", MODE_PRIVATE);
 
         targetX = prefs.getInt("target_x", 350);
         targetY = prefs.getInt("target_y", 700);
@@ -109,6 +104,7 @@ public class AutoClickService extends AccessibilityService {
     @Override
     public void onDestroy() {
         serviceReady = false;
+
         handler.removeCallbacks(schedulerRunnable);
         scheduledTargetNanos = NO_SCHEDULE;
 
@@ -117,13 +113,17 @@ public class AutoClickService extends AccessibilityService {
         }
 
         Iterator<ClickRequest> iterator = activeRequests.iterator();
+
         while (iterator.hasNext()) {
             ClickRequest request = iterator.next();
             iterator.remove();
             notifyCompletion(request, false, false);
         }
 
-        if (instance == this) instance = null;
+        if (instance == this) {
+            instance = null;
+        }
+
         super.onDestroy();
     }
 
@@ -152,7 +152,10 @@ public class AutoClickService extends AccessibilityService {
         final int newY = Math.max(0, y);
 
         runOnMain(() -> {
-            if (targetX == newX && targetY == newY) return;
+            if (!serviceReady ||
+                    (targetX == newX && targetY == newY)) {
+                return;
+            }
 
             targetX = newX;
             targetY = newY;
@@ -195,17 +198,18 @@ public class AutoClickService extends AccessibilityService {
 
         ClickRequest head = pending.peekFirst();
 
-        // درخواست سررسیدشده، در صورت خالی بودن صف، مستقیم ارسال می‌شود.
-        if (head == null && targetElapsedRealtimeNanos
-                <= SystemClock.elapsedRealtimeNanos()) {
+        if (head == null &&
+                targetElapsedRealtimeNanos <= SystemClock.elapsedRealtimeNanos()) {
             dispatchReadyRequest(request);
             return true;
         }
 
-        // درخواست‌ها باید به ترتیب زمان هدف وارد شوند.
         pending.offerLast(request);
 
-        if (head == null) scheduleHead();
+        if (head == null) {
+            scheduleHead();
+        }
+
         return true;
     }
 
@@ -220,34 +224,40 @@ public class AutoClickService extends AccessibilityService {
             return;
         }
 
-        if (scheduledTargetNanos == head.targetNanos) return;
+        if (scheduledTargetNanos == head.targetNanos) {
+            return;
+        }
 
         handler.removeCallbacks(schedulerRunnable);
         scheduledTargetNanos = head.targetNanos;
 
-        long remaining = head.targetNanos - SystemClock.elapsedRealtimeNanos();
+        long remaining =
+                head.targetNanos - SystemClock.elapsedRealtimeNanos();
 
         if (remaining <= 0) {
             handler.post(schedulerRunnable);
             return;
         }
 
-        long delayMs = (remaining + NANOS_PER_MS - 1) / NANOS_PER_MS;
+        long delayMs = 1L + (remaining - 1L) / NANOS_PER_MS;
         handler.postDelayed(schedulerRunnable, delayMs);
     }
 
     private void processDueRequests() {
         scheduledTargetNanos = NO_SCHEDULE;
 
-        long now;
+        long now = SystemClock.elapsedRealtimeNanos();
         ClickRequest request;
 
         while ((request = pending.peekFirst()) != null) {
-            now = SystemClock.elapsedRealtimeNanos();
-            if (now < request.targetNanos) break;
+            if (now < request.targetNanos) {
+                break;
+            }
 
             pending.pollFirst();
             dispatchReadyRequest(request);
+
+            now = SystemClock.elapsedRealtimeNanos();
         }
 
         scheduleHead();
@@ -256,7 +266,10 @@ public class AutoClickService extends AccessibilityService {
     private void dispatchReadyRequest(ClickRequest request) {
         if (SystemClock.elapsedRealtimeNanos() >= request.deadlineNanos) {
             notifyCompletion(request, false, true);
-        } else if (!dispatchRequest(request)) {
+            return;
+        }
+
+        if (!dispatchRequest(request)) {
             notifyCompletion(request, false, false);
         }
     }
@@ -267,15 +280,22 @@ public class AutoClickService extends AccessibilityService {
             path.moveTo(request.x, request.y);
             path.lineTo(request.x, request.y);
 
-            GestureDescription gesture = new GestureDescription.Builder()
-                    .addStroke(new GestureDescription.StrokeDescription(
-                            path, 0, request.touchDurationMs
-                    ))
-                    .build();
+            GestureDescription gesture =
+                    new GestureDescription.Builder()
+                            .addStroke(
+                                    new GestureDescription.StrokeDescription(
+                                            path,
+                                            0,
+                                            request.touchDurationMs
+                                    )
+                            )
+                            .build();
 
             activeRequests.add(request);
 
-            if (dispatchGesture(gesture, request, handler)) return true;
+            if (dispatchGesture(gesture, request, handler)) {
+                return true;
+            }
 
             activeRequests.remove(request);
             return false;
@@ -297,7 +317,9 @@ public class AutoClickService extends AccessibilityService {
             boolean success,
             boolean expired
     ) {
-        if (request == null) return;
+        if (request == null) {
+            return;
+        }
 
         GestureCompletion callback = request.completion;
         request.completion = null;
