@@ -48,8 +48,9 @@ public class MainActivity extends Activity {
     private static final String ACTION_CLOCK_SOURCE_CHANGED =
             "com.precision.loopclicker.ACTION_CLOCK_SOURCE_CHANGED";
 
-    private static final long SYNC_INTERVAL_MS = 60000L;
-    private static final long SYNC_RETRY_INTERVAL_MS = 10000L;
+    // تلاش برای همگام‌سازی ساعت اینترنتی هر یک ثانیه؛ هم‌زمان فقط یک درخواست فعال است.
+    private static final long SYNC_INTERVAL_MS = 1000L;
+    private static final long SYNC_RETRY_INTERVAL_MS = 1000L;
 
     private final android.os.Handler handler =
             new android.os.Handler(android.os.Looper.getMainLooper());
@@ -59,8 +60,8 @@ public class MainActivity extends Activity {
 
     private EditText startHourInput, startMinuteInput;
     private EditText startSecondInput, startMillisInput;
-    private EditText intervalSecondsInput, intervalMillisInput;
-    private EditText clickCountInput, touchMillisInput;
+    private EditText intervalNanosInput;
+    private EditText clickCountInput, touchNanosInput;
     private EditText cycleDurationInput, cycleCountInput;
     private EditText cyclePauseInput;
 
@@ -437,10 +438,9 @@ public class MainActivity extends Activity {
         startSecondInput = findViewById(R.id.startSecondInput);
         startMillisInput = findViewById(R.id.startMillisInput);
 
-        intervalSecondsInput = findViewById(R.id.intervalSecondsInput);
-        intervalMillisInput = findViewById(R.id.intervalMillisInput);
+        intervalNanosInput = findViewById(R.id.intervalNanosInput);
         clickCountInput = findViewById(R.id.clickCountInput);
-        touchMillisInput = findViewById(R.id.touchMillisInput);
+        touchNanosInput = findViewById(R.id.touchNanosInput);
 
         phoneClock = findViewById(R.id.phoneClock);
         internetClock = findViewById(R.id.internetClock);
@@ -650,7 +650,6 @@ public class MainActivity extends Activity {
         }
 
         boolean useInternet = isInternetClockSelected();
-
         String source = useInternet ? CLOCK_INTERNET : CLOCK_PHONE;
         saveClockSource(source);
 
@@ -666,184 +665,107 @@ public class MainActivity extends Activity {
             int second = (int) readNumber(startSecondInput, 0);
             int millis = (int) readNumber(startMillisInput, 0);
 
-            if (hour < 0 || hour > 23
-                    || minute < 0 || minute > 59
-                    || second < 0 || second > 59
-                    || millis < 0 || millis > 999) {
+            if (hour < 0 || hour > 23 || minute < 0 || minute > 59
+                    || second < 0 || second > 59 || millis < 0 || millis > 999) {
                 showError("زمان شروع معتبر نیست.");
                 return;
             }
 
-            long intervalSeconds = readNumber(intervalSecondsInput, 0);
-            long intervalMillis = readNumber(intervalMillisInput, 20);
+            // فاصله و مدت لمس مستقیماً برحسب نانوثانیه دریافت می‌شوند.
+            long intervalNanos = readNumber(intervalNanosInput, 20_000_000L);
             long clicksPerCycle = readNumber(clickCountInput, 2);
-            long touchMillis = readNumber(touchMillisInput, 5);
+            long touchNanos = readNumber(touchNanosInput, 5_000_000L);
 
-            long cycleDuration = readNumber(cycleDurationInput, 1000);
+            // مدت چرخه و مکث همچنان از ورودی میلی‌ثانیه‌ای فعلی خوانده می‌شوند،
+            // اما از این نقطه به بعد تمام محاسبات زمان‌بندی نانوثانیه‌ای است.
+            long cycleDurationMs = readNumber(cycleDurationInput, 1000);
             long cycleCount = readNumber(cycleCountInput, 1);
-            long cyclePause = readNumber(cyclePauseInput, 0);
+            long cyclePauseMs = readNumber(cyclePauseInput, 0);
 
-            if (intervalSeconds < 0 || intervalMillis < 0
-                    || clicksPerCycle <= 0
-                    || clicksPerCycle > Integer.MAX_VALUE
-                    || touchMillis <= 0
-                    || cycleDuration <= 0
-                    || cycleCount <= 0
-                    || cyclePause < 0) {
+            if (intervalNanos < 0 || clicksPerCycle <= 0
+                    || clicksPerCycle > Integer.MAX_VALUE || touchNanos < 0
+                    || cycleDurationMs <= 0 || cycleCount <= 0 || cyclePauseMs < 0) {
                 showError("یکی از مقادیر تنظیمات معتبر نیست.");
                 return;
             }
 
-            long interval = combineDuration(intervalSeconds, intervalMillis);
+            long cycleDurationNanos = safeMultiply(cycleDurationMs, 1_000_000L);
+            long cyclePauseNanos = safeMultiply(cyclePauseMs, 1_000_000L);
+            long lastClickOffsetNanos = safeMultiply(clicksPerCycle - 1, intervalNanos);
 
-            if (interval <= 0) {
-                showError("فاصله کلیک باید بیشتر از صفر باشد.");
-                return;
-            }
-
-            long lastClickOffset = safeMultiply(
-                    clicksPerCycle - 1, interval
-            );
-
-            if (lastClickOffset > Long.MAX_VALUE - touchMillis) {
+            if (lastClickOffsetNanos > Long.MAX_VALUE - touchNanos) {
                 showError("مدت لمس خارج از محدوده مجاز است.");
                 return;
             }
 
-            long lastTouchEndOffset = lastClickOffset + touchMillis;
-
-            if (lastTouchEndOffset > cycleDuration) {
-                showError(
-                        "تعداد کلیک‌ها، فاصله و مدت لمس در چرخه جا نمی‌شوند."
-                                + "\nپایان آخرین لمس باید قبل از پایان چرخه باشد."
-                );
+            long lastTouchEndNanos = lastClickOffsetNanos + touchNanos;
+            if (lastTouchEndNanos > cycleDurationNanos) {
+                showError("تعداد کلیک‌ها، فاصله و مدت لمس در چرخه جا نمی‌شوند.\nپایان آخرین لمس باید قبل از پایان چرخه باشد.");
                 return;
             }
 
-            // مدت کل شامل مدت چرخه‌ها و مکث بین آن‌هاست.
-            // مکث بعد از آخرین چرخه محاسبه نمی‌شود.
-            long totalCycleTime = safeMultiply(
-                    cycleCount, cycleDuration
-            );
-
-            long totalPauseTime = safeMultiply(
-                    cycleCount - 1, cyclePause
-            );
-
-            if (totalCycleTime > Long.MAX_VALUE - totalPauseTime) {
+            long totalCycleNanos = safeMultiply(cycleCount, cycleDurationNanos);
+            long totalPauseNanos = safeMultiply(cycleCount - 1, cyclePauseNanos);
+            if (totalCycleNanos > Long.MAX_VALUE - totalPauseNanos) {
                 throw new ArithmeticException();
             }
-
-            long totalDuration = totalCycleTime + totalPauseTime;
-
-            if (totalDuration <= 0) {
+            long totalDurationNanos = totalCycleNanos + totalPauseNanos;
+            if (totalDurationNanos <= 0) {
                 showError("مدت کل اجرا معتبر نیست.");
                 return;
             }
 
             final long sourceNow;
-            final long internetEpochAnchor;
-            final long internetElapsedAnchor;
-
             if (useInternet) {
-                internetEpochAnchor = trustedEpochAtSync;
-                internetElapsedAnchor = elapsedAtSync;
-
-                long delta = SystemClock.elapsedRealtime()
-                        - internetElapsedAnchor;
-
-                if (delta < 0
-                        || internetEpochAnchor > Long.MAX_VALUE - delta) {
+                long delta = SystemClock.elapsedRealtime() - elapsedAtSync;
+                if (delta < 0 || trustedEpochAtSync <= 0
+                        || trustedEpochAtSync > Long.MAX_VALUE - delta) {
                     showError("مرجع زمانی اینترنتی معتبر نیست.");
                     return;
                 }
-
-                sourceNow = internetEpochAnchor + delta;
+                sourceNow = trustedEpochAtSync + delta;
             } else {
-                internetEpochAnchor = 0;
-                internetElapsedAnchor = 0;
                 sourceNow = System.currentTimeMillis();
             }
 
             LocalDateTime nowIran = Instant.ofEpochMilli(sourceNow)
-                    .atZone(IRAN_ZONE)
-                    .toLocalDateTime();
+                    .atZone(IRAN_ZONE).toLocalDateTime();
+            LocalDateTime requested = nowIran.withHour(hour).withMinute(minute)
+                    .withSecond(second).withNano(millis * 1_000_000);
+            long targetEpoch = requested.atZone(IRAN_ZONE).toInstant().toEpochMilli();
+            long startDelayMs = targetEpoch - sourceNow;
 
-            LocalDateTime requested = nowIran
-                    .withHour(hour)
-                    .withMinute(minute)
-                    .withSecond(second)
-                    .withNano(millis * 1000000);
-
-            long targetEpoch = requested.atZone(IRAN_ZONE)
-                    .toInstant().toEpochMilli();
-
-            long startDelay = targetEpoch - sourceNow;
-
-            if (startDelay <= 0) {
+            if (startDelayMs <= 0) {
                 showError("زمان شروع باید از زمان فعلی جلوتر باشد.");
                 return;
             }
 
-            final long targetElapsed;
-
-            if (useInternet) {
-                long delta = targetEpoch - internetEpochAnchor;
-
-                if (delta < 0
-                        || internetElapsedAnchor > Long.MAX_VALUE - delta) {
-                    showError("زمان هدف خارج از محدوده مجاز است.");
-                    return;
-                }
-
-                targetElapsed = internetElapsedAnchor + delta;
-            } else {
-                long wallAnchor = System.currentTimeMillis();
-                long elapsedAnchor = SystemClock.elapsedRealtime();
-                long delta = targetEpoch - wallAnchor;
-
-                if (delta <= 0 || elapsedAnchor > Long.MAX_VALUE - delta) {
-                    showError("زمان هدف معتبر نیست.");
-                    return;
-                }
-
-                targetElapsed = elapsedAnchor + delta;
+            long startDelayNanos = safeMultiply(startDelayMs, 1_000_000L);
+            long nowElapsedNanos = SystemClock.elapsedRealtimeNanos();
+            if (nowElapsedNanos > Long.MAX_VALUE - startDelayNanos) {
+                throw new ArithmeticException();
             }
-
-            long actualDelay = targetElapsed - SystemClock.elapsedRealtime();
-
-            if (actualDelay <= 0) {
-                showError("زمان هدف هنگام ثبت فرمان گذشته است.");
-                return;
-            }
+            long targetElapsedNanos = nowElapsedNanos + startDelayNanos;
 
             Intent service = new Intent(this, FloatingService.class);
             service.setAction(FloatingService.ACTION_START);
-
             service.putExtra("start_time_epoch_ms", targetEpoch);
-            service.putExtra("start_elapsed_realtime_ms", targetElapsed);
-            service.putExtra("start_delay_ms", actualDelay);
-
-            if (useInternet) {
-                service.putExtra(
-                        "internet_epoch_at_sync_ms", internetEpochAnchor
-                );
-                service.putExtra(
-                        "internet_elapsed_at_sync_ms", internetElapsedAnchor
-                );
-            }
-
+            service.putExtra("start_elapsed_realtime_ns", targetElapsedNanos);
+            service.putExtra("start_delay_ns", startDelayNanos);
             service.putExtra("click_count", clicksPerCycle);
-            service.putExtra("click_interval_ms", interval);
-            service.putExtra("touch_duration_ms", touchMillis);
-
+            service.putExtra("click_interval_ns", intervalNanos);
+            service.putExtra("touch_duration_ns", touchNanos);
             service.putExtra("clicks_per_cycle", clicksPerCycle);
             service.putExtra("cycle_count", cycleCount);
-            service.putExtra("cycle_duration_ms", cycleDuration);
-            service.putExtra("cycle_pause_ms", cyclePause);
-            service.putExtra("total_duration_ms", totalDuration);
-
+            service.putExtra("cycle_duration_ns", cycleDurationNanos);
+            service.putExtra("cycle_pause_ns", cyclePauseNanos);
+            service.putExtra("total_duration_ns", totalDurationNanos);
             service.putExtra("clock_source", source);
+
+            if (useInternet) {
+                service.putExtra("internet_epoch_at_sync_ms", trustedEpochAtSync);
+                service.putExtra("internet_elapsed_at_sync_ms", elapsedAtSync);
+            }
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 startForegroundService(service);
@@ -851,11 +773,8 @@ public class MainActivity extends Activity {
                 startService(service);
             }
 
-            Toast.makeText(
-                    this,
-                    "زمان‌بندی " + cycleCount + " چرخه ثبت شد.",
-                    Toast.LENGTH_SHORT
-            ).show();
+            Toast.makeText(this, "زمان‌بندی " + cycleCount + " چرخه ثبت شد.",
+                    Toast.LENGTH_SHORT).show();
 
         } catch (NumberFormatException e) {
             showError("لطفاً مقادیر عددی را بررسی کن.");
@@ -871,15 +790,6 @@ public class MainActivity extends Activity {
 
         String value = input.getText().toString().trim();
         return value.isEmpty() ? defaultValue : Long.parseLong(value);
-    }
-
-    private long combineDuration(long seconds, long millis) {
-        if (seconds < 0 || millis < 0
-                || seconds > (Long.MAX_VALUE - millis) / 1000L) {
-            throw new ArithmeticException();
-        }
-
-        return seconds * 1000L + millis;
     }
 
     private long safeMultiply(long a, long b) {
