@@ -88,10 +88,9 @@ public class FloatingService extends Service {
     private String clockSource = CLOCK_PHONE;
 
     private long internetEpochAtSyncMs, internetElapsedAtSyncMs;
-    private long runStartElapsedMs, runEndElapsedMs, totalClicks;
-    private long cycleDurationMs, cycleStrideMs, clickIntervalMs, touchDurationMs;
-
-    private long scheduledCycleStartMs, scheduledCycleEndMs, nextClickTargetMs;
+    private long runStartElapsedNanos, runEndElapsedNanos, totalClicks;
+    private long cycleDurationNanos, cycleStrideNanos, clickIntervalNanos, touchDurationNanos;
+    private long scheduledCycleStartNanos, scheduledCycleEndNanos, nextClickTargetNanos;
 
     private long completedClicks, expiredClicks, failedClicks;
 
@@ -228,31 +227,43 @@ public class FloatingService extends Service {
         }
 
         final int generation = ++runGeneration;
-        long now = SystemClock.elapsedRealtime();
+        long nowNanos = SystemClock.elapsedRealtimeNanos();
 
-        long requestedStart =
-                intent.getLongExtra("start_elapsed_realtime_ms", 0L);
+        long requestedStart = intent.getLongExtra(
+                "start_elapsed_realtime_ns", 0L);
 
         if (requestedStart <= 0) {
-            long delay = intent.getLongExtra("start_delay_ms", 0L);
+            long legacyStartMs = intent.getLongExtra(
+                    "start_elapsed_realtime_ms", 0L);
+            if (legacyStartMs > 0) {
+                try {
+                    requestedStart = Math.multiplyExact(legacyStartMs, NANOS_PER_MS);
+                } catch (ArithmeticException e) {
+                    updateStatus("زمان شروع نامعتبر است");
+                    return;
+                }
+            }
+        }
 
-            if (delay < 0 || delay > Long.MAX_VALUE - now) {
+        if (requestedStart <= 0) {
+            long delayNanos = intent.getLongExtra(
+                    "start_delay_ns",
+                    intent.getLongExtra("start_delay_ms", 0L) * NANOS_PER_MS);
+
+            if (delayNanos < 0 || delayNanos > Long.MAX_VALUE - nowNanos) {
                 updateStatus("زمان شروع نامعتبر است");
                 return;
             }
-
-            requestedStart = now + delay;
+            requestedStart = nowNanos + delayNanos;
         }
 
         long clicks = intent.getLongExtra(
                 "clicks_per_cycle",
                 intent.getLongExtra("click_count", 1L));
-
         long cycles = intent.getLongExtra("cycle_count", 1L);
 
         if (clicks < 1 || clicks > Integer.MAX_VALUE ||
                 cycles < 1 || cycles > Integer.MAX_VALUE) {
-
             updateStatus("تعداد کلیک یا چرخه نامعتبر است");
             return;
         }
@@ -260,46 +271,38 @@ public class FloatingService extends Service {
         int requestedClicks = (int) clicks;
         int requestedCycles = (int) cycles;
 
-        long duration = intent.getLongExtra("cycle_duration_ms", 0L);
-        long pause = intent.getLongExtra("cycle_pause_ms", 0L);
-        long interval = intent.getLongExtra("click_interval_ms", 1L);
-        long touch = intent.getLongExtra("touch_duration_ms", 1L);
+        long duration = getNanosExtra(intent, "cycle_duration_ns",
+                "cycle_duration_ms", 0L);
+        long pause = getNanosExtra(intent, "cycle_pause_ns",
+                "cycle_pause_ms", 0L);
+        long interval = getNanosExtra(intent, "click_interval_ns",
+                "click_interval_ms", NANOS_PER_MS);
+        long touch = getNanosExtra(intent, "touch_duration_ns",
+                "touch_duration_ms", NANOS_PER_MS);
 
-        if (pause < 0 || interval < 0 || touch < 1 ||
-                touch > GestureDescription.getMaxGestureDuration()) {
-
+        if (pause < 0 || interval < 0 || touch < 0) {
             updateStatus("تنظیمات اجرای کلیک نامعتبر است");
             return;
         }
 
-        long lastOffset;
-        long stride;
-        long calculatedEnd;
-        long calculatedTotal;
-
+        long lastOffset, stride, calculatedEnd, calculatedTotal;
         try {
             lastOffset = Math.multiplyExact(requestedClicks - 1L, interval);
-
             if (duration <= 0) {
-                duration = Math.addExact(lastOffset, touch);
+                duration = Math.max(1L, Math.addExact(lastOffset, touch));
             }
-
             if (lastOffset >= duration) {
                 updateStatus("تعداد کلیک‌ها با مدت چرخه سازگار نیست");
                 return;
             }
 
             stride = Math.addExact(duration, pause);
-
             long totalDuration = Math.addExact(
                     Math.multiplyExact((long) requestedCycles, duration),
                     Math.multiplyExact((long) requestedCycles - 1L, pause));
-
             calculatedEnd = Math.addExact(requestedStart, totalDuration);
-
             calculatedTotal = Math.multiplyExact(
                     (long) requestedClicks, requestedCycles);
-
         } catch (ArithmeticException e) {
             updateStatus("مدت یا تعداد اجرا بیش از حد بزرگ است");
             return;
@@ -308,21 +311,21 @@ public class FloatingService extends Service {
         clicksPerCycle = requestedClicks;
         cycleCount = requestedCycles;
 
-        cycleDurationMs = duration;
-        cycleStrideMs = stride;
-        clickIntervalMs = interval;
-        touchDurationMs = touch;
+        cycleDurationNanos = duration;
+        cycleStrideNanos = stride;
+        clickIntervalNanos = interval;
+        touchDurationNanos = touch;
 
-        runStartElapsedMs = requestedStart;
-        runEndElapsedMs = calculatedEnd;
+        runStartElapsedNanos = requestedStart;
+        runEndElapsedNanos = calculatedEnd;
         totalClicks = calculatedTotal;
 
         cycleIndex = 0;
         clickIndex = 0;
 
-        scheduledCycleStartMs = requestedStart;
-        scheduledCycleEndMs = requestedStart + duration;
-        nextClickTargetMs = requestedStart;
+        scheduledCycleStartNanos = requestedStart;
+        scheduledCycleEndNanos = requestedStart + duration;
+        nextClickTargetNanos = requestedStart;
 
         completedClicks = 0L;
         expiredClicks = 0L;
@@ -340,6 +343,19 @@ public class FloatingService extends Service {
         updateCountdownDisplay();
 
         scheduleNextClick(generation);
+    }
+
+    private long getNanosExtra(Intent intent, String nanosKey,
+                               String millisKey, long defaultNanos) {
+        if (intent.hasExtra(nanosKey)) {
+            return intent.getLongExtra(nanosKey, defaultNanos);
+        }
+        long millis = intent.getLongExtra(millisKey, defaultNanos / NANOS_PER_MS);
+        try {
+            return Math.multiplyExact(millis, NANOS_PER_MS);
+        } catch (ArithmeticException e) {
+            return -1L;
+        }
     }
 
     // تحویل دسته‌ای درخواست‌ها
@@ -368,13 +384,13 @@ public class FloatingService extends Service {
                 }
 
                 try {
-                    scheduledCycleStartMs = Math.addExact(
-                            scheduledCycleStartMs, cycleStrideMs);
+                    scheduledCycleStartNanos = Math.addExact(
+                            scheduledCycleStartNanos, cycleStrideNanos);
 
-                    scheduledCycleEndMs = Math.addExact(
-                            scheduledCycleStartMs, cycleDurationMs);
+                    scheduledCycleEndNanos = Math.addExact(
+                            scheduledCycleStartNanos, cycleDurationNanos);
 
-                    nextClickTargetMs = scheduledCycleStartMs;
+                    nextClickTargetNanos = scheduledCycleStartNanos;
 
                 } catch (ArithmeticException e) {
                     updateStatus("خطای محاسبات زمان‌بندی");
@@ -383,12 +399,12 @@ public class FloatingService extends Service {
                 }
             }
 
-            long target = nextClickTargetMs;
+            long target = nextClickTargetNanos;
 
             if (clickIndex + 1 < clicksPerCycle) {
                 try {
-                    nextClickTargetMs = Math.addExact(
-                            target, clickIntervalMs);
+                    nextClickTargetNanos = Math.addExact(
+                            target, clickIntervalNanos);
 
                 } catch (ArithmeticException e) {
                     updateStatus("خطای محاسبات زمان‌بندی");
@@ -402,9 +418,9 @@ public class FloatingService extends Service {
 
             dispatchClick(
                     generation,
-                    scheduledCycleStartMs,
+                    scheduledCycleStartNanos,
                     target,
-                    scheduledCycleEndMs
+                    scheduledCycleEndNanos
             );
         }
 
@@ -425,11 +441,7 @@ public class FloatingService extends Service {
         }
 
         try {
-            long targetNanos = Math.multiplyExact(target, NANOS_PER_MS);
-            long startNanos = Math.multiplyExact(cycleStart, NANOS_PER_MS);
-            long endNanos = Math.multiplyExact(cycleEnd, NANOS_PER_MS);
-
-            if (SystemClock.elapsedRealtimeNanos() >= endNanos) {
+            if (SystemClock.elapsedRealtimeNanos() >= cycleEnd) {
                 recordClickResult(generation, false, true);
                 return;
             }
@@ -444,10 +456,10 @@ public class FloatingService extends Service {
             ensureServiceTarget(service);
 
             boolean accepted = service.performClickAtTarget(
-                    targetNanos,
-                    startNanos,
-                    endNanos,
-                    touchDurationMs,
+                    target,
+                    cycleStart,
+                    cycleEnd,
+                    touchDurationNanos,
                     (success, expired) -> {
                         if (generation == runGeneration) {
                             recordClickResult(generation, success, expired);
@@ -497,12 +509,11 @@ public class FloatingService extends Service {
             return;
         }
 
-        long remaining = runEndElapsedMs - SystemClock.elapsedRealtime();
+        long remaining = runEndElapsedNanos - SystemClock.elapsedRealtimeNanos();
 
         if (remaining > 0) {
-            handler.postDelayed(
-                    () -> scheduleRunFinish(generation),
-                    remaining);
+            long delayMs = Math.max(1L, (remaining + NANOS_PER_MS - 1L) / NANOS_PER_MS);
+            handler.postDelayed(() -> scheduleRunFinish(generation), delayMs);
         } else {
             finishClicking();
         }
@@ -1330,13 +1341,14 @@ public class FloatingService extends Service {
         }
 
         long remaining =
-                runStartElapsedMs - SystemClock.elapsedRealtime();
+                runStartElapsedNanos - SystemClock.elapsedRealtimeNanos();
 
         if (remaining > 0) {
-            long hours = remaining / 3_600_000L;
-            long minutes = remaining % 3_600_000L / 60_000L;
-            long seconds = remaining % 60_000L / 1_000L;
-            long millis = remaining % 1_000L;
+            long remainingMs = remaining / NANOS_PER_MS;
+            long hours = remainingMs / 3_600_000L;
+            long minutes = remainingMs % 3_600_000L / 60_000L;
+            long seconds = remainingMs % 60_000L / 1_000L;
+            long millis = remainingMs % 1_000L;
 
             countdownView.setText(String.format(
                     Locale.US,
