@@ -1,3 +1,4 @@
+
 <?xml version="1.0" encoding="utf-8"?>
 <ScrollView
     xmlns:android="http://schemas.android.com/apk/res/android"
@@ -116,7 +117,6 @@
                 android:textColor="#FFFFFF"
                 android:buttonTint="#03DAC5"
                 android:padding="5dp"/>
-
         </RadioGroup>
 
         <TextView
@@ -222,33 +222,15 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="فاصله بین کلیک‌ها - ثانیه"
+            android:text="فاصله بین کلیک‌ها - نانوثانیه"
             android:textColor="#FFFFFF"
             android:paddingTop="5dp"/>
 
         <EditText
-            android:id="@+id/intervalSecondsInput"
+            android:id="@+id/intervalNanosInput"
             android:layout_width="match_parent"
             android:layout_height="52dp"
-            android:hint="0"
-            android:inputType="number"
-            android:singleLine="true"
-            android:backgroundTint="#03DAC5"
-            android:textColor="#FFFFFF"
-            android:textColorHint="#AAAAAA"/>
-
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="فاصله بین کلیک‌ها - میلی‌ثانیه"
-            android:textColor="#FFFFFF"
-            android:paddingTop="10dp"/>
-
-        <EditText
-            android:id="@+id/intervalMillisInput"
-            android:layout_width="match_parent"
-            android:layout_height="52dp"
-            android:hint="20"
+            android:hint="20000000"
             android:inputType="number"
             android:singleLine="true"
             android:backgroundTint="#03DAC5"
@@ -286,15 +268,15 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="مدت نگه‌داشتن هر لمس - میلی‌ثانیه"
+            android:text="مدت نگه‌داشتن هر لمس - نانوثانیه"
             android:textColor="#FFFFFF"
             android:paddingTop="10dp"/>
 
         <EditText
-            android:id="@+id/touchMillisInput"
+            android:id="@+id/touchNanosInput"
             android:layout_width="match_parent"
             android:layout_height="52dp"
-            android:hint="5"
+            android:hint="5000000"
             android:inputType="number"
             android:singleLine="true"
             android:backgroundTint="#03DAC5"
@@ -352,7 +334,5 @@
             android:textStyle="bold"
             android:backgroundTint="#7F0000"
             android:textColor="#FFFFFF"/>
-
     </LinearLayout>
-
 </ScrollView>
