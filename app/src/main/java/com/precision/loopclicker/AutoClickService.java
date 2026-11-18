@@ -17,6 +17,7 @@ import java.util.Iterator;
 public class AutoClickService extends AccessibilityService {
 
     private static final long NANOS_PER_MS = 1_000_000L;
+    private static final long NO_SCHEDULE = Long.MAX_VALUE;
 
     public interface GestureCompletion {
         void onFinished(boolean success, boolean expired);
@@ -24,49 +25,69 @@ public class AutoClickService extends AccessibilityService {
 
     private static volatile AutoClickService instance;
 
-    private final Handler handler =
-            new Handler(Looper.getMainLooper());
-
-    // درخواست‌ها به ترتیب زمانی وارد این صف می‌شوند.
-    private final ArrayDeque<ClickRequest> pending =
-            new ArrayDeque<>();
-
-    // فقط برای پیگیری نتیجه ژست‌های ارسال‌شده است.
-    // این مجموعه مانع ارسال ژست جدید نمی‌شود.
-    private final HashSet<ClickRequest> activeRequests =
-            new HashSet<>();
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    private final ArrayDeque<ClickRequest> pending = new ArrayDeque<>();
+    private final HashSet<ClickRequest> activeRequests = new HashSet<>();
 
     private int targetX = 350;
     private int targetY = 700;
 
     private volatile boolean serviceReady;
+    private long scheduledTargetNanos = NO_SCHEDULE;
 
-    private long scheduledTargetNanos = Long.MAX_VALUE;
+    private final Runnable schedulerRunnable = this::processDueRequests;
 
-    private static final class ClickRequest {
+    /*
+     * هر درخواست، Callback ژست خودش را نیز مدیریت می‌کند.
+     * به این ترتیب برای هر کلیک یک Callback جداگانه ساخته نمی‌شود.
+     */
+    private static final class ClickRequest
+            extends AccessibilityService.GestureResultCallback {
 
-        long targetNanos;
-        long deadlineNanos;
-        long touchDurationMs;
-
-        int x;
-        int y;
+        final AutoClickService owner;
+        final long targetNanos;
+        final long deadlineNanos;
+        final long touchDurationMs;
+        final int x;
+        final int y;
 
         GestureCompletion completion;
+
+        ClickRequest(
+                AutoClickService owner,
+                long targetNanos,
+                long deadlineNanos,
+                long touchDurationMs,
+                int x,
+                int y,
+                GestureCompletion completion
+        ) {
+            this.owner = owner;
+            this.targetNanos = targetNanos;
+            this.deadlineNanos = deadlineNanos;
+            this.touchDurationMs = touchDurationMs;
+            this.x = x;
+            this.y = y;
+            this.completion = completion;
+        }
+
+        @Override
+        public void onCompleted(GestureDescription description) {
+            owner.finishRequest(this, true);
+        }
+
+        @Override
+        public void onCancelled(GestureDescription description) {
+            owner.finishRequest(this, false);
+        }
     }
-
-    private final Runnable schedulerRunnable =
-            this::processDueRequests;
-
-    // چرخه عمر سرویس
 
     @Override
     protected void onServiceConnected() {
         super.onServiceConnected();
 
         SharedPreferences prefs = getSharedPreferences(
-                "auto_click_target",
-                MODE_PRIVATE
+                "auto_click_target", MODE_PRIVATE
         );
 
         targetX = prefs.getInt("target_x", 350);
@@ -82,46 +103,29 @@ public class AutoClickService extends AccessibilityService {
 
     @Override
     public void onInterrupt() {
-        runOnMain(this::cancelPendingInternal);
+        cancelPendingInternal();
     }
 
     @Override
     public void onDestroy() {
         serviceReady = false;
-
         handler.removeCallbacks(schedulerRunnable);
-        scheduledTargetNanos = Long.MAX_VALUE;
+        scheduledTargetNanos = NO_SCHEDULE;
 
         while (!pending.isEmpty()) {
-            notifyCompletion(
-                    pending.pollFirst(),
-                    false,
-                    true
-            );
+            notifyCompletion(pending.pollFirst(), false, true);
         }
 
-        Iterator<ClickRequest> iterator =
-                activeRequests.iterator();
-
+        Iterator<ClickRequest> iterator = activeRequests.iterator();
         while (iterator.hasNext()) {
             ClickRequest request = iterator.next();
             iterator.remove();
-
-            notifyCompletion(
-                    request,
-                    false,
-                    false
-            );
+            notifyCompletion(request, false, false);
         }
 
-        if (instance == this) {
-            instance = null;
-        }
-
+        if (instance == this) instance = null;
         super.onDestroy();
     }
-
-    // دسترسی به سرویس
 
     public static AutoClickService getInstance() {
         return instance;
@@ -143,31 +147,23 @@ public class AutoClickService extends AccessibilityService {
         return targetY;
     }
 
-    // تنظیم مختصات هدف
-
     public void setTarget(int x, int y) {
         final int newX = Math.max(0, x);
         final int newY = Math.max(0, y);
 
         runOnMain(() -> {
-            if (targetX == newX && targetY == newY) {
-                return;
-            }
+            if (targetX == newX && targetY == newY) return;
 
             targetX = newX;
             targetY = newY;
 
-            getSharedPreferences(
-                    "auto_click_target",
-                    MODE_PRIVATE
-            ).edit()
+            getSharedPreferences("auto_click_target", MODE_PRIVATE)
+                    .edit()
                     .putInt("target_x", newX)
                     .putInt("target_y", newY)
                     .apply();
         });
     }
-
-    // دریافت درخواست کلیک
 
     public boolean performClickAtTarget(
             long targetElapsedRealtimeNanos,
@@ -176,240 +172,124 @@ public class AutoClickService extends AccessibilityService {
             long touchDurationMs,
             GestureCompletion completion
     ) {
-        if (Looper.myLooper() != Looper.getMainLooper()) {
+        if (Looper.myLooper() != Looper.getMainLooper()
+                || !serviceReady
+                || completion == null
+                || touchDurationMs < 1
+                || touchDurationMs > GestureDescription.getMaxGestureDuration()
+                || cycleDeadlineElapsedRealtimeNanos <= cycleStartElapsedRealtimeNanos
+                || targetElapsedRealtimeNanos < cycleStartElapsedRealtimeNanos
+                || targetElapsedRealtimeNanos >= cycleDeadlineElapsedRealtimeNanos) {
             return false;
         }
 
-        if (!serviceReady || completion == null) {
-            return false;
-        }
-
-        if (touchDurationMs < 1 ||
-                touchDurationMs >
-                        GestureDescription.getMaxGestureDuration()) {
-            return false;
-        }
-
-        if (cycleDeadlineElapsedRealtimeNanos <=
-                cycleStartElapsedRealtimeNanos) {
-            return false;
-        }
-
-        if (targetElapsedRealtimeNanos <
-                cycleStartElapsedRealtimeNanos ||
-                targetElapsedRealtimeNanos >=
-                        cycleDeadlineElapsedRealtimeNanos) {
-            return false;
-        }
-
-        ClickRequest request = new ClickRequest();
-
-        request.targetNanos = targetElapsedRealtimeNanos;
-        request.deadlineNanos =
-                cycleDeadlineElapsedRealtimeNanos;
-
-        request.touchDurationMs = touchDurationMs;
-
-        request.x = targetX;
-        request.y = targetY;
-
-        request.completion = completion;
+        ClickRequest request = new ClickRequest(
+                this,
+                targetElapsedRealtimeNanos,
+                cycleDeadlineElapsedRealtimeNanos,
+                touchDurationMs,
+                targetX,
+                targetY,
+                completion
+        );
 
         ClickRequest head = pending.peekFirst();
 
-        // اگر صف خالی و زمان درخواست رسیده باشد،
-        // بدون واسطه وارد مرحله ارسال می‌شویم.
-        if (head == null &&
-                targetElapsedRealtimeNanos <=
-                        SystemClock.elapsedRealtimeNanos()) {
-
+        // درخواست سررسیدشده، در صورت خالی بودن صف، مستقیم ارسال می‌شود.
+        if (head == null && targetElapsedRealtimeNanos
+                <= SystemClock.elapsedRealtimeNanos()) {
             dispatchReadyRequest(request);
             return true;
         }
 
-        // درخواست‌ها به ترتیب زمان هدف وارد صف می‌شوند.
+        // درخواست‌ها باید به ترتیب زمان هدف وارد شوند.
         pending.offerLast(request);
 
-        if (head == null) {
-            scheduleHead();
-        }
-
+        if (head == null) scheduleHead();
         return true;
     }
-
-    // زمان‌بندی اولین درخواست صف
 
     private void scheduleHead() {
         ClickRequest head = pending.peekFirst();
 
         if (head == null) {
-            if (scheduledTargetNanos != Long.MAX_VALUE) {
+            if (scheduledTargetNanos != NO_SCHEDULE) {
                 handler.removeCallbacks(schedulerRunnable);
-                scheduledTargetNanos = Long.MAX_VALUE;
+                scheduledTargetNanos = NO_SCHEDULE;
             }
-
             return;
         }
 
-        if (scheduledTargetNanos == head.targetNanos) {
-            return;
-        }
+        if (scheduledTargetNanos == head.targetNanos) return;
 
         handler.removeCallbacks(schedulerRunnable);
-
         scheduledTargetNanos = head.targetNanos;
 
-        long remaining =
-                head.targetNanos -
-                        SystemClock.elapsedRealtimeNanos();
+        long remaining = head.targetNanos - SystemClock.elapsedRealtimeNanos();
 
         if (remaining <= 0) {
             handler.post(schedulerRunnable);
             return;
         }
 
-        // Handler بر اساس میلی‌ثانیه زمان‌بندی می‌کند.
-        // گرد کردن رو به بالا از ارسال زودتر از زمان هدف جلوگیری می‌کند.
-        long delayMs = remaining / NANOS_PER_MS;
-
-        if (remaining % NANOS_PER_MS != 0) {
-            delayMs++;
-        }
-
-        handler.postDelayed(
-                schedulerRunnable,
-                delayMs
-        );
+        long delayMs = (remaining + NANOS_PER_MS - 1) / NANOS_PER_MS;
+        handler.postDelayed(schedulerRunnable, delayMs);
     }
 
-    // پردازش تمام درخواست‌های سررسیدشده
-
     private void processDueRequests() {
-        scheduledTargetNanos = Long.MAX_VALUE;
+        scheduledTargetNanos = NO_SCHEDULE;
 
-        while (true) {
-            ClickRequest request = pending.peekFirst();
+        long now;
+        ClickRequest request;
 
-            if (request == null) {
-                break;
-            }
-
-            if (SystemClock.elapsedRealtimeNanos() <
-                    request.targetNanos) {
-                break;
-            }
+        while ((request = pending.peekFirst()) != null) {
+            now = SystemClock.elapsedRealtimeNanos();
+            if (now < request.targetNanos) break;
 
             pending.pollFirst();
-
-            // به تکمیل ژست قبلی وابسته نیست.
             dispatchReadyRequest(request);
         }
 
         scheduleHead();
     }
 
-    // بررسی و ارسال ژست
-
     private void dispatchReadyRequest(ClickRequest request) {
-        if (SystemClock.elapsedRealtimeNanos() >=
-                request.deadlineNanos) {
-
-            notifyCompletion(
-                    request,
-                    false,
-                    true
-            );
-
-            return;
-        }
-
-        if (!dispatchRequest(request)) {
-            notifyCompletion(
-                    request,
-                    false,
-                    false
-            );
+        if (SystemClock.elapsedRealtimeNanos() >= request.deadlineNanos) {
+            notifyCompletion(request, false, true);
+        } else if (!dispatchRequest(request)) {
+            notifyCompletion(request, false, false);
         }
     }
 
     private boolean dispatchRequest(ClickRequest request) {
         try {
             Path path = new Path();
-
             path.moveTo(request.x, request.y);
             path.lineTo(request.x, request.y);
 
-            GestureDescription gesture =
-                    new GestureDescription.Builder()
-                            .addStroke(
-                                    new GestureDescription.StrokeDescription(
-                                            path,
-                                            0,
-                                            request.touchDurationMs
-                                    )
-                            )
-                            .build();
+            GestureDescription gesture = new GestureDescription.Builder()
+                    .addStroke(new GestureDescription.StrokeDescription(
+                            path, 0, request.touchDurationMs
+                    ))
+                    .build();
 
             activeRequests.add(request);
 
-            boolean accepted = dispatchGesture(
-                    gesture,
-                    new GestureResultCallback() {
+            if (dispatchGesture(gesture, request, handler)) return true;
 
-                        @Override
-                        public void onCompleted(
-                                GestureDescription description
-                        ) {
-                            finishRequest(
-                                    request,
-                                    true,
-                                    false
-                            );
-                        }
+            activeRequests.remove(request);
+            return false;
 
-                        @Override
-                        public void onCancelled(
-                                GestureDescription description
-                        ) {
-                            finishRequest(
-                                    request,
-                                    false,
-                                    false
-                            );
-                        }
-                    },
-                    handler
-            );
-
-            if (!accepted) {
-                activeRequests.remove(request);
-                return false;
-            }
-
-            return true;
-
-        } catch (Exception e) {
+        } catch (Exception ignored) {
             activeRequests.remove(request);
             return false;
         }
     }
 
-    // پایان ژست و گزارش نتیجه
-
-    private void finishRequest(
-            ClickRequest request,
-            boolean success,
-            boolean expired
-    ) {
-        if (!activeRequests.remove(request)) {
-            return;
+    private void finishRequest(ClickRequest request, boolean success) {
+        if (activeRequests.remove(request)) {
+            notifyCompletion(request, success, false);
         }
-
-        notifyCompletion(
-                request,
-                success,
-                expired
-        );
     }
 
     private void notifyCompletion(
@@ -417,13 +297,9 @@ public class AutoClickService extends AccessibilityService {
             boolean success,
             boolean expired
     ) {
-        if (request == null) {
-            return;
-        }
+        if (request == null) return;
 
         GestureCompletion callback = request.completion;
-
-        // جلوگیری از فراخوانی دوباره Callback
         request.completion = null;
 
         if (callback != null) {
@@ -434,26 +310,18 @@ public class AutoClickService extends AccessibilityService {
         }
     }
 
-    // لغو درخواست‌های در انتظار
-
     public void cancelPendingScheduledClick() {
         runOnMain(this::cancelPendingInternal);
     }
 
     private void cancelPendingInternal() {
         handler.removeCallbacks(schedulerRunnable);
-        scheduledTargetNanos = Long.MAX_VALUE;
+        scheduledTargetNanos = NO_SCHEDULE;
 
         while (!pending.isEmpty()) {
-            notifyCompletion(
-                    pending.pollFirst(),
-                    false,
-                    true
-            );
+            notifyCompletion(pending.pollFirst(), false, true);
         }
     }
-
-    // اجرای عملیات روی نخ اصلی
 
     private void runOnMain(Runnable action) {
         if (Looper.myLooper() == Looper.getMainLooper()) {
