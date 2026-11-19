@@ -1,3 +1,4 @@
+
 package com.precision.loopclicker;
 
 import android.accessibilityservice.AccessibilityService;
@@ -32,7 +33,6 @@ public class AutoClickService extends AccessibilityService {
 
     private static final long NANOS_PER_MS = 1_000_000L;
 
-    // پنجره چرخش نهایی زمان‌بند
     private static final long FINAL_SPIN_WINDOW_NANOS =
             5_000_000L;
 
@@ -65,15 +65,12 @@ public class AutoClickService extends AccessibilityService {
 
     private final Object queueLock = new Object();
 
-    // صف زمان‌بندی؛ ترتیب ورود درخواست‌ها حفظ می‌شود.
     private final ArrayDeque<ClickRequest> pending =
             new ArrayDeque<>(INITIAL_PENDING_CAPACITY);
 
-    // درخواست‌هایی که از زمان‌بند به صف ارسال منتقل شده‌اند.
     private final HashSet<ClickRequest> dispatchQueuedRequests =
             new HashSet<>(INITIAL_PENDING_CAPACITY);
 
-    // Gestureهایی که API ارسال آن‌ها را پذیرفته است.
     private final HashSet<ClickRequest> activeRequests =
             new HashSet<>(INITIAL_ACTIVE_CAPACITY);
 
@@ -329,8 +326,6 @@ public class AutoClickService extends AccessibilityService {
 
                 writer.write(record.toCsvLine());
                 writer.newLine();
-
-                // ثبت گزارش روی دیسک؛ خارج از مسیر زمان‌بندی کلیک
                 writer.flush();
             }
 
@@ -739,7 +734,6 @@ public class AutoClickService extends AccessibilityService {
                 continue;
             }
 
-            // تا Gesture آماده نشده، زمان‌بند درخواست بعدی را جلو نمی‌اندازد.
             if (request.gesture == null) {
 
                 LockSupport.park(this);
@@ -761,7 +755,6 @@ public class AutoClickService extends AccessibilityService {
                 continue;
             }
 
-            // چرخش نهایی بدون sleep برای نزدیک شدن به زمان هدف
             while (!schedulerStopping
                     && serviceReady
                     && request.requestGeneration
@@ -815,7 +808,6 @@ public class AutoClickService extends AccessibilityService {
                 continue;
             }
 
-            // زمان‌بند منتظر پایان dispatchGesture نمی‌ماند.
             enqueueDispatch(request);
         }
     }
@@ -1086,11 +1078,12 @@ public class AutoClickService extends AccessibilityService {
                 return false;
             }
 
+            // اصلاح اصلی:
+            // مهلت چرخه مستقیماً با واحد نانوثانیه ارسال می‌شود.
             request = new ClickRequest(
                     this,
                     targetElapsedRealtimeNanos,
-                    cycleDeadlineElapsedRealtimeMs(
-                            cycleDeadlineElapsedRealtimeMs),
+                    cycleDeadlineElapsedRealtimeNanos,
                     touchDurationMs,
                     targetX,
                     targetY,
@@ -1123,14 +1116,6 @@ public class AutoClickService extends AccessibilityService {
         }
 
         return true;
-    }
-
-    private static long cycleDeadlineElapsedRealtimeMs(
-            long deadlineNanos) {
-
-        // نام متد فقط برای جلوگیری از اشتباه در محل فراخوانی است.
-        // مقدار ورودی و خروجی هر دو نانوثانیه هستند.
-        return deadlineNanos;
     }
 
     private static long toGestureDurationMs(
@@ -1236,7 +1221,6 @@ public class AutoClickService extends AccessibilityService {
             return false;
         }
 
-        // بررسی اولیه مهلت
         long finalCheckNanos =
                 SystemClock.elapsedRealtimeNanos();
 
@@ -1264,7 +1248,6 @@ public class AutoClickService extends AccessibilityService {
             activeRequests.add(request);
         }
 
-        // آخرین بررسی درست پیش از فراخوانی API
         long dispatchStart =
                 SystemClock.elapsedRealtimeNanos();
 
