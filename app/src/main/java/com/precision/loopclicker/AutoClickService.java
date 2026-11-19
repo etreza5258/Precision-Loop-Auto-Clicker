@@ -11,36 +11,27 @@ import android.os.Process;
 import android.os.SystemClock;
 import android.view.accessibility.AccessibilityEvent;
 
-import java.io.BufferedWriter;
-import java.io.File;
-import java.io.FileOutputStream;
-import java.io.OutputStreamWriter;
-import java.io.IOException;
+import java.io.*;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayDeque;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.TimeUnit;
+import java.util.*;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 
 public class AutoClickService extends AccessibilityService {
 
-    private static final long NANOS_PER_MS = 1_000_000L;
-    private static final long FINAL_SPIN_WINDOW_NANOS = 5_000_000L;
-    private static final long MAX_GESTURE_DURATION_MS = GestureDescription.getMaxGestureDuration();
+    private static final long NS_MS = 1_000_000L;
+    private static final long SPIN_NS = 5_000_000L;
+    private static final long MAX_DURATION_MS = GestureDescription.getMaxGestureDuration();
+    private static final int MAX_STROKES = GestureDescription.getMaxStrokeCount();
 
-    private static final String TARGET_PREFS_NAME = "auto_click_target";
-    private static final String TARGET_X_KEY = "target_x";
-    private static final String TARGET_Y_KEY = "target_y";
-    private static final String TIMING_FILE_NAME = "PrecisionClickTiming.txt";
+    private static final String PREFS = "auto_click_target";
+    private static final String KEY_X = "target_x";
+    private static final String KEY_Y = "target_y";
+    private static final String LOG_FILE = "PrecisionClickTiming.txt";
 
-    private static final int DEFAULT_TARGET_X = 350;
-    private static final int DEFAULT_TARGET_Y = 700;
+    private static final int DEFAULT_X = 350;
+    private static final int DEFAULT_Y = 700;
 
     private static volatile AutoClickService instance;
 
@@ -48,290 +39,230 @@ public class AutoClickService extends AccessibilityService {
         void onFinished(boolean success, boolean expired);
     }
 
-    private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private final Object queueLock = new Object();
-    private final ArrayDeque<ClickRequest> pending = new ArrayDeque<>(128);
-    private final ArrayList<ClickRequest> activeRequests = new ArrayList<>(64);
-    private final LinkedBlockingQueue<TimingRecord> timingQueue = new LinkedBlockingQueue<>();
+    private final Handler main = new Handler(Looper.getMainLooper());
+    private final Object lock = new Object();
+    private final ArrayDeque<Request> pending = new ArrayDeque<>(128);
+    private final ArrayList<Request> active = new ArrayList<>(64);
+    private final LinkedBlockingQueue<Timing> logs = new LinkedBlockingQueue<>();
 
-    private volatile boolean serviceReady;
-    private volatile boolean schedulerStopping;
-    private volatile boolean timingWriterStopping;
-    private volatile Thread schedulerThread;
-    private volatile Thread timingWriterThread;
-    private volatile int targetX = DEFAULT_TARGET_X;
-    private volatile int targetY = DEFAULT_TARGET_Y;
-    private volatile long cancellationGeneration;
-    private volatile ExecutorService preparationExecutor;
-    private volatile String timingFilePath = "فایل گزارش هنوز ساخته نشده است";
+    private volatile boolean ready, stopping, writerStopping;
+    private volatile int x = DEFAULT_X, y = DEFAULT_Y;
+    private volatile long generation;
+    private volatile Thread scheduler, writerThread;
+    private volatile ExecutorService preparer;
+    private volatile String logPath = "فایل گزارش هنوز ساخته نشده است";
+    private SharedPreferences preferences;
 
-    private SharedPreferences targetPreferences;
+    private static final class Request {
+        final long target, deadline, durationMs, durationNs, generation;
+        final int x, y;
+        final AtomicBoolean recorded = new AtomicBoolean();
+        final AtomicBoolean delivered = new AtomicBoolean();
 
-    private static final class TimingRecord {
-        final long targetNanos;
-        final long prepareStartNanos;
-        final long prepareEndNanos;
-        final long schedulerEnqueueNanos;
-        final long dispatchWorkerStartNanos;
-        final long dispatchStartNanos;
-        final long dispatchDurationNanos;
-        final long completionNanos;
-        final int x;
-        final int y;
-        final boolean accepted;
-        final boolean success;
-        final boolean expired;
-        final String callbackResult;
-
-        TimingRecord(ClickRequest r, boolean success, boolean expired) {
-            targetNanos = r.targetNanos;
-            prepareStartNanos = r.prepareStartNanos;
-            prepareEndNanos = r.prepareEndNanos;
-            schedulerEnqueueNanos = r.schedulerEnqueueNanos;
-            dispatchWorkerStartNanos = r.dispatchWorkerStartNanos;
-            dispatchStartNanos = r.dispatchStartNanos;
-            dispatchDurationNanos = r.dispatchDurationNanos;
-            completionNanos = r.completionNanos;
-            x = r.x;
-            y = r.y;
-            accepted = r.dispatchAccepted;
-            this.success = success;
-            this.expired = expired;
-            callbackResult = r.callbackResult;
-        }
-
-        String toCsvLine() {
-            long prepareDuration = prepareStartNanos == 0L || prepareEndNanos == 0L
-                    ? 0L : prepareEndNanos - prepareStartNanos;
-            long schedulerDelay = schedulerEnqueueNanos == 0L
-                    ? 0L : schedulerEnqueueNanos - targetNanos;
-            long dispatchQueueDelay = dispatchWorkerStartNanos == 0L || schedulerEnqueueNanos == 0L
-                    ? 0L : dispatchWorkerStartNanos - schedulerEnqueueNanos;
-            long dispatchDelay = dispatchStartNanos == 0L
-                    ? 0L : dispatchStartNanos - targetNanos;
-            long completionDelay = completionNanos == 0L
-                    ? 0L : completionNanos - targetNanos;
-            String result = expired ? "EXPIRED" : success ? "SUCCESS" : "FAILED";
-
-            return targetNanos + ","
-                    + prepareStartNanos + ","
-                    + prepareEndNanos + ","
-                    + prepareDuration + ","
-                    + schedulerEnqueueNanos + ","
-                    + schedulerDelay + ","
-                    + dispatchWorkerStartNanos + ","
-                    + dispatchQueueDelay + ","
-                    + dispatchStartNanos + ","
-                    + dispatchDelay + ","
-                    + dispatchDurationNanos + ","
-                    + completionNanos + ","
-                    + completionDelay + ","
-                    + accepted + ","
-                    + result + ","
-                    + callbackResult + ","
-                    + x + ","
-                    + y;
-        }
-    }
-
-    private static final class ClickRequest extends AccessibilityService.GestureResultCallback {
-        final AutoClickService owner;
-        final long targetNanos;
-        final long deadlineNanos;
-        final long touchDurationMs;
-        final long gestureDurationNanos;
-        final long requestGeneration;
-        final int x;
-        final int y;
-
-        final AtomicBoolean timingRecorded = new AtomicBoolean(false);
-        final AtomicBoolean completionDelivered = new AtomicBoolean(false);
-
-        volatile GestureDescription gesture;
-        volatile long prepareStartNanos;
-        volatile long prepareEndNanos;
-        volatile long schedulerEnqueueNanos;
-        volatile long dispatchWorkerStartNanos;
-        volatile long dispatchStartNanos;
-        volatile long dispatchDurationNanos;
-        volatile long completionNanos;
-        volatile boolean dispatchAccepted;
+        volatile Path path;
+        volatile long offsetMs, prepareStart, prepareEnd;
+        volatile long enqueue, workerStart, dispatchStart, dispatchDuration, completed;
+        volatile boolean accepted;
         volatile String callbackResult = "NOT_DISPATCHED";
         volatile GestureCompletion completion;
 
-        ClickRequest(
-                AutoClickService owner,
-                long targetNanos,
-                long deadlineNanos,
-                long touchDurationMs,
-                int x,
-                int y,
-                long requestGeneration,
-                GestureCompletion completion) {
-            this.owner = owner;
-            this.targetNanos = targetNanos;
-            this.deadlineNanos = deadlineNanos;
-            this.touchDurationMs = touchDurationMs;
-            this.gestureDurationNanos = touchDurationMs * NANOS_PER_MS;
+        Request(long target, long deadline, long durationMs, int x, int y,
+                long generation, GestureCompletion completion) {
+            this.target = target;
+            this.deadline = deadline;
+            this.durationMs = durationMs;
+            this.durationNs = durationMs * NS_MS;
             this.x = x;
             this.y = y;
-            this.requestGeneration = requestGeneration;
+            this.generation = generation;
             this.completion = completion;
         }
 
-        void prepareGesture() {
-            if (gesture != null) return;
-            prepareStartNanos = SystemClock.elapsedRealtimeNanos();
-            Path path = new Path();
-            path.moveTo(x, y);
-            path.lineTo(x, y);
-            gesture = new GestureDescription.Builder()
-                    .addStroke(new GestureDescription.StrokeDescription(path, 0L, touchDurationMs))
-                    .build();
-            prepareEndNanos = SystemClock.elapsedRealtimeNanos();
+        void prepare() {
+            if (path != null) return;
+            prepareStart = SystemClock.elapsedRealtimeNanos();
+            Path p = new Path();
+            p.moveTo(x, y);
+            p.lineTo(x, y);
+            path = p;
+            prepareEnd = SystemClock.elapsedRealtimeNanos();
+        }
+    }
+
+    private static final class Batch extends GestureDescription.GestureResultCallback {
+        final AutoClickService owner;
+        final ArrayList<Request> requests;
+
+        Batch(AutoClickService owner, ArrayList<Request> requests) {
+            this.owner = owner;
+            this.requests = requests;
         }
 
         @Override
         public void onCompleted(GestureDescription gesture) {
-            callbackResult = "ON_COMPLETED";
-            owner.completeRequest(this, true);
+            owner.finishBatch(this, true);
         }
 
         @Override
         public void onCancelled(GestureDescription gesture) {
-            callbackResult = "ON_CANCELLED";
-            owner.completeRequest(this, false);
+            owner.finishBatch(this, false);
+        }
+    }
+
+    private static final class Timing {
+        final long target, prepareStart, prepareEnd, enqueue, workerStart;
+        final long dispatchStart, dispatchDuration, completed;
+        final int x, y;
+        final boolean accepted, success, expired;
+        final String callback;
+
+        Timing(Request r, boolean success, boolean expired) {
+            target = r.target;
+            prepareStart = r.prepareStart;
+            prepareEnd = r.prepareEnd;
+            enqueue = r.enqueue;
+            workerStart = r.workerStart;
+            dispatchStart = r.dispatchStart;
+            dispatchDuration = r.dispatchDuration;
+            completed = r.completed;
+            x = r.x;
+            y = r.y;
+            accepted = r.accepted;
+            this.success = success;
+            this.expired = expired;
+            callback = r.callbackResult;
+        }
+
+        String csv() {
+            long prepare = prepareStart == 0 || prepareEnd == 0
+                    ? 0 : prepareEnd - prepareStart;
+            long schedulerDelay = enqueue == 0 ? 0 : enqueue - target;
+            long queueDelay = workerStart == 0 || enqueue == 0
+                    ? 0 : workerStart - enqueue;
+            long dispatchDelay = dispatchStart == 0 ? 0 : dispatchStart - target;
+            long completionDelay = completed == 0 ? 0 : completed - target;
+            String result = expired ? "EXPIRED" : success ? "SUCCESS" : "FAILED";
+
+            return target + "," + prepareStart + "," + prepareEnd + ","
+                    + prepare + "," + enqueue + "," + schedulerDelay + ","
+                    + workerStart + "," + queueDelay + "," + dispatchStart + ","
+                    + dispatchDelay + "," + dispatchDuration + "," + completed + ","
+                    + completionDelay + "," + accepted + "," + result + ","
+                    + callback + "," + x + "," + y;
         }
     }
 
     @Override
     protected void onServiceConnected() {
         super.onServiceConnected();
-        targetPreferences = getSharedPreferences(TARGET_PREFS_NAME, MODE_PRIVATE);
-        targetX = targetPreferences.getInt(TARGET_X_KEY, DEFAULT_TARGET_X);
-        targetY = targetPreferences.getInt(TARGET_Y_KEY, DEFAULT_TARGET_Y);
-        schedulerStopping = false;
-        serviceReady = true;
+        preferences = getSharedPreferences(PREFS, MODE_PRIVATE);
+        x = preferences.getInt(KEY_X, DEFAULT_X);
+        y = preferences.getInt(KEY_Y, DEFAULT_Y);
+        stopping = false;
+        ready = true;
         instance = this;
-        startTimingWriter();
-        startPreparationExecutor();
-        startNanoScheduler();
+        startWriter();
+        startPreparer();
+        startScheduler();
     }
 
-    private void startTimingWriter() {
-        Thread existing = timingWriterThread;
-        if (existing != null && existing.isAlive()) return;
-        timingWriterStopping = false;
-        Thread writer = new Thread(this::timingWriterLoop, "PrecisionTimingFileWriter");
-        timingWriterThread = writer;
-        writer.start();
+    private void startWriter() {
+        if (writerThread != null && writerThread.isAlive()) return;
+        writerStopping = false;
+        writerThread = new Thread(this::writerLoop, "PrecisionTimingFileWriter");
+        writerThread.start();
     }
 
-    private void timingWriterLoop() {
-        BufferedWriter writer = null;
+    private void writerLoop() {
+        BufferedWriter out = null;
         try {
-            File directory = getExternalFilesDir(null);
-            if (directory == null) directory = getFilesDir();
-            if (!directory.exists() && !directory.mkdirs()) {
-                timingFilePath = "خطا: پوشه گزارش ساخته نشد";
+            File dir = getExternalFilesDir(null);
+            if (dir == null) dir = getFilesDir();
+            if (!dir.exists() && !dir.mkdirs()) {
+                logPath = "خطا: پوشه گزارش ساخته نشد";
                 return;
             }
 
-            File file = new File(directory, TIMING_FILE_NAME);
-            boolean writeHeader = !file.exists() || file.length() == 0L;
-            writer = new BufferedWriter(new OutputStreamWriter(
+            File file = new File(dir, LOG_FILE);
+            boolean header = !file.exists() || file.length() == 0;
+            out = new BufferedWriter(new OutputStreamWriter(
                     new FileOutputStream(file, true), StandardCharsets.UTF_8));
-            timingFilePath = file.getAbsolutePath();
+            logPath = file.getAbsolutePath();
 
-            if (writeHeader) {
-                writer.write("target_elapsed_ns,prepare_start_elapsed_ns,prepare_end_elapsed_ns,prepare_duration_ns,scheduler_enqueue_elapsed_ns,scheduler_delay_ns,dispatch_worker_start_elapsed_ns,dispatch_queue_delay_ns,dispatch_start_elapsed_ns,dispatch_delay_ns,dispatch_duration_ns,completion_elapsed_ns,completion_delay_ns,accepted,result,callback_result,x,y");
-                writer.newLine();
-                writer.flush();
+            if (header) {
+                out.write("target_elapsed_ns,prepare_start_elapsed_ns,prepare_end_elapsed_ns,"
+                        + "prepare_duration_ns,scheduler_enqueue_elapsed_ns,scheduler_delay_ns,"
+                        + "dispatch_worker_start_elapsed_ns,dispatch_queue_delay_ns,"
+                        + "dispatch_start_elapsed_ns,dispatch_delay_ns,dispatch_duration_ns,"
+                        + "completion_elapsed_ns,completion_delay_ns,accepted,result,"
+                        + "callback_result,x,y");
+                out.newLine();
+                out.flush();
             }
 
-            while (!timingWriterStopping || !timingQueue.isEmpty()) {
-                TimingRecord record;
+            while (!writerStopping || !logs.isEmpty()) {
+                Timing item;
                 try {
-                    record = timingQueue.poll(500, TimeUnit.MILLISECONDS);
-                } catch (InterruptedException ignored) {
+                    item = logs.poll(500, TimeUnit.MILLISECONDS);
+                } catch (InterruptedException e) {
                     continue;
                 }
-                if (record == null) continue;
-                writer.write(record.toCsvLine());
-                writer.newLine();
-                writer.flush();
+                if (item == null) continue;
+                out.write(item.csv());
+                out.newLine();
+                out.flush();
             }
-        } catch (IOException error) {
-            timingFilePath = "خطای نوشتن گزارش: " + error.getMessage();
+        } catch (IOException e) {
+            logPath = "خطای نوشتن گزارش: " + e.getMessage();
         } finally {
-            if (writer != null) {
+            if (out != null) {
                 try {
-                    writer.flush();
-                    writer.close();
+                    out.flush();
+                    out.close();
                 } catch (IOException ignored) {
                 }
             }
         }
     }
 
-    private void recordTiming(ClickRequest request, boolean success, boolean expired) {
-        if (request == null || !request.timingRecorded.compareAndSet(false, true)) return;
-        timingQueue.offer(new TimingRecord(request, success, expired));
+    private void record(Request r, boolean success, boolean expired) {
+        if (r != null && r.recorded.compareAndSet(false, true))
+            logs.offer(new Timing(r, success, expired));
     }
 
-    private void stopTimingWriter() {
-        timingWriterStopping = true;
-        Thread writer = timingWriterThread;
-        if (writer != null) writer.interrupt();
-    }
-
-    public String getTimingFilePath() {
-        return timingFilePath;
-    }
-
-    private void startPreparationExecutor() {
-        ExecutorService existing = preparationExecutor;
-        if (existing != null && !existing.isShutdown()) return;
-
-        ThreadFactory factory = runnable -> new Thread(() -> {
+    private void startPreparer() {
+        if (preparer != null && !preparer.isShutdown()) return;
+        preparer = Executors.newSingleThreadExecutor(task -> new Thread(() -> {
             try {
                 Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY);
             } catch (Exception ignored) {
             }
-            runnable.run();
-        }, "PrecisionGesturePreparation");
-
-        preparationExecutor = Executors.newSingleThreadExecutor(factory);
+            task.run();
+        }, "PrecisionGesturePreparation"));
     }
 
-    private void prepareRequest(ClickRequest request) {
-        if (!isRequestCurrent(request)) return;
+    private void prepare(Request r) {
+        if (!current(r)) return;
         try {
-            request.prepareGesture();
-            if (isRequestCurrent(request)) {
-                Thread worker = schedulerThread;
-                if (worker != null) LockSupport.unpark(worker);
-            }
-        } catch (Exception error) {
+            r.prepare();
+            if (current(r)) unparkScheduler();
+        } catch (Exception e) {
             boolean removed;
-            synchronized (queueLock) {
-                removed = pending.remove(request);
+            synchronized (lock) {
+                removed = pending.remove(r);
             }
             if (removed) {
-                request.callbackResult = "PREPARATION_FAILED:" + error.getClass().getSimpleName();
-                postCompletion(request, false, false);
+                r.callbackResult = "PREPARATION_FAILED:" + e.getClass().getSimpleName();
+                postFinish(r, false, false);
             }
-            Thread worker = schedulerThread;
-            if (worker != null) LockSupport.unpark(worker);
+            unparkScheduler();
         }
     }
 
-    private void startNanoScheduler() {
-        Thread existing = schedulerThread;
-        if (existing != null && existing.isAlive()) return;
-        Thread worker = new Thread(this::schedulerLoop, "PrecisionClickNanoScheduler");
-        schedulerThread = worker;
-        worker.start();
+    private void startScheduler() {
+        if (scheduler != null && scheduler.isAlive()) return;
+        scheduler = new Thread(this::schedulerLoop, "PrecisionClickNanoScheduler");
+        scheduler.start();
     }
 
     private void schedulerLoop() {
@@ -340,387 +271,222 @@ public class AutoClickService extends AccessibilityService {
         } catch (Exception ignored) {
         }
 
-        while (!schedulerStopping) {
-            ClickRequest request;
-            synchronized (queueLock) {
-                request = pending.peekFirst();
+        while (!stopping) {
+            Request first;
+            synchronized (lock) {
+                first = pending.peekFirst();
             }
 
-            if (request == null) {
+            if (first == null) {
                 LockSupport.park(this);
                 continue;
             }
 
-            if (!isRequestCurrent(request)) {
-                removePendingHead(request);
+            if (!current(first)) {
+                removeHead(first);
                 continue;
             }
 
-            if (request.gesture == null) {
+            if (first.path == null) {
                 LockSupport.park(this);
                 continue;
             }
+
+            long remaining = first.target - SystemClock.elapsedRealtimeNanos();
+            if (remaining > SPIN_NS) {
+                LockSupport.parkNanos(this, remaining - SPIN_NS);
+                continue;
+            }
+
+            while (!stopping && ready && first.generation == generation
+                    && SystemClock.elapsedRealtimeNanos() < first.target) {
+            }
+
+            if (stopping) break;
+            if (first.generation != generation) {
+                removeHead(first);
+                continue;
+            }
+
+            ArrayList<Request> batch = collect(first);
+            if (batch.isEmpty()) continue;
 
             long now = SystemClock.elapsedRealtimeNanos();
-            long remaining = request.targetNanos - now;
-
-            if (remaining > FINAL_SPIN_WINDOW_NANOS) {
-                LockSupport.parkNanos(this, remaining - FINAL_SPIN_WINDOW_NANOS);
-                continue;
-            }
-
-            while (!schedulerStopping
-                    && serviceReady
-                    && request.requestGeneration == cancellationGeneration
-                    && SystemClock.elapsedRealtimeNanos() < request.targetNanos) {
-            }
-
-            if (schedulerStopping) break;
-            if (request.requestGeneration != cancellationGeneration) {
-                removePendingHead(request);
-                continue;
-            }
-
-            boolean removed = false;
-            synchronized (queueLock) {
-                if (pending.peekFirst() != request) continue;
-                if (request.requestGeneration != cancellationGeneration) {
-                    pending.pollFirst();
-                } else {
-                    pending.pollFirst();
-                    removed = true;
-                }
-            }
-
-            if (!removed) continue;
-
-            request.schedulerEnqueueNanos = SystemClock.elapsedRealtimeNanos();
-            dispatchReadyRequest(request);
+            for (Request r : batch) r.enqueue = now;
+            dispatchBatch(batch);
         }
     }
 
-    private boolean isRequestCurrent(ClickRequest request) {
-        return request != null
-                && request.requestGeneration == cancellationGeneration
-                && serviceReady
-                && !schedulerStopping;
+    private ArrayList<Request> collect(Request first) {
+        ArrayList<Request> result = new ArrayList<>(MAX_STROKES);
+        synchronized (lock) {
+            if (pending.peekFirst() != first || !current(first)) return result;
+
+            long base = first.target;
+            long gen = first.generation;
+
+            while (!pending.isEmpty() && result.size() < MAX_STROKES) {
+                Request r = pending.peekFirst();
+                if (r.generation != gen || r.path == null || r.target < base) break;
+
+                long delta = r.target - base;
+                if (delta % NS_MS != 0) break;
+
+                r.offsetMs = delta / NS_MS;
+                if (r.offsetMs + r.durationMs > MAX_DURATION_MS) break;
+
+                result.add(pending.pollFirst());
+            }
+        }
+        return result;
     }
 
-    private void removePendingHead(ClickRequest request) {
+    private boolean current(Request r) {
+        return r != null && r.generation == generation && ready && !stopping;
+    }
+
+    private void removeHead(Request r) {
         boolean removed = false;
-        synchronized (queueLock) {
-            if (pending.peekFirst() == request) {
+        synchronized (lock) {
+            if (pending.peekFirst() == r) {
                 pending.pollFirst();
                 removed = true;
             }
         }
         if (removed) {
-            request.callbackResult = "REMOVED_FROM_PENDING";
-            postCompletion(request, false, true);
+            r.callbackResult = "REMOVED_FROM_PENDING";
+            postFinish(r, false, true);
         }
     }
 
-    @Override
-    public void onAccessibilityEvent(AccessibilityEvent event) {
-    }
-
-    @Override
-    public void onInterrupt() {
-        cancelPendingInternal();
-    }
-
-    @Override
-    public void onDestroy() {
-        serviceReady = false;
-        schedulerStopping = true;
-
-        Thread worker = schedulerThread;
-        schedulerThread = null;
-        if (worker != null) {
-            LockSupport.unpark(worker);
-            worker.interrupt();
+    private GestureDescription buildGesture(List<Request> requests) {
+        GestureDescription.Builder builder = new GestureDescription.Builder();
+        for (Request r : requests) {
+            if (r.path == null) throw new IllegalStateException("PATH_NOT_PREPARED");
+            builder.addStroke(new GestureDescription.StrokeDescription(
+                    r.path, r.offsetMs, r.durationMs));
         }
-
-        ExecutorService prep = preparationExecutor;
-        preparationExecutor = null;
-        if (prep != null) prep.shutdownNow();
-
-        List<ClickRequest> pendingFinish = new ArrayList<>();
-        List<ClickRequest> activeFinish = new ArrayList<>();
-
-        synchronized (queueLock) {
-            cancellationGeneration++;
-            while (!pending.isEmpty()) pendingFinish.add(pending.pollFirst());
-            activeFinish.addAll(activeRequests);
-            activeRequests.clear();
-        }
-
-        for (ClickRequest request : pendingFinish) {
-            request.callbackResult = "SERVICE_DESTROYED_PENDING";
-            notifyCompletion(request, false, true);
-        }
-
-        for (ClickRequest request : activeFinish) {
-            request.callbackResult = "SERVICE_DESTROYED_ACTIVE";
-            notifyCompletion(request, false, false);
-        }
-
-        stopTimingWriter();
-        if (instance == this) instance = null;
-        targetPreferences = null;
-        super.onDestroy();
+        return builder.build();
     }
 
-    public static AutoClickService getInstance() {
-        return instance;
-    }
+    private void dispatchBatch(ArrayList<Request> requests) {
+        if (requests.isEmpty()) return;
 
-    public boolean isServiceReady() {
-        return serviceReady;
-    }
+        long workerStart = SystemClock.elapsedRealtimeNanos();
+        for (Request r : requests) r.workerStart = workerStart;
 
-    public boolean isGestureInProgress() {
-        synchronized (queueLock) {
-            return !activeRequests.isEmpty();
-        }
-    }
-
-    public int getTargetX() {
-        return targetX;
-    }
-
-    public int getTargetY() {
-        return targetY;
-    }
-
-    public void setTarget(int x, int y) {
-        final int newX = Math.max(0, x);
-        final int newY = Math.max(0, y);
-
-        runOnMain(() -> {
-            if (!serviceReady || (targetX == newX && targetY == newY)) return;
-            targetX = newX;
-            targetY = newY;
-            SharedPreferences prefs = targetPreferences;
-            if (prefs != null) {
-                prefs.edit()
-                        .putInt(TARGET_X_KEY, newX)
-                        .putInt(TARGET_Y_KEY, newY)
-                        .apply();
-            }
-        });
-    }
-
-    public boolean performClickAtTarget(
-            long targetElapsedRealtimeNanos,
-            long cycleStartElapsedRealtimeNanos,
-            long cycleDeadlineElapsedRealtimeNanos,
-            long touchDurationNanos,
-            GestureCompletion completion) {
-
-        if (!serviceReady
-                || schedulerStopping
-                || completion == null
-                || touchDurationNanos < 0
-                || cycleDeadlineElapsedRealtimeNanos <= cycleStartElapsedRealtimeNanos
-                || targetElapsedRealtimeNanos < cycleStartElapsedRealtimeNanos
-                || targetElapsedRealtimeNanos >= cycleDeadlineElapsedRealtimeNanos) {
-            return false;
-        }
-
-        long durationMs = toGestureDurationMs(touchDurationNanos);
-        if (durationMs > MAX_GESTURE_DURATION_MS) return false;
-
-        long durationNanos = durationMs * NANOS_PER_MS;
-        if (durationNanos > cycleDeadlineElapsedRealtimeNanos - targetElapsedRealtimeNanos) {
-            return false;
-        }
-
-        boolean wasEmpty;
-        ClickRequest request;
-
-        synchronized (queueLock) {
-            if (!serviceReady || schedulerStopping) return false;
-            ExecutorService executor = preparationExecutor;
-            if (executor == null || executor.isShutdown()) return false;
-
-            request = new ClickRequest(
-                    this,
-                    targetElapsedRealtimeNanos,
-                    cycleDeadlineElapsedRealtimeNanos,
-                    durationMs,
-                    targetX,
-                    targetY,
-                    cancellationGeneration,
-                    completion);
-
-            wasEmpty = pending.isEmpty();
-            pending.offerLast(request);
-
-            try {
-                executor.execute(() -> prepareRequest(request));
-            } catch (Exception ignored) {
-                pending.remove(request);
-                return false;
-            }
-        }
-
-        if (wasEmpty) {
-            Thread worker = schedulerThread;
-            if (worker != null) LockSupport.unpark(worker);
-        }
-
-        return true;
-    }
-
-    private static long toGestureDurationMs(long durationNanos) {
-        if (durationNanos <= 0L) return 1L;
-        long millis = durationNanos / NANOS_PER_MS;
-        if (durationNanos % NANOS_PER_MS != 0L) millis++;
-        return Math.max(1L, millis);
-    }
-
-    private void dispatchReadyRequest(ClickRequest request) {
-        request.dispatchWorkerStartNanos = SystemClock.elapsedRealtimeNanos();
-
-        if (!isRequestCurrent(request)) {
-            request.callbackResult = "REQUEST_CANCELLED_BEFORE_DISPATCH";
-            postCompletion(request, false, true);
+        if (!current(requests.get(0))) {
+            finishWithoutDispatch(requests, "CANCELLED_BEFORE_DISPATCH", true);
             return;
         }
 
-        long now = SystemClock.elapsedRealtimeNanos();
-        if (!hasEnoughTime(request, now)) {
-            request.callbackResult = "DEADLINE_EXPIRED_BEFORE_DISPATCH";
-            postCompletion(request, false, true);
+        GestureDescription gesture;
+        try {
+            gesture = buildGesture(requests);
+        } catch (Exception e) {
+            finishWithoutDispatch(requests,
+                    "BATCH_BUILD_FAILED:" + e.getClass().getSimpleName(), false);
             return;
-        }
-
-        if (!dispatchRequest(request)) {
-            if ("NOT_DISPATCHED".equals(request.callbackResult)) {
-                request.callbackResult = "DISPATCH_REJECTED";
-            }
-            boolean expired = request.callbackResult.startsWith("DEADLINE_EXPIRED");
-            postCompletion(request, false, expired);
-        }
-    }
-
-    private boolean hasEnoughTime(ClickRequest request, long nowNanos) {
-        return nowNanos < request.deadlineNanos
-                && request.gestureDurationNanos <= request.deadlineNanos - nowNanos;
-    }
-
-    private boolean dispatchRequest(ClickRequest request) {
-        GestureDescription gesture = request.gesture;
-
-        if (gesture == null) {
-            request.callbackResult = "GESTURE_NOT_PREPARED";
-            return false;
-        }
-
-        if (!serviceReady
-                || schedulerStopping
-                || request.requestGeneration != cancellationGeneration) {
-            request.callbackResult = "REQUEST_CANCELLED_BEFORE_API";
-            return false;
         }
 
         long check = SystemClock.elapsedRealtimeNanos();
-        if (!hasEnoughTime(request, check)) {
-            request.callbackResult = "DEADLINE_EXPIRED_BEFORE_API";
-            return false;
-        }
-
-        synchronized (queueLock) {
-            if (!serviceReady
-                    || schedulerStopping
-                    || request.requestGeneration != cancellationGeneration) {
-                request.callbackResult = "REQUEST_CANCELLED_BEFORE_API";
-                return false;
+        for (Request r : requests) {
+            long needed = r.offsetMs * NS_MS + r.durationNs;
+            if (check >= r.deadline || needed > r.deadline - check) {
+                finishWithoutDispatch(requests, "DEADLINE_EXPIRED_BEFORE_API", true);
+                return;
             }
-            activeRequests.add(request);
         }
 
-        long dispatchStart = SystemClock.elapsedRealtimeNanos();
-
-        if (!hasEnoughTime(request, dispatchStart)
-                || !serviceReady
-                || schedulerStopping
-                || request.requestGeneration != cancellationGeneration) {
-            synchronized (queueLock) {
-                activeRequests.remove(request);
+        synchronized (lock) {
+            if (!current(requests.get(0))) {
+                finishWithoutDispatch(requests, "CANCELLED_BEFORE_API", true);
+                return;
             }
-            request.callbackResult = !hasEnoughTime(request, dispatchStart)
-                    ? "DEADLINE_EXPIRED_AT_API_ENTRY"
-                    : "REQUEST_CANCELLED_AT_API_ENTRY";
-            return false;
+            active.addAll(requests);
         }
 
-        request.dispatchStartNanos = dispatchStart;
-        request.callbackResult = "WAITING_FOR_CALLBACK";
+        long start = SystemClock.elapsedRealtimeNanos();
+        for (Request r : requests) {
+            long needed = r.offsetMs * NS_MS + r.durationNs;
+            if (start >= r.deadline || needed > r.deadline - start
+                    || !current(r)) {
+                synchronized (lock) {
+                    active.removeAll(requests);
+                }
+                finishWithoutDispatch(requests, "DEADLINE_OR_CANCEL_AT_API_ENTRY", true);
+                return;
+            }
+        }
+
+        for (Request r : requests) {
+            r.dispatchStart = start;
+            r.callbackResult = "WAITING_FOR_CALLBACK";
+        }
 
         boolean accepted;
         try {
-            accepted = dispatchGesture(gesture, request, mainHandler);
-        } catch (Exception error) {
-            request.dispatchDurationNanos =
-                    SystemClock.elapsedRealtimeNanos() - dispatchStart;
-            request.callbackResult =
-                    "DISPATCH_EXCEPTION:" + error.getClass().getSimpleName();
-            synchronized (queueLock) {
-                activeRequests.remove(request);
+            accepted = dispatchGesture(gesture, new Batch(this, requests), main);
+        } catch (Exception e) {
+            long end = SystemClock.elapsedRealtimeNanos();
+            for (Request r : requests) {
+                r.dispatchDuration = end - start;
+                r.callbackResult = "DISPATCH_EXCEPTION:" + e.getClass().getSimpleName();
             }
-            return false;
-        }
-
-        long dispatchEnd = SystemClock.elapsedRealtimeNanos();
-        request.dispatchDurationNanos = dispatchEnd - dispatchStart;
-        request.dispatchAccepted = accepted;
-
-        if (!accepted) {
-            request.callbackResult = "API_RETURNED_FALSE";
-            synchronized (queueLock) {
-                activeRequests.remove(request);
+            synchronized (lock) {
+                active.removeAll(requests);
             }
-            return false;
-        }
-
-        return true;
-    }
-
-    private void completeRequest(ClickRequest request, boolean success) {
-        boolean wasActive;
-        synchronized (queueLock) {
-            wasActive = activeRequests.remove(request);
-        }
-
-        if (wasActive) {
-            request.completionNanos = SystemClock.elapsedRealtimeNanos();
-            notifyCompletion(request, success, false);
-        }
-    }
-
-    private void postCompletion(ClickRequest request, boolean success, boolean expired) {
-        if (Looper.myLooper() == Looper.getMainLooper()) {
-            notifyCompletion(request, success, expired);
-        } else {
-            mainHandler.post(() -> notifyCompletion(request, success, expired));
-        }
-    }
-
-    private void notifyCompletion(ClickRequest request, boolean success, boolean expired) {
-        if (request == null || !request.completionDelivered.compareAndSet(false, true)) {
+            for (Request r : requests) postFinish(r, false, false);
             return;
         }
 
-        if (request.completionNanos == 0L) {
-            request.completionNanos = SystemClock.elapsedRealtimeNanos();
+        long end = SystemClock.elapsedRealtimeNanos();
+        for (Request r : requests) {
+            r.dispatchDuration = end - start;
+            r.accepted = accepted;
         }
 
-        recordTiming(request, success, expired);
-        GestureCompletion callback = request.completion;
-        request.completion = null;
+        if (!accepted) {
+            for (Request r : requests) r.callbackResult = "API_RETURNED_FALSE";
+            synchronized (lock) {
+                active.removeAll(requests);
+            }
+            for (Request r : requests) postFinish(r, false, false);
+        }
+    }
 
+    private void finishWithoutDispatch(List<Request> requests,
+                                       String reason, boolean expired) {
+        for (Request r : requests) r.callbackResult = reason;
+        for (Request r : requests) postFinish(r, false, expired);
+    }
+
+    private void finishBatch(Batch batch, boolean success) {
+        long now = SystemClock.elapsedRealtimeNanos();
+        synchronized (lock) {
+            active.removeAll(batch.requests);
+        }
+        for (Request r : batch.requests) {
+            r.completed = now;
+            r.callbackResult = success ? "ON_COMPLETED" : "ON_CANCELLED";
+            finish(r, success, false);
+        }
+    }
+
+    private void postFinish(Request r, boolean success, boolean expired) {
+        if (Looper.myLooper() == Looper.getMainLooper())
+            finish(r, success, expired);
+        else
+            main.post(() -> finish(r, success, expired));
+    }
+
+    private void finish(Request r, boolean success, boolean expired) {
+        if (r == null || !r.delivered.compareAndSet(false, true)) return;
+        if (r.completed == 0) r.completed = SystemClock.elapsedRealtimeNanos();
+        record(r, success, expired);
+
+        GestureCompletion callback = r.completion;
+        r.completion = null;
         if (callback != null) {
             try {
                 callback.onFinished(success, expired);
@@ -729,32 +495,170 @@ public class AutoClickService extends AccessibilityService {
         }
     }
 
-    public void cancelPendingScheduledClick() {
-        cancelPendingInternal();
+    public boolean performClickAtTarget(
+            long targetNanos, long cycleStartNanos, long deadlineNanos,
+            long touchDurationNanos, GestureCompletion completion) {
+
+        if (!ready || stopping || completion == null || touchDurationNanos < 0
+                || deadlineNanos <= cycleStartNanos
+                || targetNanos < cycleStartNanos || targetNanos >= deadlineNanos)
+            return false;
+
+        long durationMs = toDurationMs(touchDurationNanos);
+        if (durationMs > MAX_DURATION_MS) return false;
+
+        long durationNs = durationMs * NS_MS;
+        if (durationNs > deadlineNanos - targetNanos) return false;
+
+        boolean empty;
+        Request request;
+
+        synchronized (lock) {
+            if (!ready || stopping || preparer == null || preparer.isShutdown())
+                return false;
+
+            request = new Request(targetNanos, deadlineNanos, durationMs,
+                    x, y, generation, completion);
+
+            empty = pending.isEmpty();
+            pending.offerLast(request);
+
+            try {
+                preparer.execute(() -> prepare(request));
+            } catch (Exception e) {
+                pending.remove(request);
+                return false;
+            }
+        }
+
+        if (empty) unparkScheduler();
+        return true;
     }
 
-    private void cancelPendingInternal() {
-        List<ClickRequest> cancelled = new ArrayList<>();
+    private static long toDurationMs(long nanos) {
+        if (nanos <= 0) return 1;
+        return Math.max(1, (nanos + NS_MS - 1) / NS_MS);
+    }
 
-        synchronized (queueLock) {
-            cancellationGeneration++;
+    private void unparkScheduler() {
+        Thread t = scheduler;
+        if (t != null) LockSupport.unpark(t);
+    }
+
+    public void cancelPendingScheduledClick() {
+        cancelPending();
+    }
+
+    private void cancelPending() {
+        List<Request> cancelled = new ArrayList<>();
+        synchronized (lock) {
+            generation++;
             while (!pending.isEmpty()) cancelled.add(pending.pollFirst());
         }
-
-        Thread worker = schedulerThread;
-        if (worker != null) LockSupport.unpark(worker);
-
-        for (ClickRequest request : cancelled) {
-            request.callbackResult = "CANCELLED_BEFORE_DISPATCH";
-            postCompletion(request, false, true);
+        unparkScheduler();
+        for (Request r : cancelled) {
+            r.callbackResult = "CANCELLED_BEFORE_DISPATCH";
+            postFinish(r, false, true);
         }
+    }
+
+    @Override
+    public void onInterrupt() {
+        cancelPending();
+    }
+
+    @Override
+    public void onAccessibilityEvent(AccessibilityEvent event) {
+    }
+
+    @Override
+    public void onDestroy() {
+        ready = false;
+        stopping = true;
+
+        Thread t = scheduler;
+        scheduler = null;
+        if (t != null) {
+            LockSupport.unpark(t);
+            t.interrupt();
+        }
+
+        ExecutorService executor = preparer;
+        preparer = null;
+        if (executor != null) executor.shutdownNow();
+
+        List<Request> waiting = new ArrayList<>();
+        List<Request> running = new ArrayList<>();
+
+        synchronized (lock) {
+            generation++;
+            while (!pending.isEmpty()) waiting.add(pending.pollFirst());
+            running.addAll(active);
+            active.clear();
+        }
+
+        for (Request r : waiting) {
+            r.callbackResult = "SERVICE_DESTROYED_PENDING";
+            finish(r, false, true);
+        }
+
+        for (Request r : running) {
+            r.callbackResult = "SERVICE_DESTROYED_ACTIVE";
+            finish(r, false, false);
+        }
+
+        writerStopping = true;
+        if (writerThread != null) writerThread.interrupt();
+        if (instance == this) instance = null;
+        preferences = null;
+        super.onDestroy();
+    }
+
+    public static AutoClickService getInstance() {
+        return instance;
+    }
+
+    public boolean isServiceReady() {
+        return ready;
+    }
+
+    public boolean isGestureInProgress() {
+        synchronized (lock) {
+            return !active.isEmpty();
+        }
+    }
+
+    public int getTargetX() {
+        return x;
+    }
+
+    public int getTargetY() {
+        return y;
+    }
+
+    public String getTimingFilePath() {
+        return logPath;
+    }
+
+    public void setTarget(int newX, int newY) {
+        int nx = Math.max(0, newX);
+        int ny = Math.max(0, newY);
+
+        runOnMain(() -> {
+            if (!ready || (x == nx && y == ny)) return;
+            x = nx;
+            y = ny;
+            SharedPreferences p = preferences;
+            if (p != null) {
+                p.edit().putInt(KEY_X, nx).putInt(KEY_Y, ny).apply();
+            }
+        });
     }
 
     private void runOnMain(Runnable action) {
-        if (Looper.myLooper() == Looper.getMainLooper()) {
+        if (Looper.myLooper() == Looper.getMainLooper())
             action.run();
-        } else {
-            mainHandler.post(action);
-        }
+        else
+            main.post(action);
     }
 }
