@@ -7,6 +7,7 @@ import android.content.SharedPreferences;
 import android.graphics.Path;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.Process;
 import android.os.SystemClock;
 import android.view.accessibility.AccessibilityEvent;
 
@@ -15,15 +16,25 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.locks.LockSupport;
 
 public class AutoClickService extends AccessibilityService {
 
     private static final long NANOS_PER_MS = 1_000_000L;
 
-    private static final long FINAL_SPIN_WINDOW_NANOS = 300_000L;
+    /*
+     * پنجره انتظار فعال:
+     * 5 میلی‌ثانیه
+     */
+    private static final long FINAL_SPIN_WINDOW_NANOS =
+            5_000_000L;
 
-    private static final String TARGET_PREFS_NAME = "auto_click_target";
+    private static final String TARGET_PREFS_NAME =
+            "auto_click_target";
+
     private static final String TARGET_X_KEY = "target_x";
     private static final String TARGET_Y_KEY = "target_y";
 
@@ -45,7 +56,15 @@ public class AutoClickService extends AccessibilityService {
     private final Handler mainHandler =
             new Handler(Looper.getMainLooper());
 
+    /*
+     * قفل صف درخواست‌ها.
+     */
     private final Object queueLock = new Object();
+
+    /*
+     * قفل مستقل برای هماهنگی مرز لغو و ارسال.
+     */
+    private final Object dispatchLock = new Object();
 
     private final ArrayDeque<ClickRequest> pending =
             new ArrayDeque<>(INITIAL_PENDING_CAPACITY);
@@ -61,16 +80,14 @@ public class AutoClickService extends AccessibilityService {
     private volatile int targetX = DEFAULT_TARGET_X;
     private volatile int targetY = DEFAULT_TARGET_Y;
 
-    private SharedPreferences targetPreferences;
-
     /*
-     * هر بار که درخواست‌های در انتظار لغو می‌شوند،
-     * این شماره افزایش پیدا می‌کند.
-     *
-     * درخواست‌هایی که قبلاً از صف خارج شده‌اند نیز
-     * با مقایسه این شماره قابل شناسایی هستند.
+     * بررسی نسل بدون نیاز به گرفتن قفل.
      */
-    private long cancellationGeneration = 0L;
+    private volatile long cancellationGeneration = 0L;
+
+    private volatile ExecutorService preparationExecutor;
+
+    private SharedPreferences targetPreferences;
 
     private static final class ClickRequest
             extends AccessibilityService.GestureResultCallback {
@@ -121,13 +138,16 @@ public class AutoClickService extends AccessibilityService {
             path.moveTo(x, y);
             path.lineTo(x, y);
 
-            gesture = new GestureDescription.Builder()
-                    .addStroke(
-                            new GestureDescription.StrokeDescription(
-                                    path,
-                                    0L,
-                                    touchDurationMs))
-                    .build();
+            GestureDescription prepared =
+                    new GestureDescription.Builder()
+                            .addStroke(
+                                    new GestureDescription.StrokeDescription(
+                                            path,
+                                            0L,
+                                            touchDurationMs))
+                            .build();
+
+            gesture = prepared;
         }
 
         @Override
@@ -163,9 +183,37 @@ public class AutoClickService extends AccessibilityService {
 
         instance = this;
 
+        startPreparationExecutor();
         startNanoScheduler();
     }
 
+    /*
+     * نخ مستقل برای آماده‌سازی Gesture.
+     */
+    private void startPreparationExecutor() {
+
+        ExecutorService existing = preparationExecutor;
+
+        if (existing != null && !existing.isShutdown()) {
+            return;
+        }
+
+        ThreadFactory factory = runnable -> {
+
+            Thread thread = new Thread(
+                    runnable,
+                    "PrecisionGesturePreparation");
+
+            return thread;
+        };
+
+        preparationExecutor =
+                Executors.newSingleThreadExecutor(factory);
+    }
+
+    /*
+     * نخ مستقل زمان‌بندی نانوثانیه‌ای.
+     */
     private void startNanoScheduler() {
 
         Thread existing = schedulerThread;
@@ -184,12 +232,65 @@ public class AutoClickService extends AccessibilityService {
     }
 
     /*
-     * زمان‌بندی مستقل با elapsedRealtimeNanos.
-     *
-     * این حلقه هرگز منتظر پایان ژست قبلی نمی‌ماند.
-     * درخواست‌ها در زمان هدف خودشان ارسال می‌شوند.
+     * آماده‌سازی درخواست خارج از نخ زمان‌بندی.
+     */
+    private void prepareRequest(ClickRequest request) {
+
+        if (!isRequestCurrent(request)) {
+            return;
+        }
+
+        try {
+
+            request.prepareGesture();
+
+            if (isRequestCurrent(request)) {
+
+                Thread worker = schedulerThread;
+
+                if (worker != null) {
+                    LockSupport.unpark(worker);
+                }
+            }
+
+        } catch (Exception ignored) {
+
+            boolean removed;
+
+            synchronized (queueLock) {
+
+                removed = pending.remove(request);
+            }
+
+            if (removed) {
+
+                postCompletion(
+                        request,
+                        false,
+                        false);
+            }
+
+            Thread worker = schedulerThread;
+
+            if (worker != null) {
+                LockSupport.unpark(worker);
+            }
+        }
+    }
+
+    /*
+     * زمان‌بند اصلی.
      */
     private void schedulerLoop() {
+
+        try {
+
+            Process.setThreadPriority(
+                    Process.THREAD_PRIORITY_URGENT_DISPLAY);
+
+        } catch (Exception ignored) {
+            // Keep scheduler operational.
+        }
 
         while (!schedulerStopping) {
 
@@ -208,7 +309,7 @@ public class AutoClickService extends AccessibilityService {
             }
 
             /*
-             * درخواست لغوشده نباید پردازش شود.
+             * بررسی اعتبار بدون قفل.
              */
             if (!isRequestCurrent(request)) {
 
@@ -218,20 +319,11 @@ public class AutoClickService extends AccessibilityService {
             }
 
             /*
-             * آماده‌سازی ژست پیش از زمان هدف.
+             * ژست باید پیش از زمان هدف آماده شده باشد.
              */
-            try {
+            if (request.gesture == null) {
 
-                request.prepareGesture();
-
-            } catch (Exception ignored) {
-
-                removePendingHead(request);
-
-                postCompletion(
-                        request,
-                        false,
-                        false);
+                LockSupport.park(this);
 
                 continue;
             }
@@ -252,22 +344,33 @@ public class AutoClickService extends AccessibilityService {
             }
 
             /*
-             * انتظار نهایی بدون ارسال زودهنگام.
+             * انتظار فعال نهایی:
+             * بدون گرفتن قفل در حلقه.
              */
             while (!schedulerStopping
-                    && isRequestCurrent(request)
+                    && serviceReady
+                    && request.requestGeneration
+                            == cancellationGeneration
                     && SystemClock.elapsedRealtimeNanos()
-                    < request.targetNanos) {
-                // Final precision wait.
+                            < request.targetNanos) {
+
+                // Maximum-priority precision spin.
             }
 
             if (schedulerStopping) {
                 break;
             }
 
+            if (request.requestGeneration
+                    != cancellationGeneration) {
+
+                removePendingHead(request);
+
+                continue;
+            }
+
             /*
-             * پیش از خارج‌کردن درخواست از صف،
-             * هویت درخواست دوباره بررسی می‌شود.
+             * خارج‌کردن درخواست از صف.
              */
             synchronized (queueLock) {
 
@@ -305,16 +408,16 @@ public class AutoClickService extends AccessibilityService {
         }
     }
 
+    /*
+     * بررسی اعتبار درخواست بدون قفل.
+     */
     private boolean isRequestCurrent(ClickRequest request) {
 
-        synchronized (queueLock) {
-
-            return request != null
-                    && request.requestGeneration
-                    == cancellationGeneration
-                    && serviceReady
-                    && !schedulerStopping;
-        }
+        return request != null
+                && request.requestGeneration
+                        == cancellationGeneration
+                && serviceReady
+                && !schedulerStopping;
     }
 
     private void removePendingHead(ClickRequest request) {
@@ -336,7 +439,7 @@ public class AutoClickService extends AccessibilityService {
             postCompletion(
                     request,
                     false,
-                    false);
+                    true);
         }
     }
 
@@ -368,30 +471,45 @@ public class AutoClickService extends AccessibilityService {
             worker.interrupt();
         }
 
+        ExecutorService executor = preparationExecutor;
+
+        preparationExecutor = null;
+
+        if (executor != null) {
+            executor.shutdownNow();
+        }
+
         List<ClickRequest> pendingToFinish =
                 new ArrayList<>();
 
         List<ClickRequest> activeToFinish =
                 new ArrayList<>();
 
-        synchronized (queueLock) {
+        /*
+         * ترتیب قفل‌ها در تمام مسیرها یکسان است:
+         * dispatchLock سپس queueLock.
+         */
+        synchronized (dispatchLock) {
 
-            cancellationGeneration++;
+            synchronized (queueLock) {
 
-            while (!pending.isEmpty()) {
+                cancellationGeneration++;
 
-                pendingToFinish.add(
-                        pending.pollFirst());
-            }
+                while (!pending.isEmpty()) {
 
-            Iterator<ClickRequest> iterator =
-                    activeRequests.iterator();
+                    pendingToFinish.add(
+                            pending.pollFirst());
+                }
 
-            while (iterator.hasNext()) {
+                Iterator<ClickRequest> iterator =
+                        activeRequests.iterator();
 
-                activeToFinish.add(iterator.next());
+                while (iterator.hasNext()) {
 
-                iterator.remove();
+                    activeToFinish.add(iterator.next());
+
+                    iterator.remove();
+                }
             }
         }
 
@@ -502,13 +620,21 @@ public class AutoClickService extends AccessibilityService {
 
         boolean wasEmpty;
 
+        ClickRequest request;
+
         synchronized (queueLock) {
 
             if (!serviceReady || schedulerStopping) {
                 return false;
             }
 
-            ClickRequest request = new ClickRequest(
+            ExecutorService executor = preparationExecutor;
+
+            if (executor == null || executor.isShutdown()) {
+                return false;
+            }
+
+            request = new ClickRequest(
                     this,
                     targetElapsedRealtimeNanos,
                     cycleDeadlineElapsedRealtimeNanos,
@@ -521,12 +647,23 @@ public class AutoClickService extends AccessibilityService {
             wasEmpty = pending.isEmpty();
 
             pending.offerLast(request);
+
+            /*
+             * ثبت کار آماده‌سازی در همان ترتیب FIFO.
+             */
+            try {
+
+                executor.execute(
+                        () -> prepareRequest(request));
+
+            } catch (Exception ignored) {
+
+                pending.remove(request);
+
+                return false;
+            }
         }
 
-        /*
-         * ارسال درخواست جدید فقط در صورت نیاز،
-         * زمان‌بند خوابیده را بیدار می‌کند.
-         */
         if (wasEmpty) {
 
             Thread worker = schedulerThread;
@@ -559,8 +696,7 @@ public class AutoClickService extends AccessibilityService {
     private void dispatchReadyRequest(ClickRequest request) {
 
         /*
-         * همان قانون قبلی مهلت چرخه:
-         * شروع ارسال باید قبل از پایان چرخه باشد.
+         * حفظ قانون مهلت چرخه.
          */
         if (SystemClock.elapsedRealtimeNanos()
                 >= request.deadlineNanos) {
@@ -582,70 +718,65 @@ public class AutoClickService extends AccessibilityService {
         }
     }
 
+    /*
+     * ارسال ژست با قفل مستقل.
+     *
+     * queueLock هنگام dispatchGesture گرفته نمی‌شود.
+     */
     private boolean dispatchRequest(ClickRequest request) {
 
-        try {
+        GestureDescription gesture = request.gesture;
 
-            GestureDescription gesture =
-                    request.gesture;
+        if (gesture == null) {
+            return false;
+        }
+
+        synchronized (dispatchLock) {
+
+            /*
+             * کنترل نهایی نسل لغو.
+             */
+            if (!serviceReady
+                    || schedulerStopping
+                    || request.requestGeneration
+                            != cancellationGeneration) {
+
+                return false;
+            }
 
             synchronized (queueLock) {
-
-                /*
-                 * کنترل نهایی نسل درخواست دقیقاً
-                 * در مرز شروع ارسال انجام می‌شود.
-                 *
-                 * توقفی که قبل از این نقطه انجام شده باشد،
-                 * اجازه ارسال درخواست را نمی‌دهد.
-                 */
-                if (!serviceReady
-                        || schedulerStopping
-                        || request.requestGeneration
-                                != cancellationGeneration) {
-
-                    return false;
-                }
 
                 activeRequests.add(request);
+            }
 
-                boolean accepted;
+            boolean accepted;
 
-                try {
+            try {
 
-                    /*
-                     * هیچ انتظاری برای پایان ژست قبلی
-                     * وجود ندارد.
-                     *
-                     * این فراخوانی در زمان هدف انجام می‌شود.
-                     */
-                    accepted = dispatchGesture(
-                            gesture,
-                            request,
-                            mainHandler);
+                accepted = dispatchGesture(
+                        gesture,
+                        request,
+                        mainHandler);
 
-                } catch (Exception ignored) {
+            } catch (Exception ignored) {
 
-                    activeRequests.remove(request);
-
-                    return false;
-                }
-
-                if (!accepted) {
+                synchronized (queueLock) {
 
                     activeRequests.remove(request);
                 }
 
-                return accepted;
+                return false;
             }
 
-        } catch (Exception ignored) {
+            if (!accepted) {
 
-            synchronized (queueLock) {
+                synchronized (queueLock) {
 
-                activeRequests.remove(request);
+                    activeRequests.remove(request);
+                }
             }
 
-            return false;
+            return accepted;
         }
     }
 
@@ -719,9 +850,14 @@ public class AutoClickService extends AccessibilityService {
         }
     }
 
+    /*
+     * لغو فوری و thread-safe.
+     *
+     * دیگر برای اجرای عملیات لغو منتظر نخ اصلی نمی‌مانیم.
+     */
     public void cancelPendingScheduledClick() {
 
-        runOnMain(this::cancelPendingInternal);
+        cancelPendingInternal();
     }
 
     private void cancelPendingInternal() {
@@ -729,19 +865,20 @@ public class AutoClickService extends AccessibilityService {
         List<ClickRequest> cancelled =
                 new ArrayList<>();
 
-        synchronized (queueLock) {
+        synchronized (dispatchLock) {
 
-            /*
-             * مهم‌ترین اصلاح:
-             * حتی درخواست خارج‌شده از صف نیز با نسل قبلی
-             * دیگر اجازه شروع ارسال نخواهد داشت.
-             */
-            cancellationGeneration++;
+            synchronized (queueLock) {
 
-            while (!pending.isEmpty()) {
+                /*
+                 * تمام درخواست‌های نسل قبلی نامعتبر می‌شوند.
+                 */
+                cancellationGeneration++;
 
-                cancelled.add(
-                        pending.pollFirst());
+                while (!pending.isEmpty()) {
+
+                    cancelled.add(
+                            pending.pollFirst());
+                }
             }
         }
 
@@ -754,7 +891,7 @@ public class AutoClickService extends AccessibilityService {
 
         for (ClickRequest request : cancelled) {
 
-            notifyCompletion(
+            postCompletion(
                     request,
                     false,
                     true);
