@@ -1,1 +1,699 @@
-package com.precision.loopclicker;\nimport android.accessibilityservice.AccessibilityService;\nimport android.accessibilityservice.GestureDescription;\nimport android.content.SharedPreferences;\nimport android.graphics.Path;\nimport android.os.Handler;\nimport android.os.Looper;\nimport android.os.Process;\nimport android.os.SystemClock;\nimport android.view.accessibility.AccessibilityEvent;\nimport java.io.*;\nimport java.nio.charset.StandardCharsets;\nimport java.util.*;\nimport java.util.concurrent.*;\nimport java.util.concurrent.atomic.AtomicBoolean;\nimport java.util.concurrent.locks.LockSupport;\n\npublic class AutoClickService extends AccessibilityService {\n    private static final long NS_MS = 1_000_000L;\n    private static final long SPIN_NS = 5_000_000L;\n    private static final long MAX_DURATION_MS =\n            GestureDescription.getMaxGestureDuration();\n    private static final int MAX_BATCH_REQUESTS = 50;\n    private static final int MAX_STROKES = Math.min(\n            MAX_BATCH_REQUESTS, GestureDescription.getMaxStrokeCount());\n    private static final String PREFS = "auto_click_target";\n    private static final String KEY_X = "target_x";\n    private static final String KEY_Y = "target_y";\n    private static final String LOG_FILE = "PrecisionClickTiming.txt";\n    private static final int DEFAULT_X = 350;\n    private static final int DEFAULT_Y = 700;\n    private static volatile AutoClickService instance;\n\n    public interface GestureCompletion {\n        void onFinished(boolean success, boolean expired);\n    }\n    private final Handler main = new Handler(Looper.getMainLooper());\n    private final Object lock = new Object();\n    private final ArrayDeque<Request> pending = new ArrayDeque<>(128);\n    private final ArrayList<Request> active = new ArrayList<>(64);\n    private final LinkedBlockingQueue<Timing> logs =\n            new LinkedBlockingQueue<>();\n    private volatile boolean ready;\n    private volatile boolean stopping;\n    private volatile boolean writerStopping;\n    private volatile int x = DEFAULT_X;\n    private volatile int y = DEFAULT_Y;\n    private volatile long generation;\n    private volatile long nextBatchAllowedNs;\n    private volatile Thread scheduler;\n    private volatile Thread writerThread;\n    private volatile ExecutorService preparer;\n    private volatile String logPath = "فایل گزارش هنوز ساخته نشده است";\n    private SharedPreferences preferences;\n\n    private static final class Request {\n        final long target;\n        final long deadline;\n        final long durationMs;\n        final long durationNs;\n        final long generation;\n        final int x;\n        final int y;\n        final AtomicBoolean recorded = new AtomicBoolean();\n        final AtomicBoolean delivered = new AtomicBoolean();\n        volatile Path path;\n        volatile long offsetMs;\n        volatile long prepareStart;\n        volatile long prepareEnd;\n        volatile long enqueue;\n        volatile long workerStart;\n        volatile long dispatchStart;\n        volatile long dispatchDuration;\n        volatile long completed;\n        volatile boolean accepted;\n        volatile String callbackResult = "NOT_DISPATCHED";\n        volatile GestureCompletion completion;\n        Request(long target, long deadline, long durationMs,\n                int x, int y, long generation,\n                GestureCompletion completion) {\n            this.target = target;\n            this.deadline = deadline;\n            this.durationMs = durationMs;\n            this.durationNs = durationMs * NS_MS;\n            this.x = x;\n            this.y = y;\n            this.generation = generation;\n            this.completion = completion; }\n        void prepare() {\n            if (path != null) return;\n            prepareStart = SystemClock.elapsedRealtimeNanos();\n            Path p = new Path();\n            p.moveTo(x, y);\n            p.lineTo(x, y);\n            path = p;\n            prepareEnd = SystemClock.elapsedRealtimeNanos(); }\n    }\n\n    private static final class Batch\n            extends AccessibilityService.GestureResultCallback {\n        final AutoClickService owner;\n        final ArrayList<Request> requests;\n        Batch(AutoClickService owner, ArrayList<Request> requests) {\n            this.owner = owner;\n            this.requests = requests;\n        }\n        @Override\n        public void onCompleted(GestureDescription gesture) {\n            owner.finishBatch(this, true);\n        }\n        @Override\n        public void onCancelled(GestureDescription gesture) {\n            owner.finishBatch(this, false); }\n    }\n\n    private static final class Timing {\n        final long target;\n        final long prepareStart;\n        final long prepareEnd;\n        final long enqueue;\n        final long workerStart;\n        final long dispatchStart;\n        final long dispatchDuration;\n        final long completed;\n        final int x;\n        final int y;\n        final boolean accepted;\n        final boolean success;\n        final boolean expired;\n        final String callback;\n        Timing(Request r, boolean success, boolean expired) {\n            target = r.target;\n            prepareStart = r.prepareStart;\n            prepareEnd = r.prepareEnd;\n            enqueue = r.enqueue;\n            workerStart = r.workerStart;\n            dispatchStart = r.dispatchStart;\n            dispatchDuration = r.dispatchDuration;\n            completed = r.completed;\n            x = r.x;\n            y = r.y;\n            accepted = r.accepted;\n            this.success = success;\n            this.expired = expired;\n            callback = r.callbackResult; }\n        String csv() {\n            long prepare = prepareStart == 0 || prepareEnd == 0\n                    ? 0 : prepareEnd - prepareStart;\n            long schedulerDelay = enqueue == 0\n                    ? 0 : enqueue - target;\n            long queueDelay = workerStart == 0 || enqueue == 0\n                    ? 0 : workerStart - enqueue;\n            long dispatchDelay = dispatchStart == 0\n                    ? 0 : dispatchStart - target;\n            long completionDelay = completed == 0\n                    ? 0 : completed - target;\n            String result = expired\n                    ? "EXPIRED"\n                    : success ? "SUCCESS" : "FAILED";\n            return target + "," + prepareStart + "," + prepareEnd + ","\n                    + prepare + "," + enqueue + "," + schedulerDelay + ","\n                    + workerStart + "," + queueDelay + "," + dispatchStart + ","\n                    + dispatchDelay + "," + dispatchDuration + "," + completed + ","\n                    + completionDelay + "," + accepted + "," + result + ","\n                    + callback + "," + x + "," + y; }\n    }\n\n    @Override\n\n    protected void onServiceConnected() {\n        super.onServiceConnected();\n        preferences = getSharedPreferences(PREFS, MODE_PRIVATE);\n        x = preferences.getInt(KEY_X, DEFAULT_X);\n        y = preferences.getInt(KEY_Y, DEFAULT_Y);\n        stopping = false;\n        ready = true;\n        instance = this;\n        startWriter();\n        startPreparer();\n        startScheduler();\n    }\n\n    private void startWriter() {\n        if (writerThread != null && writerThread.isAlive()) return;\n        writerStopping = false;\n        writerThread = new Thread(\n                this::writerLoop, "PrecisionTimingFileWriter");\n        writerThread.start();\n    }\n\n    private void writerLoop() {\n        BufferedWriter out = null;\n        try {\n            File dir = getExternalFilesDir(null);\n            if (dir == null) dir = getFilesDir();\n            if (!dir.exists() && !dir.mkdirs()) {\n                logPath = "خطا: پوشه گزارش ساخته نشد";\n                return; }\n            File file = new File(dir, LOG_FILE);\n            boolean header = !file.exists() || file.length() == 0;\n            out = new BufferedWriter(new OutputStreamWriter(\n                    new FileOutputStream(file, true),\n                    StandardCharsets.UTF_8));\n            logPath = file.getAbsolutePath();\n            if (header) {\n                out.write("target_elapsed_ns,prepare_start_elapsed_ns,"\n                        + "prepare_end_elapsed_ns,prepare_duration_ns,"\n                        + "scheduler_enqueue_elapsed_ns,scheduler_delay_ns,"\n                        + "dispatch_worker_start_elapsed_ns,dispatch_queue_delay_ns,"\n                        + "dispatch_start_elapsed_ns,dispatch_delay_ns,"\n                        + "dispatch_duration_ns,completion_elapsed_ns,"\n                        + "completion_delay_ns,accepted,result,"\n                        + "callback_result,x,y");\n                out.newLine();\n                out.flush(); }\n            while (!writerStopping || !logs.isEmpty()) {\n                Timing item;\n                try {\n                    item = logs.poll(500, TimeUnit.MILLISECONDS);\n                } catch (InterruptedException e) {\n                    continue; }\n                if (item == null) continue;\n                out.write(item.csv());\n                out.newLine();\n                out.flush(); }\n        } catch (IOException e) {\n            logPath = "خطای نوشتن گزارش: " + e.getMessage();\n        } finally {\n            if (out != null) {\n                try {\n                    out.flush();\n                    out.close();\n                } catch (IOException ignored) { } } }\n    }\n\n    private void record(Request r, boolean success, boolean expired) {\n        if (r != null && r.recorded.compareAndSet(false, true)) {\n            logs.offer(new Timing(r, success, expired)); }\n    }\n\n    private void startPreparer() {\n        if (preparer != null && !preparer.isShutdown()) return;\n        preparer = Executors.newSingleThreadExecutor(task ->\n                new Thread(() -> {\n                    try {\n                        Process.setThreadPriority(\n                                Process.THREAD_PRIORITY_URGENT_DISPLAY);\n                    } catch (Exception ignored) { }\n                    task.run();\n                }, "PrecisionGesturePreparation"));\n    }\n\n    private void prepare(Request r) {\n        if (!current(r)) return;\n        try {\n            r.prepare();\n            if (current(r)) {\n                unparkScheduler(); }\n        } catch (Exception e) {\n            boolean removed;\n            synchronized (lock) {\n                removed = pending.remove(r); }\n            if (removed) {\n                r.callbackResult = "PREPARATION_FAILED:"\n                        + e.getClass().getSimpleName();\n                postFinish(r, false, false); }\n            unparkScheduler(); }\n    }\n\n    private void startScheduler() {\n        if (scheduler != null && scheduler.isAlive()) return;\n        scheduler = new Thread(\n                this::schedulerLoop, "PrecisionClickNanoScheduler");\n        scheduler.start();\n    }\n\n    private void schedulerLoop() {\n        try {\n            Process.setThreadPriority(\n                    Process.THREAD_PRIORITY_URGENT_DISPLAY);\n        } catch (Exception ignored) { }\n        while (!stopping) {\n            Request first;\n            synchronized (lock) {\n                first = pending.peekFirst(); }\n            if (first == null) {\n                LockSupport.park(this);\n                continue; }\n            if (!current(first)) {\n                removeHead(first);\n                continue; }\n            if (first.path == null) {\n                LockSupport.park(this);\n                continue; }\n            long due = Math.max(first.target, nextBatchAllowedNs);\n            long remaining = due - SystemClock.elapsedRealtimeNanos();\n            if (remaining > SPIN_NS) {\n                LockSupport.parkNanos(this, remaining - SPIN_NS);\n                continue; }\n            while (!stopping && ready\n                    && first.generation == generation\n                    && SystemClock.elapsedRealtimeNanos() < due) { }\n            if (stopping) break;\n            if (first.generation != generation) {\n                removeHead(first);\n                continue; }\n            ArrayList<Request> batch = collect(first);\n            if (batch.isEmpty()) continue;\n            long now = SystemClock.elapsedRealtimeNanos();\n            for (Request r : batch) {\n                r.enqueue = now; }\n            dispatchBatch(batch); }\n    }\n\n    private ArrayList<Request> collect(Request first) {\n        ArrayList<Request> result = new ArrayList<>(MAX_STROKES);\n        synchronized (lock) {\n            if (pending.peekFirst() != first || !current(first)) {\n                return result; }\n            long base = first.target;\n            long gen = first.generation;\n            while (!pending.isEmpty() && result.size() < MAX_STROKES) {\n                Request r = pending.peekFirst();\n                if (r.generation != gen || r.path == null\n                        || r.target < base) {\n                    break; }\n                long delta = r.target - base;\n                if (delta % NS_MS != 0) break;\n                long offset = delta / NS_MS;\n                if (offset > MAX_DURATION_MS\n                        || r.durationMs > MAX_DURATION_MS - offset) {\n                    break; }\n                r.offsetMs = offset;\n                result.add(pending.pollFirst()); } }\n        return result;\n    }\n\n    private boolean current(Request r) {\n        return r != null\n                && r.generation == generation\n                && ready\n                && !stopping;\n    }\n\n    private void removeHead(Request r) {\n        boolean removed = false;\n        synchronized (lock) {\n            if (pending.peekFirst() == r) {\n                pending.pollFirst();\n                removed = true; } }\n        if (removed) {\n            r.callbackResult = "REMOVED_FROM_PENDING";\n            postFinish(r, false, true); }\n    }\n\n    private GestureDescription buildGesture(List<Request> requests) {\n        GestureDescription.Builder builder =\n                new GestureDescription.Builder();\n        for (Request r : requests) {\n            if (r.path == null) {\n                throw new IllegalStateException("PATH_NOT_PREPARED"); }\n            builder.addStroke(new GestureDescription.StrokeDescription(\n                    r.path, r.offsetMs, r.durationMs)); }\n        return builder.build();\n    }\n\n    private void dispatchBatch(ArrayList<Request> requests) {\n        if (requests.isEmpty()) return;\n        long workerStart = SystemClock.elapsedRealtimeNanos();\n        for (Request r : requests) {\n            r.workerStart = workerStart; }\n        if (!current(requests.get(0))) {\n            finishWithoutDispatch(\n                    requests, "CANCELLED_BEFORE_DISPATCH", true);\n            return; }\n        GestureDescription gesture;\n        try {\n            gesture = buildGesture(requests);\n        } catch (Exception e) {\n            finishWithoutDispatch(\n                    requests,\n                    "BATCH_BUILD_FAILED:" + e.getClass().getSimpleName(),\n                    false);\n            return; }\n        long check = SystemClock.elapsedRealtimeNanos();\n        ArrayList<Request> valid = new ArrayList<>(requests.size());\n        for (Request r : requests) {\n            long needed = r.offsetMs * NS_MS + r.durationNs;\n            if (check < r.deadline && needed <= r.deadline - check\n                    && current(r)) {\n                valid.add(r);\n            } else {\n                r.callbackResult = "DEADLINE_OR_CANCEL_BEFORE_API";\n                postFinish(r, false, true); } }\n        if (valid.isEmpty()) return;\n        if (valid.size() != requests.size()) {\n            requests = valid;\n            try {\n                gesture = buildGesture(requests);\n            } catch (Exception e) {\n                finishWithoutDispatch(\n                        requests,\n                        "BATCH_REBUILD_FAILED:"\n                                + e.getClass().getSimpleName(),\n                        false);\n                return; } }\n        boolean registered;\n        synchronized (lock) {\n            registered = current(requests.get(0));\n            if (registered) {\n                active.addAll(requests); } }\n        if (!registered) {\n            finishWithoutDispatch(\n                    requests, "CANCELLED_BEFORE_API", true);\n            return; }\n        long start = SystemClock.elapsedRealtimeNanos();\n        ArrayList<Request> apiValid = new ArrayList<>(requests.size());\n        for (Request r : requests) {\n            long needed = r.offsetMs * NS_MS + r.durationNs;\n            if (start < r.deadline && needed <= r.deadline - start\n                    && current(r)) {\n                apiValid.add(r);\n            } else {\n                r.callbackResult = "DEADLINE_OR_CANCEL_AT_API_ENTRY";\n                postFinish(r, false, true); } }\n        if (apiValid.size() != requests.size()) {\n            synchronized (lock) {\n                active.removeAll(requests); }\n            if (apiValid.isEmpty()) return;\n            requests = apiValid;\n            try {\n                gesture = buildGesture(requests);\n            } catch (Exception e) {\n                finishWithoutDispatch(\n                        requests,\n                        "BATCH_FINAL_BUILD_FAILED:"\n                                + e.getClass().getSimpleName(),\n                        false);\n                return; }\n            synchronized (lock) {\n                if (!current(requests.get(0))) {\n                    active.removeAll(requests);\n                    finishWithoutDispatch(\n                            requests, "CANCELLED_BEFORE_FINAL_API", true);\n                    return; }\n                active.addAll(requests); }\n            start = SystemClock.elapsedRealtimeNanos();\n            for (Request r : requests) {\n                long needed = r.offsetMs * NS_MS + r.durationNs;\n                if (start >= r.deadline\n                        || needed > r.deadline - start\n                        || !current(r)) {\n                    synchronized (lock) {\n                        active.removeAll(requests); }\n                    finishWithoutDispatch(\n                            requests, "FINAL_DEADLINE_CHECK_FAILED", true);\n                    return; } } }\n        for (Request r : requests) {\n            r.dispatchStart = start;\n            r.callbackResult = "WAITING_FOR_CALLBACK"; }\n        boolean accepted;\n        try {\n            accepted = dispatchGesture(\n                    gesture, new Batch(this, requests), main);\n        } catch (Exception e) {\n            long end = SystemClock.elapsedRealtimeNanos();\n            for (Request r : requests) {\n                r.dispatchDuration = end - start;\n                r.callbackResult = "DISPATCH_EXCEPTION:"\n                        + e.getClass().getSimpleName(); }\n            synchronized (lock) {\n                active.removeAll(requests); }\n            for (Request r : requests) {\n                postFinish(r, false, false); }\n            return; }\n        long end = SystemClock.elapsedRealtimeNanos();\n        for (Request r : requests) {\n            r.dispatchDuration = end - start;\n            r.accepted = accepted; }\n        if (accepted) {\n            long estimatedDurationNs = 0;\n            for (Request r : requests) {\n                long strokeEndNs = r.offsetMs * NS_MS + r.durationNs;\n                if (strokeEndNs > estimatedDurationNs) {\n                    estimatedDurationNs = strokeEndNs;\n                }\n            }\n            nextBatchAllowedNs = start\n                    + estimatedDurationNs * 95L / 100L;\n        }\n        if (!accepted) {\n            for (Request r : requests) {\n                r.callbackResult = "API_RETURNED_FALSE"; }\n            synchronized (lock) {\n                active.removeAll(requests); }\n            for (Request r : requests) {\n                postFinish(r, false, false); } }\n    }\n\n    private void finishWithoutDispatch(\n            List<Request> requests, String reason, boolean expired) {\n        for (Request r : requests) {\n            r.callbackResult = reason;\n            postFinish(r, false, expired); }\n    }\n\n    private void finishBatch(Batch batch, boolean success) {\n        long now = SystemClock.elapsedRealtimeNanos();\n        synchronized (lock) {\n            active.removeAll(batch.requests); }\n        for (Request r : batch.requests) {\n            r.completed = now;\n            r.callbackResult =\n                    success ? "ON_COMPLETED" : "ON_CANCELLED";\n            finish(r, success, false); }\n    }\n\n    private void postFinish(\n            Request r, boolean success, boolean expired) {\n        if (Looper.myLooper() == Looper.getMainLooper()) {\n            finish(r, success, expired);\n        } else {\n            main.post(() -> finish(r, success, expired)); }\n    }\n\n    private void finish(\n            Request r, boolean success, boolean expired) {\n        if (r == null || !r.delivered.compareAndSet(false, true)) {\n            return; }\n        if (r.completed == 0) {\n            r.completed = SystemClock.elapsedRealtimeNanos(); }\n        record(r, success, expired);\n        GestureCompletion callback = r.completion;\n        r.completion = null;\n        if (callback != null) {\n            try {\n                callback.onFinished(success, expired);\n            } catch (Exception ignored) { } }\n    }\n\n    public boolean performClickAtTarget(\n            long targetNanos,\n            long cycleStartNanos,\n            long deadlineNanos,\n            long touchDurationNanos,\n            GestureCompletion completion) {\n        if (!ready || stopping || completion == null\n                || touchDurationNanos < 0\n                || deadlineNanos <= cycleStartNanos\n                || targetNanos < cycleStartNanos\n                || targetNanos >= deadlineNanos) {\n            return false; }\n        long durationMs = toDurationMs(touchDurationNanos);\n        if (durationMs > MAX_DURATION_MS) {\n            return false; }\n        long durationNs = durationMs * NS_MS;\n        if (durationNs > deadlineNanos - targetNanos) {\n            return false; }\n        boolean empty;\n        Request request;\n        synchronized (lock) {\n            if (!ready || stopping || preparer == null\n                    || preparer.isShutdown()) {\n                return false; }\n            request = new Request(\n                    targetNanos,\n                    deadlineNanos,\n                    durationMs,\n                    x,\n                    y,\n                    generation,\n                    completion);\n            empty = pending.isEmpty();\n            pending.offerLast(request);\n            try {\n                preparer.execute(() -> prepare(request));\n            } catch (Exception e) {\n                pending.remove(request);\n                return false; } }\n        if (empty) {\n            unparkScheduler(); }\n        return true;\n    }\n\n    private static long toDurationMs(long nanos) {\n        if (nanos <= 0) return 1;\n        return Math.max(1, (nanos + NS_MS - 1) / NS_MS);\n    }\n\n    private void unparkScheduler() {\n        Thread t = scheduler;\n        if (t != null) {\n            LockSupport.unpark(t); }\n    }\n\n    public void cancelPendingScheduledClick() {\n        cancelPending();\n    }\n\n    private void cancelPending() {\n        List<Request> cancelled = new ArrayList<>();\n        synchronized (lock) {\n            generation++;\n            nextBatchAllowedNs = 0;\n            while (!pending.isEmpty()) {\n                cancelled.add(pending.pollFirst()); } }\n        unparkScheduler();\n        for (Request r : cancelled) {\n            r.callbackResult = "CANCELLED_BEFORE_DISPATCH";\n            postFinish(r, false, true); }\n    }\n\n    @Override\n\n    public void onInterrupt() {\n        cancelPending();\n    }\n\n    @Override\n\n    public void onAccessibilityEvent(AccessibilityEvent event) {\n    }\n\n    @Override\n\n    public void onDestroy() {\n        ready = false;\n        stopping = true;\n        Thread t = scheduler;\n        scheduler = null;\n        if (t != null) {\n            LockSupport.unpark(t);\n            t.interrupt(); }\n        ExecutorService executor = preparer;\n        preparer = null;\n        if (executor != null) {\n            executor.shutdownNow(); }\n        List<Request> waiting = new ArrayList<>();\n        List<Request> running = new ArrayList<>();\n        synchronized (lock) {\n            generation++;\n            while (!pending.isEmpty()) {\n                waiting.add(pending.pollFirst()); }\n            running.addAll(active);\n            active.clear(); }\n        for (Request r : waiting) {\n            r.callbackResult = "SERVICE_DESTROYED_PENDING";\n            finish(r, false, true); }\n        for (Request r : running) {\n            r.callbackResult = "SERVICE_DESTROYED_ACTIVE";\n            finish(r, false, false); }\n        writerStopping = true;\n        if (writerThread != null) {\n            writerThread.interrupt(); }\n        if (instance == this) {\n            instance = null; }\n        preferences = null;\n        super.onDestroy();\n    }\n    public static AutoClickService getInstance() {\n        return instance;\n    }\n    public boolean isServiceReady() {\n        return ready;\n    }\n    public boolean isGestureInProgress() {\n        synchronized (lock) {\n            return !active.isEmpty(); }\n    }\n    public int getTargetX() {\n        return x;\n    }\n    public int getTargetY() {\n        return y;\n    }\n    public String getTimingFilePath() {\n        return logPath;\n    }\n    public void setTarget(int newX, int newY) {\n        int nx = Math.max(0, newX);\n        int ny = Math.max(0, newY);\n        runOnMain(() -> {\n            if (!ready || (x == nx && y == ny)) {\n                return; }\n            x = nx;\n            y = ny;\n            SharedPreferences p = preferences;\n            if (p != null) {\n                p.edit()\n                        .putInt(KEY_X, nx)\n                        .putInt(KEY_Y, ny)\n                        .apply(); }\n        });\n    }\n    private void runOnMain(Runnable action) {\n        if (Looper.myLooper() == Looper.getMainLooper()) {\n            action.run();\n        } else {\n            main.post(action); } } }\n
+package com.precision.loopclicker;
+import android.accessibilityservice.AccessibilityService;
+import android.accessibilityservice.GestureDescription;
+import android.content.SharedPreferences;
+import android.graphics.Path;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.Process;
+import android.os.SystemClock;
+import android.view.accessibility.AccessibilityEvent;
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.LockSupport;
+
+public class AutoClickService extends AccessibilityService {
+    private static final long NS_MS = 1_000_000L;
+    private static final long SPIN_NS = 5_000_000L;
+    private static final long MAX_DURATION_MS =
+            GestureDescription.getMaxGestureDuration();
+    private static final int MAX_BATCH_REQUESTS = 50;
+    private static final int MAX_STROKES = Math.min(
+            MAX_BATCH_REQUESTS, GestureDescription.getMaxStrokeCount());
+    private static final String PREFS = "auto_click_target";
+    private static final String KEY_X = "target_x";
+    private static final String KEY_Y = "target_y";
+    private static final String LOG_FILE = "PrecisionClickTiming.txt";
+    private static final int DEFAULT_X = 350;
+    private static final int DEFAULT_Y = 700;
+    private static volatile AutoClickService instance;
+
+    public interface GestureCompletion {
+        void onFinished(boolean success, boolean expired);
+    }
+    private final Handler main = new Handler(Looper.getMainLooper());
+    private final Object lock = new Object();
+    private final ArrayDeque<Request> pending = new ArrayDeque<>(128);
+    private final ArrayList<Request> active = new ArrayList<>(64);
+    private final LinkedBlockingQueue<Timing> logs =
+            new LinkedBlockingQueue<>();
+    private volatile boolean ready;
+    private volatile boolean stopping;
+    private volatile boolean writerStopping;
+    private volatile int x = DEFAULT_X;
+    private volatile int y = DEFAULT_Y;
+    private volatile long generation;
+    private volatile long nextBatchAllowedNs;
+    private volatile Thread scheduler;
+    private volatile Thread writerThread;
+    private volatile ExecutorService preparer;
+    private volatile String logPath = "فایل گزارش هنوز ساخته نشده است";
+    private SharedPreferences preferences;
+
+    private static final class Request {
+        final long target;
+        final long deadline;
+        final long durationMs;
+        final long durationNs;
+        final long generation;
+        final int x;
+        final int y;
+        final AtomicBoolean recorded = new AtomicBoolean();
+        final AtomicBoolean delivered = new AtomicBoolean();
+        volatile Path path;
+        volatile long offsetMs;
+        volatile long prepareStart;
+        volatile long prepareEnd;
+        volatile long enqueue;
+        volatile long workerStart;
+        volatile long dispatchStart;
+        volatile long dispatchDuration;
+        volatile long completed;
+        volatile boolean accepted;
+        volatile String callbackResult = "NOT_DISPATCHED";
+        volatile GestureCompletion completion;
+        Request(long target, long deadline, long durationMs,
+                int x, int y, long generation,
+                GestureCompletion completion) {
+            this.target = target;
+            this.deadline = deadline;
+            this.durationMs = durationMs;
+            this.durationNs = durationMs * NS_MS;
+            this.x = x;
+            this.y = y;
+            this.generation = generation;
+            this.completion = completion; }
+        void prepare() {
+            if (path != null) return;
+            prepareStart = SystemClock.elapsedRealtimeNanos();
+            Path p = new Path();
+            p.moveTo(x, y);
+            p.lineTo(x, y);
+            path = p;
+            prepareEnd = SystemClock.elapsedRealtimeNanos(); }
+    }
+
+    private static final class Batch
+            extends AccessibilityService.GestureResultCallback {
+        final AutoClickService owner;
+        final ArrayList<Request> requests;
+        Batch(AutoClickService owner, ArrayList<Request> requests) {
+            this.owner = owner;
+            this.requests = requests;
+        }
+        @Override
+        public void onCompleted(GestureDescription gesture) {
+            owner.finishBatch(this, true);
+        }
+        @Override
+        public void onCancelled(GestureDescription gesture) {
+            owner.finishBatch(this, false); }
+    }
+
+    private static final class Timing {
+        final long target;
+        final long prepareStart;
+        final long prepareEnd;
+        final long enqueue;
+        final long workerStart;
+        final long dispatchStart;
+        final long dispatchDuration;
+        final long completed;
+        final int x;
+        final int y;
+        final boolean accepted;
+        final boolean success;
+        final boolean expired;
+        final String callback;
+        Timing(Request r, boolean success, boolean expired) {
+            target = r.target;
+            prepareStart = r.prepareStart;
+            prepareEnd = r.prepareEnd;
+            enqueue = r.enqueue;
+            workerStart = r.workerStart;
+            dispatchStart = r.dispatchStart;
+            dispatchDuration = r.dispatchDuration;
+            completed = r.completed;
+            x = r.x;
+            y = r.y;
+            accepted = r.accepted;
+            this.success = success;
+            this.expired = expired;
+            callback = r.callbackResult; }
+        String csv() {
+            long prepare = prepareStart == 0 || prepareEnd == 0
+                    ? 0 : prepareEnd - prepareStart;
+            long schedulerDelay = enqueue == 0
+                    ? 0 : enqueue - target;
+            long queueDelay = workerStart == 0 || enqueue == 0
+                    ? 0 : workerStart - enqueue;
+            long dispatchDelay = dispatchStart == 0
+                    ? 0 : dispatchStart - target;
+            long completionDelay = completed == 0
+                    ? 0 : completed - target;
+            String result = expired
+                    ? "EXPIRED"
+                    : success ? "SUCCESS" : "FAILED";
+            return target + "," + prepareStart + "," + prepareEnd + ","
+                    + prepare + "," + enqueue + "," + schedulerDelay + ","
+                    + workerStart + "," + queueDelay + "," + dispatchStart + ","
+                    + dispatchDelay + "," + dispatchDuration + "," + completed + ","
+                    + completionDelay + "," + accepted + "," + result + ","
+                    + callback + "," + x + "," + y; }
+    }
+
+    @Override
+
+    protected void onServiceConnected() {
+        super.onServiceConnected();
+        preferences = getSharedPreferences(PREFS, MODE_PRIVATE);
+        x = preferences.getInt(KEY_X, DEFAULT_X);
+        y = preferences.getInt(KEY_Y, DEFAULT_Y);
+        stopping = false;
+        ready = true;
+        instance = this;
+        startWriter();
+        startPreparer();
+        startScheduler();
+    }
+
+    private void startWriter() {
+        if (writerThread != null && writerThread.isAlive()) return;
+        writerStopping = false;
+        writerThread = new Thread(
+                this::writerLoop, "PrecisionTimingFileWriter");
+        writerThread.start();
+    }
+
+    private void writerLoop() {
+        BufferedWriter out = null;
+        try {
+            File dir = getExternalFilesDir(null);
+            if (dir == null) dir = getFilesDir();
+            if (!dir.exists() && !dir.mkdirs()) {
+                logPath = "خطا: پوشه گزارش ساخته نشد";
+                return; }
+            File file = new File(dir, LOG_FILE);
+            boolean header = !file.exists() || file.length() == 0;
+            out = new BufferedWriter(new OutputStreamWriter(
+                    new FileOutputStream(file, true),
+                    StandardCharsets.UTF_8));
+            logPath = file.getAbsolutePath();
+            if (header) {
+                out.write("target_elapsed_ns,prepare_start_elapsed_ns,"
+                        + "prepare_end_elapsed_ns,prepare_duration_ns,"
+                        + "scheduler_enqueue_elapsed_ns,scheduler_delay_ns,"
+                        + "dispatch_worker_start_elapsed_ns,dispatch_queue_delay_ns,"
+                        + "dispatch_start_elapsed_ns,dispatch_delay_ns,"
+                        + "dispatch_duration_ns,completion_elapsed_ns,"
+                        + "completion_delay_ns,accepted,result,"
+                        + "callback_result,x,y");
+                out.newLine();
+                out.flush(); }
+            while (!writerStopping || !logs.isEmpty()) {
+                Timing item;
+                try {
+                    item = logs.poll(500, TimeUnit.MILLISECONDS);
+                } catch (InterruptedException e) {
+                    continue; }
+                if (item == null) continue;
+                out.write(item.csv());
+                out.newLine();
+                out.flush(); }
+        } catch (IOException e) {
+            logPath = "خطای نوشتن گزارش: " + e.getMessage();
+        } finally {
+            if (out != null) {
+                try {
+                    out.flush();
+                    out.close();
+                } catch (IOException ignored) { } } }
+    }
+
+    private void record(Request r, boolean success, boolean expired) {
+        if (r != null && r.recorded.compareAndSet(false, true)) {
+            logs.offer(new Timing(r, success, expired)); }
+    }
+
+    private void startPreparer() {
+        if (preparer != null && !preparer.isShutdown()) return;
+        preparer = Executors.newSingleThreadExecutor(task ->
+                new Thread(() -> {
+                    try {
+                        Process.setThreadPriority(
+                                Process.THREAD_PRIORITY_URGENT_DISPLAY);
+                    } catch (Exception ignored) { }
+                    task.run();
+                }, "PrecisionGesturePreparation"));
+    }
+
+    private void prepare(Request r) {
+        if (!current(r)) return;
+        try {
+            r.prepare();
+            if (current(r)) {
+                unparkScheduler(); }
+        } catch (Exception e) {
+            boolean removed;
+            synchronized (lock) {
+                removed = pending.remove(r); }
+            if (removed) {
+                r.callbackResult = "PREPARATION_FAILED:"
+                        + e.getClass().getSimpleName();
+                postFinish(r, false, false); }
+            unparkScheduler(); }
+    }
+
+    private void startScheduler() {
+        if (scheduler != null && scheduler.isAlive()) return;
+        scheduler = new Thread(
+                this::schedulerLoop, "PrecisionClickNanoScheduler");
+        scheduler.start();
+    }
+
+    private void schedulerLoop() {
+        try {
+            Process.setThreadPriority(
+                    Process.THREAD_PRIORITY_URGENT_DISPLAY);
+        } catch (Exception ignored) { }
+        while (!stopping) {
+            Request first;
+            synchronized (lock) {
+                first = pending.peekFirst(); }
+            if (first == null) {
+                LockSupport.park(this);
+                continue; }
+            if (!current(first)) {
+                removeHead(first);
+                continue; }
+            if (first.path == null) {
+                LockSupport.park(this);
+                continue; }
+            long due = Math.max(first.target, nextBatchAllowedNs);
+            long remaining = due - SystemClock.elapsedRealtimeNanos();
+            if (remaining > SPIN_NS) {
+                LockSupport.parkNanos(this, remaining - SPIN_NS);
+                continue; }
+            while (!stopping && ready
+                    && first.generation == generation
+                    && SystemClock.elapsedRealtimeNanos() < due) { }
+            if (stopping) break;
+            if (first.generation != generation) {
+                removeHead(first);
+                continue; }
+            ArrayList<Request> batch = collect(first);
+            if (batch.isEmpty()) continue;
+            long now = SystemClock.elapsedRealtimeNanos();
+            for (Request r : batch) {
+                r.enqueue = now; }
+            dispatchBatch(batch); }
+    }
+
+    private ArrayList<Request> collect(Request first) {
+        ArrayList<Request> result = new ArrayList<>(MAX_STROKES);
+        synchronized (lock) {
+            if (pending.peekFirst() != first || !current(first)) {
+                return result; }
+            long base = first.target;
+            long gen = first.generation;
+            while (!pending.isEmpty() && result.size() < MAX_STROKES) {
+                Request r = pending.peekFirst();
+                if (r.generation != gen || r.path == null
+                        || r.target < base) {
+                    break; }
+                long delta = r.target - base;
+                if (delta % NS_MS != 0) break;
+                long offset = delta / NS_MS;
+                if (offset > MAX_DURATION_MS
+                        || r.durationMs > MAX_DURATION_MS - offset) {
+                    break; }
+                r.offsetMs = offset;
+                result.add(pending.pollFirst()); } }
+        return result;
+    }
+
+    private boolean current(Request r) {
+        return r != null
+                && r.generation == generation
+                && ready
+                && !stopping;
+    }
+
+    private void removeHead(Request r) {
+        boolean removed = false;
+        synchronized (lock) {
+            if (pending.peekFirst() == r) {
+                pending.pollFirst();
+                removed = true; } }
+        if (removed) {
+            r.callbackResult = "REMOVED_FROM_PENDING";
+            postFinish(r, false, true); }
+    }
+
+    private GestureDescription buildGesture(List<Request> requests) {
+        GestureDescription.Builder builder =
+                new GestureDescription.Builder();
+        for (Request r : requests) {
+            if (r.path == null) {
+                throw new IllegalStateException("PATH_NOT_PREPARED"); }
+            builder.addStroke(new GestureDescription.StrokeDescription(
+                    r.path, r.offsetMs, r.durationMs)); }
+        return builder.build();
+    }
+
+    private void dispatchBatch(ArrayList<Request> requests) {
+        if (requests.isEmpty()) return;
+        long workerStart = SystemClock.elapsedRealtimeNanos();
+        for (Request r : requests) {
+            r.workerStart = workerStart; }
+        if (!current(requests.get(0))) {
+            finishWithoutDispatch(
+                    requests, "CANCELLED_BEFORE_DISPATCH", true);
+            return; }
+        GestureDescription gesture;
+        try {
+            gesture = buildGesture(requests);
+        } catch (Exception e) {
+            finishWithoutDispatch(
+                    requests,
+                    "BATCH_BUILD_FAILED:" + e.getClass().getSimpleName(),
+                    false);
+            return; }
+        long check = SystemClock.elapsedRealtimeNanos();
+        ArrayList<Request> valid = new ArrayList<>(requests.size());
+        for (Request r : requests) {
+            long needed = r.offsetMs * NS_MS + r.durationNs;
+            if (check < r.deadline && needed <= r.deadline - check
+                    && current(r)) {
+                valid.add(r);
+            } else {
+                r.callbackResult = "DEADLINE_OR_CANCEL_BEFORE_API";
+                postFinish(r, false, true); } }
+        if (valid.isEmpty()) return;
+        if (valid.size() != requests.size()) {
+            requests = valid;
+            try {
+                gesture = buildGesture(requests);
+            } catch (Exception e) {
+                finishWithoutDispatch(
+                        requests,
+                        "BATCH_REBUILD_FAILED:"
+                                + e.getClass().getSimpleName(),
+                        false);
+                return; } }
+        boolean registered;
+        synchronized (lock) {
+            registered = current(requests.get(0));
+            if (registered) {
+                active.addAll(requests); } }
+        if (!registered) {
+            finishWithoutDispatch(
+                    requests, "CANCELLED_BEFORE_API", true);
+            return; }
+        long start = SystemClock.elapsedRealtimeNanos();
+        ArrayList<Request> apiValid = new ArrayList<>(requests.size());
+        for (Request r : requests) {
+            long needed = r.offsetMs * NS_MS + r.durationNs;
+            if (start < r.deadline && needed <= r.deadline - start
+                    && current(r)) {
+                apiValid.add(r);
+            } else {
+                r.callbackResult = "DEADLINE_OR_CANCEL_AT_API_ENTRY";
+                postFinish(r, false, true); } }
+        if (apiValid.size() != requests.size()) {
+            synchronized (lock) {
+                active.removeAll(requests); }
+            if (apiValid.isEmpty()) return;
+            requests = apiValid;
+            try {
+                gesture = buildGesture(requests);
+            } catch (Exception e) {
+                finishWithoutDispatch(
+                        requests,
+                        "BATCH_FINAL_BUILD_FAILED:"
+                                + e.getClass().getSimpleName(),
+                        false);
+                return; }
+            synchronized (lock) {
+                if (!current(requests.get(0))) {
+                    active.removeAll(requests);
+                    finishWithoutDispatch(
+                            requests, "CANCELLED_BEFORE_FINAL_API", true);
+                    return; }
+                active.addAll(requests); }
+            start = SystemClock.elapsedRealtimeNanos();
+            for (Request r : requests) {
+                long needed = r.offsetMs * NS_MS + r.durationNs;
+                if (start >= r.deadline
+                        || needed > r.deadline - start
+                        || !current(r)) {
+                    synchronized (lock) {
+                        active.removeAll(requests); }
+                    finishWithoutDispatch(
+                            requests, "FINAL_DEADLINE_CHECK_FAILED", true);
+                    return; } } }
+        for (Request r : requests) {
+            r.dispatchStart = start;
+            r.callbackResult = "WAITING_FOR_CALLBACK"; }
+        boolean accepted;
+        try {
+            accepted = dispatchGesture(
+                    gesture, new Batch(this, requests), main);
+        } catch (Exception e) {
+            long end = SystemClock.elapsedRealtimeNanos();
+            for (Request r : requests) {
+                r.dispatchDuration = end - start;
+                r.callbackResult = "DISPATCH_EXCEPTION:"
+                        + e.getClass().getSimpleName(); }
+            synchronized (lock) {
+                active.removeAll(requests); }
+            for (Request r : requests) {
+                postFinish(r, false, false); }
+            return; }
+        long end = SystemClock.elapsedRealtimeNanos();
+        for (Request r : requests) {
+            r.dispatchDuration = end - start;
+            r.accepted = accepted; }
+        if (accepted) {
+            long estimatedDurationNs = 0;
+            for (Request r : requests) {
+                long strokeEndNs = r.offsetMs * NS_MS + r.durationNs;
+                if (strokeEndNs > estimatedDurationNs) {
+                    estimatedDurationNs = strokeEndNs;
+                }
+            }
+            nextBatchAllowedNs = start
+                    + estimatedDurationNs * 95L / 100L;
+        }
+        if (!accepted) {
+            for (Request r : requests) {
+                r.callbackResult = "API_RETURNED_FALSE"; }
+            synchronized (lock) {
+                active.removeAll(requests); }
+            for (Request r : requests) {
+                postFinish(r, false, false); } }
+    }
+
+    private void finishWithoutDispatch(
+            List<Request> requests, String reason, boolean expired) {
+        for (Request r : requests) {
+            r.callbackResult = reason;
+            postFinish(r, false, expired); }
+    }
+
+    private void finishBatch(Batch batch, boolean success) {
+        long now = SystemClock.elapsedRealtimeNanos();
+        synchronized (lock) {
+            active.removeAll(batch.requests); }
+        for (Request r : batch.requests) {
+            r.completed = now;
+            r.callbackResult =
+                    success ? "ON_COMPLETED" : "ON_CANCELLED";
+            finish(r, success, false); }
+    }
+
+    private void postFinish(
+            Request r, boolean success, boolean expired) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            finish(r, success, expired);
+        } else {
+            main.post(() -> finish(r, success, expired)); }
+    }
+
+    private void finish(
+            Request r, boolean success, boolean expired) {
+        if (r == null || !r.delivered.compareAndSet(false, true)) {
+            return; }
+        if (r.completed == 0) {
+            r.completed = SystemClock.elapsedRealtimeNanos(); }
+        record(r, success, expired);
+        GestureCompletion callback = r.completion;
+        r.completion = null;
+        if (callback != null) {
+            try {
+                callback.onFinished(success, expired);
+            } catch (Exception ignored) { } }
+    }
+
+    public boolean performClickAtTarget(
+            long targetNanos,
+            long cycleStartNanos,
+            long deadlineNanos,
+            long touchDurationNanos,
+            GestureCompletion completion) {
+        if (!ready || stopping || completion == null
+                || touchDurationNanos < 0
+                || deadlineNanos <= cycleStartNanos
+                || targetNanos < cycleStartNanos
+                || targetNanos >= deadlineNanos) {
+            return false; }
+        long durationMs = toDurationMs(touchDurationNanos);
+        if (durationMs > MAX_DURATION_MS) {
+            return false; }
+        long durationNs = durationMs * NS_MS;
+        if (durationNs > deadlineNanos - targetNanos) {
+            return false; }
+        boolean empty;
+        Request request;
+        synchronized (lock) {
+            if (!ready || stopping || preparer == null
+                    || preparer.isShutdown()) {
+                return false; }
+            request = new Request(
+                    targetNanos,
+                    deadlineNanos,
+                    durationMs,
+                    x,
+                    y,
+                    generation,
+                    completion);
+            empty = pending.isEmpty();
+            pending.offerLast(request);
+            try {
+                preparer.execute(() -> prepare(request));
+            } catch (Exception e) {
+                pending.remove(request);
+                return false; } }
+        if (empty) {
+            unparkScheduler(); }
+        return true;
+    }
+
+    private static long toDurationMs(long nanos) {
+        if (nanos <= 0) return 1;
+        return Math.max(1, (nanos + NS_MS - 1) / NS_MS);
+    }
+
+    private void unparkScheduler() {
+        Thread t = scheduler;
+        if (t != null) {
+            LockSupport.unpark(t); }
+    }
+
+    public void cancelPendingScheduledClick() {
+        cancelPending();
+    }
+
+    private void cancelPending() {
+        List<Request> cancelled = new ArrayList<>();
+        synchronized (lock) {
+            generation++;
+            nextBatchAllowedNs = 0;
+            while (!pending.isEmpty()) {
+                cancelled.add(pending.pollFirst()); } }
+        unparkScheduler();
+        for (Request r : cancelled) {
+            r.callbackResult = "CANCELLED_BEFORE_DISPATCH";
+            postFinish(r, false, true); }
+    }
+
+    @Override
+
+    public void onInterrupt() {
+        cancelPending();
+    }
+
+    @Override
+
+    public void onAccessibilityEvent(AccessibilityEvent event) {
+    }
+
+    @Override
+
+    public void onDestroy() {
+        ready = false;
+        stopping = true;
+        Thread t = scheduler;
+        scheduler = null;
+        if (t != null) {
+            LockSupport.unpark(t);
+            t.interrupt(); }
+        ExecutorService executor = preparer;
+        preparer = null;
+        if (executor != null) {
+            executor.shutdownNow(); }
+        List<Request> waiting = new ArrayList<>();
+        List<Request> running = new ArrayList<>();
+        synchronized (lock) {
+            generation++;
+            while (!pending.isEmpty()) {
+                waiting.add(pending.pollFirst()); }
+            running.addAll(active);
+            active.clear(); }
+        for (Request r : waiting) {
+            r.callbackResult = "SERVICE_DESTROYED_PENDING";
+            finish(r, false, true); }
+        for (Request r : running) {
+            r.callbackResult = "SERVICE_DESTROYED_ACTIVE";
+            finish(r, false, false); }
+        writerStopping = true;
+        if (writerThread != null) {
+            writerThread.interrupt(); }
+        if (instance == this) {
+            instance = null; }
+        preferences = null;
+        super.onDestroy();
+    }
+    public static AutoClickService getInstance() {
+        return instance;
+    }
+    public boolean isServiceReady() {
+        return ready;
+    }
+    public boolean isGestureInProgress() {
+        synchronized (lock) {
+            return !active.isEmpty(); }
+    }
+    public int getTargetX() {
+        return x;
+    }
+    public int getTargetY() {
+        return y;
+    }
+    public String getTimingFilePath() {
+        return logPath;
+    }
+    public void setTarget(int newX, int newY) {
+        int nx = Math.max(0, newX);
+        int ny = Math.max(0, newY);
+        runOnMain(() -> {
+            if (!ready || (x == nx && y == ny)) {
+                return; }
+            x = nx;
+            y = ny;
+            SharedPreferences p = preferences;
+            if (p != null) {
+                p.edit()
+                        .putInt(KEY_X, nx)
+                        .putInt(KEY_Y, ny)
+                        .apply(); }
+        });
+    }
+    private void runOnMain(Runnable action) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            action.run();
+        } else {
+            main.post(action); } } }
