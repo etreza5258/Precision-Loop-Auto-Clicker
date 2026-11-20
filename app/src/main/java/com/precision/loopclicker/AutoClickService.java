@@ -477,15 +477,18 @@ public class AutoClickService extends AccessibilityService {
 
     private void finishBatch(Batch batch, boolean success) {
         long now = SystemClock.elapsedRealtimeNanos();
+
         synchronized (lock) {
             active.removeAll(batch.requests);
         }
+
+        unparkScheduler();
+
         for (Request r : batch.requests) {
             r.completed = now;
             r.callbackResult = success ? "ON_COMPLETED" : "ON_CANCELLED";
             finish(r, success, false);
         }
-        unparkScheduler();
     }
 
     private void postFinish(Request r, boolean success, boolean expired) {
