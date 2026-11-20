@@ -17,7 +17,8 @@ import java.util.concurrent.locks.LockSupport;
 public class AutoClickService extends AccessibilityService {
     private static final long NS_MS = 1_000_000L, SPIN_NS = 5_000_000L;
     private static final long MAX_DURATION_MS = GestureDescription.getMaxGestureDuration();
-    private static final int MAX_STROKES = Math.min(50, GestureDescription.getMaxStrokeCount());
+    private static final int MAX_STROKES = Math.min(10, GestureDescription.getMaxStrokeCount());
+    private static final int MAX_PREPARED_BATCHES = 20;
     private static final String PREFS = "auto_click_target", KEY_X = "target_x",
             KEY_Y = "target_y", LOG_FILE = "PrecisionClickTiming_v3.txt";
     private static final int DEFAULT_X = 350, DEFAULT_Y = 700;
@@ -36,7 +37,8 @@ public class AutoClickService extends AccessibilityService {
     private volatile Thread scheduler, writerThread;
     private volatile ExecutorService preparer;
     private volatile String logPath = "فایل گزارش هنوز ساخته نشده است";
-    private PreparedBatch prepared;
+    private final ArrayDeque<PreparedBatch> preparedBatches =
+            new ArrayDeque<>(MAX_PREPARED_BATCHES);
     private boolean dispatching;
     private SharedPreferences preferences;
     private static final class Request {
@@ -283,64 +285,71 @@ public class AutoClickService extends AccessibilityService {
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY);
         } catch (Exception ignored) { }
         while (!stopping) {
-            PreparedBatch readyBatch;
+            PreparedBatch headBatch;
             Request first;
-            boolean busy, isDispatching;
+            boolean busy, canBuild;
             ArrayList<Request> stale = new ArrayList<>();
             synchronized (lock) {
                 while (!pending.isEmpty() && pending.peekFirst().generation != generation)
                     stale.add(pending.pollFirst());
-                readyBatch = prepared;
+                while (!preparedBatches.isEmpty()
+                        && preparedBatches.peekFirst().requests.get(0).generation != generation) {
+                    PreparedBatch old = preparedBatches.pollFirst();
+                    stale.addAll(old.requests);
+                }
+                headBatch = preparedBatches.peekFirst();
                 first = pending.peekFirst();
-                busy = !active.isEmpty();
-                isDispatching = dispatching;
+                busy = !active.isEmpty() || dispatching;
+                canBuild = preparedBatches.size() < MAX_PREPARED_BATCHES;
             }
             for (Request r : stale) {
                 r.callbackResult = "STALE_GENERATION";
                 postFinish(r, false, true);
             }
             if (stopping) break;
-            if (readyBatch != null) {
-                if (!busy && !isDispatching) {
-                    long remaining = readyBatch.baseTarget
-                            - SystemClock.elapsedRealtimeNanos();
-                    if (remaining > SPIN_NS) {
-                        LockSupport.parkNanos(this, remaining - SPIN_NS);
-                    } else {
-                        while (!stopping && ready
-                                && readyBatch.baseTarget
-                                > SystemClock.elapsedRealtimeNanos()) { }
-                        if (!stopping) dispatchPrepared();
-                    }
-                } else {
-                    LockSupport.park(this);
-                }
+
+            if (headBatch != null && !busy
+                    && headBatch.baseTarget <= SystemClock.elapsedRealtimeNanos()) {
+                dispatchPrepared();
                 continue;
             }
-            if (first == null || first.path == null) {
+
+            // Build future batches while the current Gesture is still running.
+            if (canBuild && first != null && first.path != null) {
+                ArrayList<Request> requests = collect(first);
+                if (!requests.isEmpty()) {
+                    long buildStart = SystemClock.elapsedRealtimeNanos();
+                    for (Request r : requests) r.batchBuildStart = buildStart;
+                    try {
+                        GestureDescription gesture = buildGesture(requests);
+                        long readyTime = SystemClock.elapsedRealtimeNanos();
+                        synchronized (lock) {
+                            if (!stopping && preparedBatches.size() < MAX_PREPARED_BATCHES
+                                    && current(requests.get(0))) {
+                                for (Request r : requests) r.batchReady = readyTime;
+                                preparedBatches.addLast(new PreparedBatch(requests, gesture));
+                            } else {
+                                requeueCurrentInOrder(requests);
+                            }
+                        }
+                    } catch (Exception e) {
+                        finishWithoutDispatch(requests,
+                                "BATCH_BUILD_FAILED:" + e.getClass().getSimpleName(), false);
+                    }
+                    continue;
+                }
+            }
+
+            if (headBatch != null && !busy) {
+                long remaining = headBatch.baseTarget - SystemClock.elapsedRealtimeNanos();
+                if (remaining > 0L) LockSupport.parkNanos(this, remaining);
+                continue;
+            }
+            if (first == null || first.path == null || !canBuild || busy) {
                 LockSupport.park(this);
                 continue;
             }
-            ArrayList<Request> requests = collect(first);
-            if (requests.isEmpty()) continue;
-            long buildStart = SystemClock.elapsedRealtimeNanos();
-            for (Request r : requests) r.batchBuildStart = buildStart;
-            try {
-                GestureDescription gesture = buildGesture(requests);
-                long readyTime = SystemClock.elapsedRealtimeNanos();
-                synchronized (lock) {
-                    if (!stopping && prepared == null && current(requests.get(0))) {
-                        for (Request r : requests) r.batchReady = readyTime;
-                        prepared = new PreparedBatch(requests, gesture);
-                    } else {
-                        requeueCurrentInOrder(requests);
-                    }
-                }
-            } catch (Exception e) {
-                finishWithoutDispatch(requests,
-                        "BATCH_BUILD_FAILED:" + e.getClass().getSimpleName(), false);
-            }
-            unparkScheduler();
+            LockSupport.park(this);
         }
     }
     private void requeueCurrentInOrder(List<Request> requests) {
@@ -399,9 +408,11 @@ public class AutoClickService extends AccessibilityService {
     private void dispatchPrepared() {
         PreparedBatch batch;
         synchronized (lock) {
-            if (prepared == null || !active.isEmpty() || dispatching || stopping
-                    || SystemClock.elapsedRealtimeNanos() < prepared.baseTarget) return;
-            batch = prepared; prepared = null; dispatching = true;
+            if (preparedBatches.isEmpty() || !active.isEmpty() || dispatching || stopping
+                    || SystemClock.elapsedRealtimeNanos()
+                    < preparedBatches.peekFirst().baseTarget) return;
+            batch = preparedBatches.pollFirst();
+            dispatching = true;
         }
         long workerStart = SystemClock.elapsedRealtimeNanos();
         ArrayList<Request> valid = new ArrayList<>(), expired = new ArrayList<>();
@@ -579,14 +590,12 @@ public class AutoClickService extends AccessibilityService {
     }
     private void cancelPending() {
         List<Request> cancelled = new ArrayList<>();
-        PreparedBatch oldPrepared;
         synchronized (lock) {
             generation++;
             while (!pending.isEmpty()) cancelled.add(pending.pollFirst());
-            oldPrepared = prepared;
-            prepared = null;
+            while (!preparedBatches.isEmpty())
+                cancelled.addAll(preparedBatches.pollFirst().requests);
         }
-        if (oldPrepared != null) cancelled.addAll(oldPrepared.requests);
         unparkScheduler();
         for (Request r : cancelled) {
             r.callbackResult = "CANCELLED_BEFORE_DISPATCH";
@@ -614,8 +623,8 @@ public class AutoClickService extends AccessibilityService {
         synchronized (lock) {
             generation++;
             while (!pending.isEmpty()) waiting.add(pending.pollFirst());
-            if (prepared != null) waiting.addAll(prepared.requests);
-            prepared = null;
+            while (!preparedBatches.isEmpty())
+                waiting.addAll(preparedBatches.pollFirst().requests);
             running.addAll(active);
             active.clear();
         }
