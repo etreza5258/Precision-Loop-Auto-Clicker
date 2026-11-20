@@ -23,7 +23,7 @@ public class AutoClickService extends AccessibilityService {
     private static final long MAX_DURATION_MS = GestureDescription.getMaxGestureDuration();
     private static final int MAX_STROKES = Math.min(50, GestureDescription.getMaxStrokeCount());
     private static final String PREFS = "auto_click_target", KEY_X = "target_x",
-            KEY_Y = "target_y", LOG_FILE = "PrecisionClickTiming_v2.txt";
+            KEY_Y = "target_y", LOG_FILE = "PrecisionClickTiming_v3.txt";
     private static final int DEFAULT_X = 350, DEFAULT_Y = 700;
     private static volatile AutoClickService instance;
 
@@ -43,6 +43,7 @@ public class AutoClickService extends AccessibilityService {
     private volatile Thread scheduler, writerThread;
     private volatile ExecutorService preparer;
     private volatile String logPath = "فایل گزارش هنوز ساخته نشده است";
+
     private PreparedBatch prepared;
     private boolean dispatching;
     private SharedPreferences preferences;
@@ -51,8 +52,10 @@ public class AutoClickService extends AccessibilityService {
         final long target, deadline, durationMs, durationNs, generation;
         final int x, y;
         final AtomicBoolean recorded = new AtomicBoolean(), delivered = new AtomicBoolean();
+
         volatile Path path;
-        volatile long offsetMs, prepareStart, prepareEnd, enqueue, workerStart;
+        volatile long offsetMs, prepareStart, prepareEnd;
+        volatile long batchBuildStart, batchReady, workerStart;
         volatile long dispatchStart, dispatchDuration, completed, callbackElapsed;
         volatile long previousCallbackElapsed, handoffDelay;
         volatile boolean accepted;
@@ -94,7 +97,6 @@ public class AutoClickService extends AccessibilityService {
         }
     }
 
-    // Callback and dispatchGesture return may arrive in either order.
     private static final class Batch extends GestureResultCallback {
         final AutoClickService owner;
         final ArrayList<Request> requests;
@@ -106,8 +108,13 @@ public class AutoClickService extends AccessibilityService {
             this.requests = requests;
         }
 
-        @Override public void onCompleted(GestureDescription g) { receive(true); }
-        @Override public void onCancelled(GestureDescription g) { receive(false); }
+        @Override public void onCompleted(GestureDescription g) {
+            receive(true);
+        }
+
+        @Override public void onCancelled(GestureDescription g) {
+            receive(false);
+        }
 
         private void receive(boolean result) {
             boolean process;
@@ -135,9 +142,10 @@ public class AutoClickService extends AccessibilityService {
     }
 
     private static final class Timing {
-        final long target, prepareStart, prepareEnd, enqueue, workerStart;
-        final long dispatchStart, dispatchDuration, completed;
-        final long callbackElapsed, previousCallbackElapsed, handoffDelay;
+        final long target, prepareStart, prepareEnd;
+        final long batchBuildStart, batchReady, workerStart;
+        final long dispatchStart, dispatchDuration, completed, callbackElapsed;
+        final long previousCallbackElapsed, handoffDelay;
         final int x, y;
         final boolean accepted, success, expired;
         final String callback;
@@ -146,7 +154,8 @@ public class AutoClickService extends AccessibilityService {
             target = r.target;
             prepareStart = r.prepareStart;
             prepareEnd = r.prepareEnd;
-            enqueue = r.enqueue;
+            batchBuildStart = r.batchBuildStart;
+            batchReady = r.batchReady;
             workerStart = r.workerStart;
             dispatchStart = r.dispatchStart;
             dispatchDuration = r.dispatchDuration;
@@ -163,16 +172,31 @@ public class AutoClickService extends AccessibilityService {
         }
 
         String csv() {
-            long prepare = prepareStart == 0 || prepareEnd == 0 ? 0 : prepareEnd - prepareStart;
-            long schedulerDelay = enqueue == 0 ? 0 : enqueue - target;
-            long queueDelay = workerStart == 0 || enqueue == 0 ? 0 : workerStart - enqueue;
-            long dispatchDelay = dispatchStart == 0 ? 0 : dispatchStart - target;
+            long prepare = prepareStart == 0 || prepareEnd == 0
+                    ? 0 : prepareEnd - prepareStart;
+            long build = batchBuildStart == 0 || batchReady == 0
+                    ? 0 : batchReady - batchBuildStart;
+            long readyToWorker = batchReady == 0 || workerStart == 0
+                    ? 0 : workerStart - batchReady;
+            long targetWait = batchReady == 0
+                    ? 0 : Math.max(0, target - batchReady);
+            long previousWait = batchReady == 0 || previousCallbackElapsed == 0
+                    ? 0 : Math.max(0, previousCallbackElapsed - batchReady);
+            long dispatchDelta = dispatchStart == 0 ? 0 : dispatchStart - target;
+            long pipeline = dispatchStart == 0 || workerStart == 0
+                    ? 0 : dispatchStart - workerStart;
             long completionDelay = completed == 0 ? 0 : completed - target;
+            long dispatchToCallback = dispatchStart == 0 || callbackElapsed == 0
+                    ? 0 : callbackElapsed - dispatchStart;
+
             String result = expired ? "EXPIRED" : success ? "SUCCESS" : "FAILED";
+
             return target + "," + prepareStart + "," + prepareEnd + "," + prepare + ","
-                    + enqueue + "," + schedulerDelay + "," + workerStart + "," + queueDelay
-                    + "," + dispatchStart + "," + dispatchDelay + "," + dispatchDuration
-                    + "," + completed + "," + completionDelay + "," + accepted + ","
+                    + batchBuildStart + "," + batchReady + "," + build + ","
+                    + workerStart + "," + readyToWorker + "," + targetWait + ","
+                    + previousWait + "," + dispatchStart + "," + dispatchDelta + ","
+                    + pipeline + "," + dispatchDuration + "," + completed + ","
+                    + completionDelay + "," + dispatchToCallback + "," + accepted + ","
                     + result + "," + callback + "," + x + "," + y + ","
                     + callbackElapsed + "," + previousCallbackElapsed + "," + handoffDelay;
         }
@@ -207,6 +231,7 @@ public class AutoClickService extends AccessibilityService {
                 logPath = "خطا: پوشه گزارش ساخته نشد";
                 return;
             }
+
             File file = new File(dir, LOG_FILE);
             boolean header = !file.exists() || file.length() == 0;
             out = new BufferedWriter(new OutputStreamWriter(
@@ -215,11 +240,13 @@ public class AutoClickService extends AccessibilityService {
 
             if (header) {
                 out.write("target_elapsed_ns,prepare_start_elapsed_ns,prepare_end_elapsed_ns,"
-                        + "prepare_duration_ns,scheduler_enqueue_elapsed_ns,scheduler_delay_ns,"
-                        + "dispatch_worker_start_elapsed_ns,dispatch_queue_delay_ns,"
-                        + "dispatch_start_elapsed_ns,dispatch_delay_ns,dispatch_duration_ns,"
-                        + "completion_elapsed_ns,completion_delay_ns,accepted,result,"
-                        + "callback_result,x,y,callback_elapsed_ns,"
+                        + "prepare_duration_ns,batch_build_start_elapsed_ns,batch_ready_elapsed_ns,"
+                        + "batch_build_duration_ns,dispatch_worker_start_elapsed_ns,"
+                        + "batch_ready_to_worker_ns,target_wait_ns,previous_callback_wait_ns,"
+                        + "dispatch_start_elapsed_ns,dispatch_start_delta_ns,"
+                        + "dispatch_pipeline_delay_ns,dispatch_duration_ns,"
+                        + "completion_elapsed_ns,completion_delay_ns,dispatch_to_callback_ns,"
+                        + "accepted,result,callback_result,x,y,callback_elapsed_ns,"
                         + "previous_callback_elapsed_ns,handoff_delay_ns");
                 out.newLine();
                 out.flush();
@@ -240,10 +267,12 @@ public class AutoClickService extends AccessibilityService {
         } catch (IOException e) {
             logPath = "خطای نوشتن گزارش: " + e.getMessage();
         } finally {
-            if (out != null) try {
-                out.flush();
-                out.close();
-            } catch (IOException ignored) { }
+            if (out != null) {
+                try {
+                    out.flush();
+                    out.close();
+                } catch (IOException ignored) { }
+            }
         }
     }
 
@@ -313,14 +342,19 @@ public class AutoClickService extends AccessibilityService {
 
             if (readyBatch != null) {
                 if (!busy && !isDispatching) {
-                    long remaining = readyBatch.baseTarget - SystemClock.elapsedRealtimeNanos();
-                    if (remaining > SPIN_NS) LockSupport.parkNanos(this, remaining - SPIN_NS);
-                    else {
+                    long remaining = readyBatch.baseTarget
+                            - SystemClock.elapsedRealtimeNanos();
+                    if (remaining > SPIN_NS) {
+                        LockSupport.parkNanos(this, remaining - SPIN_NS);
+                    } else {
                         while (!stopping && ready
-                                && readyBatch.baseTarget > SystemClock.elapsedRealtimeNanos()) { }
+                                && readyBatch.baseTarget
+                                > SystemClock.elapsedRealtimeNanos()) { }
                         if (!stopping) dispatchPrepared();
                     }
-                } else LockSupport.park(this);
+                } else {
+                    LockSupport.park(this);
+                }
                 continue;
             }
 
@@ -331,15 +365,21 @@ public class AutoClickService extends AccessibilityService {
 
             ArrayList<Request> requests = collect(first);
             if (requests.isEmpty()) continue;
-            long now = SystemClock.elapsedRealtimeNanos();
-            for (Request r : requests) r.enqueue = now;
+
+            long buildStart = SystemClock.elapsedRealtimeNanos();
+            for (Request r : requests) r.batchBuildStart = buildStart;
 
             try {
                 GestureDescription gesture = buildGesture(requests);
+                long readyTime = SystemClock.elapsedRealtimeNanos();
+
                 synchronized (lock) {
-                    if (!stopping && prepared == null && current(requests.get(0)))
+                    if (!stopping && prepared == null && current(requests.get(0))) {
+                        for (Request r : requests) r.batchReady = readyTime;
                         prepared = new PreparedBatch(requests, gesture);
-                    else requeueCurrentInOrder(requests);
+                    } else {
+                        requeueCurrentInOrder(requests);
+                    }
                 }
             } catch (Exception e) {
                 finishWithoutDispatch(requests,
@@ -358,17 +398,23 @@ public class AutoClickService extends AccessibilityService {
 
     private ArrayList<Request> collect(Request first) {
         ArrayList<Request> result = new ArrayList<>(MAX_STROKES);
+
         synchronized (lock) {
             if (pending.peekFirst() != first || !current(first)) return result;
+
             long base = first.target, gen = first.generation;
 
             while (!pending.isEmpty() && result.size() < MAX_STROKES) {
                 Request r = pending.peekFirst();
                 if (r.generation != gen || r.path == null || r.target < base) break;
+
                 long delta = r.target - base;
                 if (delta % NS_MS != 0) break;
+
                 long offset = delta / NS_MS;
-                if (offset > MAX_DURATION_MS || r.durationMs > MAX_DURATION_MS - offset) break;
+                if (offset > MAX_DURATION_MS
+                        || r.durationMs > MAX_DURATION_MS - offset) break;
+
                 r.offsetMs = offset;
                 result.add(pending.pollFirst());
             }
@@ -382,40 +428,50 @@ public class AutoClickService extends AccessibilityService {
 
     private GestureDescription buildGesture(List<Request> requests) {
         GestureDescription.Builder builder = new GestureDescription.Builder();
+
         for (Request r : requests) {
             if (r.path == null) throw new IllegalStateException("PATH_NOT_PREPARED");
-            builder.addStroke(new GestureDescription.StrokeDescription(r.path, r.offsetMs, r.durationMs));
+            builder.addStroke(new GestureDescription.StrokeDescription(
+                    r.path, r.offsetMs, r.durationMs));
         }
         return builder.build();
     }
 
     private boolean fitsDeadline(Request r, long start) {
         if (start >= r.deadline) return false;
-        long offset = r.offsetMs * NS_MS, remaining = r.deadline - start;
+
+        long offset = r.offsetMs * NS_MS;
+        long remaining = r.deadline - start;
+
         return offset <= remaining && r.durationNs <= remaining - offset;
     }
 
     private void dispatchPrepared() {
         PreparedBatch batch;
+
         synchronized (lock) {
             if (prepared == null || !active.isEmpty() || dispatching || stopping) return;
             if (SystemClock.elapsedRealtimeNanos() < prepared.baseTarget) return;
+
             batch = prepared;
             prepared = null;
             dispatching = true;
         }
 
         long workerStart = SystemClock.elapsedRealtimeNanos();
-        ArrayList<Request> valid = new ArrayList<>(), expired = new ArrayList<>();
+        ArrayList<Request> valid = new ArrayList<>();
+        ArrayList<Request> expired = new ArrayList<>();
 
         for (Request r : batch.requests) {
             r.workerStart = workerStart;
-            if (current(r) && fitsDeadline(r, workerStart)) valid.add(r);
-            else {
+            if (current(r) && fitsDeadline(r, workerStart)) {
+                valid.add(r);
+            } else {
                 r.callbackResult = "DEADLINE_OR_CANCEL_BEFORE_API";
                 expired.add(r);
             }
         }
+
         for (Request r : expired) postFinish(r, false, true);
 
         if (valid.isEmpty()) {
@@ -424,10 +480,9 @@ public class AutoClickService extends AccessibilityService {
             return;
         }
 
-        Batch callback = new Batch(this, valid);
-
         while (!valid.isEmpty() && !stopping) {
             GestureDescription gesture;
+
             try {
                 gesture = valid.size() == batch.requests.size()
                         ? batch.gesture : buildGesture(valid);
@@ -440,24 +495,28 @@ public class AutoClickService extends AccessibilityService {
             }
 
             ArrayList<Request> invalid = new ArrayList<>();
+            Batch callback = null;
             boolean aborted = false, accepted = false, called = false, exception = false;
             long start = 0, end = 0, previousCallback = 0;
             String exceptionName = "";
 
-            // بررسی Deadline و ثبت active با لغو درخواست هماهنگ است.
             synchronized (lock) {
                 if (stopping || !current(valid.get(0)) || !active.isEmpty()) {
                     dispatching = false;
                     aborted = true;
                 } else {
                     long now = SystemClock.elapsedRealtimeNanos();
-                    for (Request r : valid)
-                        if (!current(r) || !fitsDeadline(r, now)) invalid.add(r);
 
-                    if (!invalid.isEmpty()) valid.removeAll(invalid);
-                    else {
+                    for (Request r : valid) {
+                        if (!current(r) || !fitsDeadline(r, now)) invalid.add(r);
+                    }
+
+                    if (!invalid.isEmpty()) {
+                        valid.removeAll(invalid);
+                    } else {
                         start = now;
                         previousCallback = lastCallbackElapsed;
+
                         for (Request r : valid) {
                             r.dispatchStart = start;
                             r.previousCallbackElapsed = previousCallback;
@@ -465,19 +524,26 @@ public class AutoClickService extends AccessibilityService {
                                     : Math.max(0, start - previousCallback);
                             r.callbackResult = "WAITING_FOR_CALLBACK";
                         }
+
+                        // Callback فقط برای درخواست‌های نهایی همین Gesture ساخته می‌شود.
+                        callback = new Batch(this, valid);
                         active.addAll(valid);
                         called = true;
+
                         try {
                             accepted = dispatchGesture(gesture, callback, main);
                         } catch (Exception e) {
                             exception = true;
                             exceptionName = e.getClass().getSimpleName();
                         }
+
                         end = SystemClock.elapsedRealtimeNanos();
+
                         for (Request r : valid) {
                             r.dispatchDuration = end - start;
                             r.accepted = accepted;
                         }
+
                         if (!accepted || exception) active.removeAll(valid);
                         dispatching = false;
                     }
@@ -495,6 +561,7 @@ public class AutoClickService extends AccessibilityService {
                     r.callbackResult = "FINAL_DEADLINE_CHECK_FAILED";
                     postFinish(r, false, true);
                 }
+
                 if (valid.isEmpty()) {
                     clearDispatching();
                     unparkScheduler();
@@ -513,6 +580,7 @@ public class AutoClickService extends AccessibilityService {
             if (exception || !accepted) {
                 String reason = exception ? "DISPATCH_EXCEPTION:" + exceptionName
                         : "API_RETURNED_FALSE";
+
                 for (Request r : valid) r.callbackResult = reason;
                 finishWithoutDispatch(valid, reason, false);
                 unparkScheduler();
@@ -525,7 +593,8 @@ public class AutoClickService extends AccessibilityService {
         }
 
         clearDispatching();
-        if (!valid.isEmpty()) finishWithoutDispatch(valid, "SERVICE_STOPPING", true);
+        if (!valid.isEmpty())
+            finishWithoutDispatch(valid, "SERVICE_STOPPING", true);
         unparkScheduler();
     }
 
@@ -535,7 +604,8 @@ public class AutoClickService extends AccessibilityService {
         }
     }
 
-    private void finishWithoutDispatch(List<Request> requests, String reason, boolean expired) {
+    private void finishWithoutDispatch(List<Request> requests,
+            String reason, boolean expired) {
         for (Request r : requests) {
             r.callbackResult = reason;
             postFinish(r, false, expired);
@@ -546,6 +616,7 @@ public class AutoClickService extends AccessibilityService {
         synchronized (lock) {
             active.removeAll(batch.requests);
         }
+
         lastCallbackElapsed = callbackTime;
 
         for (Request r : batch.requests) {
@@ -554,32 +625,29 @@ public class AutoClickService extends AccessibilityService {
             r.callbackResult = success ? "ON_COMPLETED" : "ON_CANCELLED";
         }
 
-        tryDispatchAfterCallback();
-        for (Request r : batch.requests) finish(r, success, false);
+        // فقط زمان‌بند اختصاصی اجازه شروع Gesture بعدی را دارد.
         unparkScheduler();
-    }
 
-    private void tryDispatchAfterCallback() {
-        PreparedBatch batch;
-        synchronized (lock) {
-            if (!active.isEmpty() || dispatching || prepared == null || stopping) return;
-            batch = prepared;
-        }
-        if (SystemClock.elapsedRealtimeNanos() >= batch.baseTarget) dispatchPrepared();
-        else unparkScheduler();
+        for (Request r : batch.requests) finish(r, success, false);
     }
 
     private void postFinish(Request r, boolean success, boolean expired) {
-        if (Looper.myLooper() == Looper.getMainLooper()) finish(r, success, expired);
-        else main.post(() -> finish(r, success, expired));
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            finish(r, success, expired);
+        } else {
+            main.post(() -> finish(r, success, expired));
+        }
     }
 
     private void finish(Request r, boolean success, boolean expired) {
         if (r == null || !r.delivered.compareAndSet(false, true)) return;
+
         if (r.completed == 0) r.completed = SystemClock.elapsedRealtimeNanos();
         record(r, success, expired);
+
         GestureCompletion callback = r.completion;
         r.completion = null;
+
         if (callback != null) {
             try {
                 callback.onFinished(success, expired);
@@ -595,14 +663,19 @@ public class AutoClickService extends AccessibilityService {
 
         long durationMs = toDurationMs(touchDurationNanos);
         if (durationMs > MAX_DURATION_MS) return false;
+
         long durationNs = durationMs * NS_MS;
         if (durationNs > deadlineNanos - targetNanos) return false;
 
         synchronized (lock) {
-            if (!ready || stopping || preparer == null || preparer.isShutdown()) return false;
+            if (!ready || stopping || preparer == null || preparer.isShutdown())
+                return false;
+
             Request r = new Request(targetNanos, deadlineNanos, durationMs,
                     x, y, generation, completion);
+
             pending.offerLast(r);
+
             try {
                 preparer.execute(() -> prepare(r));
             } catch (Exception e) {
@@ -610,6 +683,7 @@ public class AutoClickService extends AccessibilityService {
                 return false;
             }
         }
+
         unparkScheduler();
         return true;
     }
@@ -634,7 +708,9 @@ public class AutoClickService extends AccessibilityService {
 
         synchronized (lock) {
             generation++;
+
             while (!pending.isEmpty()) cancelled.add(pending.pollFirst());
+
             oldPrepared = prepared;
             prepared = null;
         }
@@ -660,6 +736,7 @@ public class AutoClickService extends AccessibilityService {
 
         Thread t = scheduler;
         scheduler = null;
+
         if (t != null) {
             LockSupport.unpark(t);
             t.interrupt();
@@ -669,12 +746,17 @@ public class AutoClickService extends AccessibilityService {
         preparer = null;
         if (executor != null) executor.shutdownNow();
 
-        List<Request> waiting = new ArrayList<>(), running = new ArrayList<>();
+        List<Request> waiting = new ArrayList<>();
+        List<Request> running = new ArrayList<>();
+
         synchronized (lock) {
             generation++;
+
             while (!pending.isEmpty()) waiting.add(pending.pollFirst());
+
             if (prepared != null) waiting.addAll(prepared.requests);
             prepared = null;
+
             running.addAll(active);
             active.clear();
         }
@@ -683,6 +765,7 @@ public class AutoClickService extends AccessibilityService {
             r.callbackResult = "SERVICE_DESTROYED_PENDING";
             finish(r, false, true);
         }
+
         for (Request r : running) {
             r.callbackResult = "SERVICE_DESTROYED_ACTIVE";
             finish(r, false, false);
@@ -690,13 +773,19 @@ public class AutoClickService extends AccessibilityService {
 
         writerStopping = true;
         if (writerThread != null) writerThread.interrupt();
+
         if (instance == this) instance = null;
         preferences = null;
         super.onDestroy();
     }
 
-    public static AutoClickService getInstance() { return instance; }
-    public boolean isServiceReady() { return ready; }
+    public static AutoClickService getInstance() {
+        return instance;
+    }
+
+    public boolean isServiceReady() {
+        return ready;
+    }
 
     public boolean isGestureInProgress() {
         synchronized (lock) {
@@ -704,23 +793,38 @@ public class AutoClickService extends AccessibilityService {
         }
     }
 
-    public int getTargetX() { return x; }
-    public int getTargetY() { return y; }
-    public String getTimingFilePath() { return logPath; }
+    public int getTargetX() {
+        return x;
+    }
+
+    public int getTargetY() {
+        return y;
+    }
+
+    public String getTimingFilePath() {
+        return logPath;
+    }
 
     public void setTarget(int newX, int newY) {
         int nx = Math.max(0, newX), ny = Math.max(0, newY);
+
         runOnMain(() -> {
             if (!ready || (x == nx && y == ny)) return;
+
             x = nx;
             y = ny;
+
             SharedPreferences p = preferences;
-            if (p != null) p.edit().putInt(KEY_X, nx).putInt(KEY_Y, ny).apply();
+            if (p != null)
+                p.edit().putInt(KEY_X, nx).putInt(KEY_Y, ny).apply();
         });
     }
 
     private void runOnMain(Runnable action) {
-        if (Looper.myLooper() == Looper.getMainLooper()) action.run();
-        else main.post(action);
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            action.run();
+        } else {
+            main.post(action);
+        }
     }
 }
