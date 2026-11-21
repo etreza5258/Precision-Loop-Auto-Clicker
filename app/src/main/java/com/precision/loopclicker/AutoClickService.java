@@ -56,6 +56,8 @@ public class AutoClickService extends AccessibilityService {
         volatile long offsetMs, prepareStart, prepareEnd, batchBuildStart, batchReady,
                 workerStart, dispatchStart, dispatchDuration, completed, callbackElapsed,
                 previousCallbackElapsed, handoffDelay, lastStrokeEndElapsed;
+        volatile long schedulerParkStart, schedulerWakeTarget, schedulerParkReturn,
+                schedulerWakeLateness, schedulerSpinDuration;
         volatile boolean accepted;
         volatile String callbackResult="NOT_DISPATCHED";
         volatile GestureCompletion completion;
@@ -126,6 +128,8 @@ public class AutoClickService extends AccessibilityService {
         final long target,prepareStart,prepareEnd,batchBuildStart,batchReady,workerStart,
                 dispatchStart,dispatchDuration,completed,callbackElapsed,
                 previousCallbackElapsed,handoffDelay,lastStrokeEndElapsed;
+        final long schedulerParkStart,schedulerWakeTarget,schedulerParkReturn,
+                schedulerWakeLateness,schedulerSpinDuration;
         final int x,y;
         final boolean accepted,success,expired;
         final String callback;
@@ -138,6 +142,11 @@ public class AutoClickService extends AccessibilityService {
             callbackElapsed=r.callbackElapsed;
             previousCallbackElapsed=r.previousCallbackElapsed;
             handoffDelay=r.handoffDelay; lastStrokeEndElapsed=r.lastStrokeEndElapsed;
+            schedulerParkStart=r.schedulerParkStart;
+            schedulerWakeTarget=r.schedulerWakeTarget;
+            schedulerParkReturn=r.schedulerParkReturn;
+            schedulerWakeLateness=r.schedulerWakeLateness;
+            schedulerSpinDuration=r.schedulerSpinDuration;
             x=r.x; y=r.y; accepted=r.accepted;
             this.success=success; this.expired=expired; callback=r.callbackResult;
         }
@@ -156,7 +165,11 @@ public class AutoClickService extends AccessibilityService {
                     callbackElapsed-dispatchStart;
             long lastStrokeToCallback=lastStrokeEndElapsed==0||callbackElapsed==0?0:
                     callbackElapsed-lastStrokeEndElapsed;
+            long wakeToWorker=schedulerParkReturn==0||workerStart==0?0:
+                    workerStart-schedulerParkReturn;
+            long workerQueueDelay=pipeline;
             String result=expired?"EXPIRED":success?"SUCCESS":"FAILED";
+
             return target+","+prepareStart+","+prepareEnd+","+prepare+","+
                     batchBuildStart+","+batchReady+","+build+","+workerStart+","+
                     readyToWorker+","+targetWait+","+previousWait+","+dispatchStart+","+
@@ -164,7 +177,10 @@ public class AutoClickService extends AccessibilityService {
                     completionDelay+","+dispatchToCallback+","+accepted+","+result+","+
                     callback+","+x+","+y+","+callbackElapsed+","+
                     previousCallbackElapsed+","+handoffDelay+","+
-                    lastStrokeEndElapsed+","+lastStrokeToCallback;
+                    lastStrokeEndElapsed+","+lastStrokeToCallback+","+
+                    schedulerParkStart+","+schedulerWakeTarget+","+
+                    schedulerParkReturn+","+schedulerWakeLateness+","+
+                    schedulerSpinDuration+","+wakeToWorker+","+workerQueueDelay;
         }
     }
 
@@ -216,7 +232,11 @@ public class AutoClickService extends AccessibilityService {
                         "completion_elapsed_ns,completion_delay_ns,dispatch_to_callback_ns,"+
                         "accepted,result,callback_result,x,y,callback_elapsed_ns,"+
                         "previous_callback_elapsed_ns,handoff_delay_ns,"+
-                        "last_stroke_end_elapsed_ns,last_stroke_to_callback_ns");
+                        "last_stroke_end_elapsed_ns,last_stroke_to_callback_ns,"+
+                        "scheduler_park_start_ns,scheduler_wake_target_ns,"+
+                        "scheduler_park_return_ns,scheduler_wake_lateness_ns,"+
+                        "scheduler_spin_duration_ns,scheduler_wake_to_worker_ns,"+
+                        "dispatch_worker_queue_delay_ns");
                 out.newLine(); out.flush();
             }
             while(!writerStopping||!logs.isEmpty()) {
@@ -267,6 +287,24 @@ public class AutoClickService extends AccessibilityService {
         if(scheduler!=null&&scheduler.isAlive())return;
         scheduler=new Thread(this::schedulerLoop,"PrecisionClickNanoScheduler");
         scheduler.start();
+    }
+
+    private void parkForBatch(PreparedBatch batch,long wakeTarget) {
+        long parkStart=SystemClock.elapsedRealtimeNanos();
+        for(Request r:batch.requests) {
+            r.schedulerParkStart=parkStart;
+            r.schedulerWakeTarget=wakeTarget;
+            r.schedulerSpinDuration=0;
+        }
+
+        LockSupport.parkNanos(this,Math.max(1,wakeTarget-parkStart));
+
+        long parkReturn=SystemClock.elapsedRealtimeNanos();
+        long lateness=Math.max(0,parkReturn-wakeTarget);
+        for(Request r:batch.requests) {
+            r.schedulerParkReturn=parkReturn;
+            r.schedulerWakeLateness=lateness;
+        }
     }
 
     private void schedulerLoop() {
@@ -336,9 +374,9 @@ public class AutoClickService extends AccessibilityService {
             }
 
             if(headBatch!=null&&!busy) {
-                long remaining=headBatch.baseTarget-DISPATCH_LEAD_NS-
-                        SystemClock.elapsedRealtimeNanos();
-                if(remaining>0)LockSupport.parkNanos(this,remaining);
+                long wakeTarget=headBatch.baseTarget-DISPATCH_LEAD_NS;
+                long remaining=wakeTarget-SystemClock.elapsedRealtimeNanos();
+                if(remaining>0)parkForBatch(headBatch,wakeTarget);
                 continue;
             }
 
