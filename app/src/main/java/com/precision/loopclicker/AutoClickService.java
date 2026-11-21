@@ -7,7 +7,6 @@ import android.content.SharedPreferences;
 import android.graphics.Path;
 import android.os.*;
 import android.view.accessibility.AccessibilityEvent;
-
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
@@ -16,90 +15,67 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 
 public class AutoClickService extends AccessibilityService {
-    private static final long NS_MS=1_000_000L, DISPATCH_LEAD_MS=12L;
-    private static final long DISPATCH_LEAD_NS=DISPATCH_LEAD_MS*NS_MS;
+    private static final long NS_MS=1_000_000L;
+    private static final long LEAD_MS=12,LEAD_NS=LEAD_MS*NS_MS;
+    private static final long SPIN_NS=1_000_000L;
     private static final long MAX_DURATION_MS=GestureDescription.getMaxGestureDuration();
     private static final int MAX_STROKES=GestureDescription.getMaxStrokeCount();
-    private static final int MAX_PREPARED_BATCHES=20;
-    private static final String PREFS="auto_click_target",KEY_X="target_x",
-            KEY_Y="target_y",LOG_FILE="PrecisionClickTiming_v3.txt";
+    private static final int MAX_PREPARED=20;
+    private static final String PREFS="auto_click_target",KEY_X="target_x",KEY_Y="target_y";
+    private static final String LOG_FILE="PrecisionClickTiming_v5.txt";
     private static final int DEFAULT_X=350,DEFAULT_Y=700;
     private static volatile AutoClickService instance;
 
-    public interface GestureCompletion {
-        void onFinished(boolean success,boolean expired);
-    }
+    public interface GestureCompletion { void onFinished(boolean success,boolean expired); }
 
     private final Handler main=new Handler(Looper.getMainLooper());
     private volatile HandlerThread callbackThread;
     private volatile Handler callbackHandler;
     private final Object lock=new Object();
     private final ArrayDeque<Request> pending=new ArrayDeque<>(128);
-    private final ArrayList<Request> active=new ArrayList<>(64);
-    private final ArrayList<Request> callbackPending=new ArrayList<>(64);
+    private final ArrayList<Request> building=new ArrayList<>(),active=new ArrayList<>(64),callbackPending=new ArrayList<>(64);
     private final LinkedBlockingQueue<Timing> logs=new LinkedBlockingQueue<>();
+    private final PriorityQueue<PreparedBatch> prepared=new PriorityQueue<>(MAX_PREPARED,Comparator.comparingLong(b->b.baseTarget));
 
     private volatile boolean ready,stopping,writerStopping;
     private volatile int x=DEFAULT_X,y=DEFAULT_Y;
-    private volatile long generation,lastCallbackElapsed;
-    private volatile long lastSchedulerUnparkElapsed=-1;
-    private volatile Thread scheduler,writerThread;
-    private volatile ExecutorService preparer,dispatchExecutor;
+    private volatile long generation,lastCallbackElapsed,lastSchedulerUnparkElapsed=-1,activeRelease;
+    private volatile Thread scheduler,worker,writerThread;
+    private volatile ExecutorService preparer;
     private volatile String logPath="فایل گزارش هنوز ساخته نشده است";
-
-    private final ArrayDeque<PreparedBatch> preparedBatches=
-            new ArrayDeque<>(MAX_PREPARED_BATCHES);
-
     private boolean dispatching;
-    private long activeGestureReleaseElapsed;
+    private PreparedBatch workerCurrentBatch;
     private SharedPreferences preferences;
 
     private static final class Request {
-        final long target,deadline,durationMs,durationNs,generation;
+        final long target,deadline,durationMs,generation;
         final int x,y;
         final AtomicBoolean recorded=new AtomicBoolean(),delivered=new AtomicBoolean();
-
         volatile Path path;
         volatile long offsetMs;
         volatile long prepareStart=-1,prepareEnd=-1,batchBuildStart=-1,batchReady=-1;
-        volatile long workerStart=-1,dispatchStart=-1,dispatchDuration=-1;
-        volatile long completed=-1,callbackElapsed=-1,previousCallbackElapsed=-1;
-        volatile long handoffDelay=-1,lastStrokeEndElapsed=-1;
-
-        volatile long schedulerParkStart=-1,schedulerWakeTarget=-1;
-        volatile long schedulerParkReturn=-1,schedulerWakeLateness=-1;
-        volatile long schedulerSpinDuration=-1;
-
-        volatile long schedulerLoopEntry=-1,schedulerWakeElapsed=-1;
-        volatile long schedulerUnparkElapsed=-1,schedulerDecisionElapsed=-1;
-        volatile long schedulerDispatchEntry=-1;
-
+        volatile long workerStart=-1,dispatchStart=-1,dispatchDuration=-1,completed=-1,callbackElapsed=-1;
+        volatile long previousCallbackElapsed=-1,handoffDelay=-1,lastStrokeEndElapsed=-1;
+        volatile long schedulerParkStart=-1,schedulerWakeTarget=-1,schedulerParkReturn=-1;
+        volatile long schedulerWakeLateness=-1,schedulerSpinDuration=-1;
+        volatile long schedulerLoopEntry=-1,schedulerWakeElapsed=-1,schedulerUnparkElapsed=-1;
+        volatile long schedulerDecisionElapsed=-1,schedulerDispatchEntry=-1;
         volatile long lockWaitStart=-1,lockAcquired=-1,dispatchDecision=-1;
         volatile long apiCallStart=-1,apiCallReturn=-1;
-
+        volatile long workerParkStart=-1,workerWakeTarget=-1,workerParkReturn=-1;
+        volatile long workerWakeLateness=-1,workerSpinStart=-1,workerSpinEnd=-1;
+        volatile int workerQueueDepth=-1;
         volatile boolean accepted;
         volatile String callbackResult="NOT_DISPATCHED";
         volatile GestureCompletion completion;
 
-        Request(long target,long deadline,long durationMs,int x,int y,long generation,
-                GestureCompletion completion) {
-            this.target=target;
-            this.deadline=deadline;
-            this.durationMs=durationMs;
-            durationNs=durationMs*NS_MS;
-            this.x=x;
-            this.y=y;
-            this.generation=generation;
-            this.completion=completion;
+        Request(long t,long d,long ms,int px,int py,long gen,GestureCompletion c) {
+            target=t;deadline=d;durationMs=ms;x=px;y=py;generation=gen;completion=c;
         }
-
         void prepare() {
             if(path!=null)return;
             prepareStart=SystemClock.elapsedRealtimeNanos();
-            Path p=new Path();
-            p.moveTo(x,y);
-            p.lineTo(x,y);
-            path=p;
+            Path p=new Path();p.moveTo(x,y);p.lineTo(x,y);path=p;
             prepareEnd=SystemClock.elapsedRealtimeNanos();
         }
     }
@@ -107,12 +83,9 @@ public class AutoClickService extends AccessibilityService {
     private static final class PreparedBatch {
         final ArrayList<Request> requests;
         final GestureDescription[] gestures;
-        final long baseTarget;
-
-        PreparedBatch(ArrayList<Request> requests,GestureDescription[] gestures) {
-            this.requests=requests;
-            this.gestures=gestures;
-            baseTarget=requests.get(0).target;
+        final long baseTarget,generation;
+        PreparedBatch(ArrayList<Request> r,GestureDescription[] g) {
+            requests=r;gestures=g;baseTarget=r.get(0).target;generation=r.get(0).generation;
         }
     }
 
@@ -121,434 +94,231 @@ public class AutoClickService extends AccessibilityService {
         final ArrayList<Request> requests;
         private boolean returned,accepted,received,success,handled;
         private long callbackTime;
-
-        Batch(AutoClickService owner,ArrayList<Request> requests) {
-            this.owner=owner;
-            this.requests=requests;
-        }
-
-        @Override public void onCompleted(GestureDescription g) {
-            receive(true);
-        }
-
-        @Override public void onCancelled(GestureDescription g) {
-            receive(false);
-        }
-
+        Batch(AutoClickService o,ArrayList<Request> r) { owner=o;requests=r; }
+        @Override public void onCompleted(GestureDescription g) { receive(true); }
+        @Override public void onCancelled(GestureDescription g) { receive(false); }
         private void receive(boolean result) {
             boolean process;
             synchronized(this) {
                 if(handled||received)return;
-                received=true;
-                success=result;
-                callbackTime=SystemClock.elapsedRealtimeNanos();
+                received=true;success=result;callbackTime=SystemClock.elapsedRealtimeNanos();
                 process=returned&&accepted;
                 if(process)handled=true;
             }
             if(process)owner.finishBatch(this,result,callbackTime);
         }
-
         void onDispatchReturned(boolean result) {
-            boolean process;
+            boolean process,value;long time;
             synchronized(this) {
-                returned=true;
-                accepted=result;
-                process=result&&received&&!handled;
+                returned=true;accepted=result;process=result&&received&&!handled;
                 if(process)handled=true;
+                value=success;time=callbackTime;
             }
-            if(process)owner.finishBatch(this,success,callbackTime);
+            if(process)owner.finishBatch(this,value,time);
         }
     }
 
     private static final class Timing {
-        final long target,prepareStart,prepareEnd,batchBuildStart,batchReady;
-        final long workerStart,dispatchStart,dispatchDuration,completed,callbackElapsed;
-        final long previousCallbackElapsed,handoffDelay,lastStrokeEndElapsed;
-        final long schedulerParkStart,schedulerWakeTarget,schedulerParkReturn;
-        final long schedulerWakeLateness,schedulerSpinDuration;
-        final long schedulerLoopEntry,schedulerWakeElapsed,schedulerUnparkElapsed;
-        final long schedulerDecisionElapsed,schedulerDispatchEntry;
-        final long lockWaitStart,lockAcquired,dispatchDecision,apiCallStart,apiCallReturn;
-        final int x,y;
-        final boolean accepted,success,expired;
-        final String callback;
-
-        Timing(Request r,boolean success,boolean expired) {
-            target=r.target;
-            prepareStart=r.prepareStart;
-            prepareEnd=r.prepareEnd;
-            batchBuildStart=r.batchBuildStart;
-            batchReady=r.batchReady;
-            workerStart=r.workerStart;
-            dispatchStart=r.dispatchStart;
-            dispatchDuration=r.dispatchDuration;
-            completed=r.completed;
-            callbackElapsed=r.callbackElapsed;
-            previousCallbackElapsed=r.previousCallbackElapsed;
-            handoffDelay=r.handoffDelay;
-            lastStrokeEndElapsed=r.lastStrokeEndElapsed;
-
-            schedulerParkStart=r.schedulerParkStart;
-            schedulerWakeTarget=r.schedulerWakeTarget;
-            schedulerParkReturn=r.schedulerParkReturn;
-            schedulerWakeLateness=r.schedulerWakeLateness;
-            schedulerSpinDuration=r.schedulerSpinDuration;
-
-            schedulerLoopEntry=r.schedulerLoopEntry;
-            schedulerWakeElapsed=r.schedulerWakeElapsed;
-            schedulerUnparkElapsed=r.schedulerUnparkElapsed;
-            schedulerDecisionElapsed=r.schedulerDecisionElapsed;
-            schedulerDispatchEntry=r.schedulerDispatchEntry;
-
-            lockWaitStart=r.lockWaitStart;
-            lockAcquired=r.lockAcquired;
-            dispatchDecision=r.dispatchDecision;
-            apiCallStart=r.apiCallStart;
-            apiCallReturn=r.apiCallReturn;
-
-            x=r.x;
-            y=r.y;
-            accepted=r.accepted;
-            this.success=success;
-            this.expired=expired;
-            callback=r.callbackResult;
-        }
-
+        final Request r;
+        final boolean success,expired;
+        Timing(Request r,boolean s,boolean e) { this.r=r;success=s;expired=e; }
+        private static long diff(long a,long b) { return a<0||b<0?-1:b-a; }
         String csv() {
-            long prepare=diff(prepareStart,prepareEnd);
-            long build=diff(batchBuildStart,batchReady);
-            long readyToWorker=diff(batchReady,workerStart);
-            long targetWait=batchReady<0?-1:Math.max(0,target-batchReady);
-            long previousWait=batchReady<0||previousCallbackElapsed<0?-1:
-                    Math.max(0,previousCallbackElapsed-batchReady);
-            long dispatchDelta=dispatchStart<0?-1:dispatchStart-target;
-            long pipeline=diff(workerStart,dispatchStart);
-            long completionDelay=completed<0?-1:completed-target;
-            long dispatchToCallback=diff(dispatchStart,callbackElapsed);
-            long lastStrokeToCallback=diff(lastStrokeEndElapsed,callbackElapsed);
-            long wakeToWorker=diff(schedulerParkReturn,workerStart);
-            long queueDelay=diff(schedulerDispatchEntry,workerStart);
-
-            long lockWait=diff(lockWaitStart,lockAcquired);
-            long workerToDecision=diff(workerStart,dispatchDecision);
-            long decisionToApi=diff(dispatchDecision,apiCallStart);
-            long apiDuration=diff(apiCallStart,apiCallReturn);
-            long schedulerWakeToDispatch=diff(schedulerWakeElapsed,schedulerDispatchEntry);
-            long schedulerLoopToDispatch=diff(schedulerLoopEntry,schedulerDispatchEntry);
-            long unparkToWake=diff(schedulerUnparkElapsed,schedulerWakeElapsed);
-
+            long prepare=diff(r.prepareStart,r.prepareEnd),build=diff(r.batchBuildStart,r.batchReady);
+            long readyWorker=diff(r.batchReady,r.workerStart);
+            long targetWait=r.batchReady<0?-1:Math.max(0,r.target-r.batchReady);
+            long previousWait=r.batchReady<0||r.previousCallbackElapsed<0?-1:Math.max(0,r.previousCallbackElapsed-r.batchReady);
+            long delta=r.dispatchStart<0?-1:r.dispatchStart-r.target;
+            long pipeline=diff(r.workerStart,r.dispatchStart);
+            long completionDelay=r.completed<0?-1:r.completed-r.target;
+            long dispatchCallback=diff(r.dispatchStart,r.callbackElapsed);
+            long strokeCallback=diff(r.lastStrokeEndElapsed,r.callbackElapsed);
+            long wakeWorker=diff(r.schedulerParkReturn,r.workerStart);
+            long queueDelay=diff(r.schedulerDispatchEntry,r.workerStart);
+            long lockWait=diff(r.lockWaitStart,r.lockAcquired);
+            long workerDecision=diff(r.workerStart,r.dispatchDecision);
+            long decisionApi=diff(r.dispatchDecision,r.apiCallStart);
+            long apiDuration=diff(r.apiCallStart,r.apiCallReturn);
+            long schedulerWakeDispatch=diff(r.schedulerWakeElapsed,r.schedulerDispatchEntry);
+            long schedulerLoopDispatch=diff(r.schedulerLoopEntry,r.schedulerDispatchEntry);
+            long unparkWake=diff(r.schedulerUnparkElapsed,r.schedulerWakeElapsed);
+            long workerWakeStart=diff(r.workerParkReturn,r.workerStart);
+            long workerPark=diff(r.workerParkStart,r.workerParkReturn);
+            long workerSpin=diff(r.workerSpinStart,r.workerSpinEnd);
             String result=expired?"EXPIRED":success?"SUCCESS":"FAILED";
-
-            return target+","+prepareStart+","+prepareEnd+","+prepare+","+
-                    batchBuildStart+","+batchReady+","+build+","+workerStart+","+
-                    readyToWorker+","+targetWait+","+previousWait+","+dispatchStart+","+
-                    dispatchDelta+","+pipeline+","+dispatchDuration+","+completed+","+
-                    completionDelay+","+dispatchToCallback+","+accepted+","+result+","+
-                    callback+","+x+","+y+","+callbackElapsed+","+
-                    previousCallbackElapsed+","+handoffDelay+","+
-                    lastStrokeEndElapsed+","+lastStrokeToCallback+","+
-                    schedulerParkStart+","+schedulerWakeTarget+","+
-                    schedulerParkReturn+","+schedulerWakeLateness+","+
-                    schedulerSpinDuration+","+wakeToWorker+","+queueDelay+","+
-                    lockWaitStart+","+lockAcquired+","+lockWait+","+
-                    dispatchDecision+","+apiCallStart+","+apiCallReturn+","+
-                    workerToDecision+","+decisionToApi+","+apiDuration+","+
-                    schedulerLoopEntry+","+schedulerWakeElapsed+","+
-                    schedulerUnparkElapsed+","+schedulerDecisionElapsed+","+
-                    schedulerDispatchEntry+","+schedulerWakeToDispatch+","+
-                    schedulerLoopToDispatch+","+unparkToWake;
-        }
-
-        private static long diff(long start,long end) {
-            return start<0||end<0?-1:end-start;
+            return r.target+","+r.prepareStart+","+r.prepareEnd+","+prepare+","+
+                r.batchBuildStart+","+r.batchReady+","+build+","+r.workerStart+","+
+                readyWorker+","+targetWait+","+previousWait+","+r.dispatchStart+","+
+                delta+","+pipeline+","+r.dispatchDuration+","+r.completed+","+
+                completionDelay+","+dispatchCallback+","+r.accepted+","+result+","+
+                r.callbackResult+","+r.x+","+r.y+","+r.callbackElapsed+","+
+                r.previousCallbackElapsed+","+r.handoffDelay+","+r.lastStrokeEndElapsed+","+
+                strokeCallback+","+r.schedulerParkStart+","+r.schedulerWakeTarget+","+
+                r.schedulerParkReturn+","+r.schedulerWakeLateness+","+r.schedulerSpinDuration+","+
+                wakeWorker+","+queueDelay+","+r.lockWaitStart+","+r.lockAcquired+","+lockWait+","+
+                r.dispatchDecision+","+r.apiCallStart+","+r.apiCallReturn+","+workerDecision+","+
+                decisionApi+","+apiDuration+","+r.schedulerLoopEntry+","+r.schedulerWakeElapsed+","+
+                r.schedulerUnparkElapsed+","+r.schedulerDecisionElapsed+","+r.schedulerDispatchEntry+","+
+                schedulerWakeDispatch+","+schedulerLoopDispatch+","+unparkWake+","+r.workerParkStart+","+
+                r.workerWakeTarget+","+r.workerParkReturn+","+r.workerWakeLateness+","+workerWakeStart+","+
+                workerPark+","+r.workerQueueDepth+","+r.workerSpinStart+","+r.workerSpinEnd+","+workerSpin;
         }
     }
 
     @Override protected void onServiceConnected() {
         super.onServiceConnected();
         preferences=getSharedPreferences(PREFS,MODE_PRIVATE);
-        x=preferences.getInt(KEY_X,DEFAULT_X);
-        y=preferences.getInt(KEY_Y,DEFAULT_Y);
-        stopping=false;
-        ready=true;
-        instance=this;
-        startWriter();
-        startPreparer();
-        startDispatchExecutor();
-        startCallbackThread();
-        startScheduler();
+        x=preferences.getInt(KEY_X,DEFAULT_X);y=preferences.getInt(KEY_Y,DEFAULT_Y);
+        stopping=false;writerStopping=false;ready=true;instance=this;
+        startWriter();startPreparer();startCallbackThread();startWorker();startScheduler();
     }
 
     private void startCallbackThread() {
         HandlerThread old=callbackThread;
         if(old!=null&&old.isAlive())return;
-        HandlerThread thread=new HandlerThread("PrecisionGestureCallback",
-                android.os.Process.THREAD_PRIORITY_DISPLAY);
-        thread.start();
-        callbackThread=thread;
-        callbackHandler=new Handler(thread.getLooper());
+        HandlerThread t=new HandlerThread("PrecisionGestureCallback",android.os.Process.THREAD_PRIORITY_DISPLAY);
+        t.start();callbackThread=t;callbackHandler=new Handler(t.getLooper());
     }
 
     private void startWriter() {
         if(writerThread!=null&&writerThread.isAlive())return;
-        writerStopping=false;
-        writerThread=new Thread(this::writerLoop,"PrecisionTimingFileWriter");
-        writerThread.start();
+        writerStopping=false;writerThread=new Thread(this::writerLoop,"PrecisionTimingFileWriter");writerThread.start();
     }
 
     private void writerLoop() {
         BufferedWriter out=null;
         try {
-            File dir=getExternalFilesDir(null);
-            if(dir==null)dir=getFilesDir();
-            if(!dir.exists()&&!dir.mkdirs()) {
-                logPath="خطا: پوشه گزارش ساخته نشد";
-                return;
-            }
-
+            File dir=getExternalFilesDir(null);if(dir==null)dir=getFilesDir();
+            if(!dir.exists()&&!dir.mkdirs()){logPath="خطا: پوشه گزارش ساخته نشد";return;}
             File file=new File(dir,LOG_FILE);
             boolean header=!file.exists()||file.length()==0;
-            out=new BufferedWriter(new OutputStreamWriter(
-                    new FileOutputStream(file,true),StandardCharsets.UTF_8));
+            out=new BufferedWriter(new OutputStreamWriter(new FileOutputStream(file,true),StandardCharsets.UTF_8));
             logPath=file.getAbsolutePath();
-
             if(header) {
-                out.write("target_elapsed_ns,prepare_start_elapsed_ns,prepare_end_elapsed_ns,"+
-                        "prepare_duration_ns,batch_build_start_elapsed_ns,batch_ready_elapsed_ns,"+
-                        "batch_build_duration_ns,dispatch_worker_start_elapsed_ns,"+
-                        "batch_ready_to_worker_ns,target_wait_ns,previous_callback_wait_ns,"+
-                        "dispatch_start_elapsed_ns,dispatch_start_delta_ns,"+
-                        "dispatch_pipeline_delay_ns,dispatch_duration_ns,"+
-                        "completion_elapsed_ns,completion_delay_ns,dispatch_to_callback_ns,"+
-                        "accepted,result,callback_result,x,y,callback_elapsed_ns,"+
-                        "previous_callback_elapsed_ns,handoff_delay_ns,"+
-                        "last_stroke_end_elapsed_ns,last_stroke_to_callback_ns,"+
-                        "scheduler_park_start_ns,scheduler_wake_target_ns,"+
-                        "scheduler_park_return_ns,scheduler_wake_lateness_ns,"+
-                        "scheduler_spin_duration_ns,scheduler_wake_to_worker_ns,"+
-                        "dispatch_worker_queue_delay_ns,"+
-                        "dispatch_lock_wait_start_elapsed_ns,dispatch_lock_acquired_elapsed_ns,"+
-                        "dispatch_lock_wait_ns,dispatch_decision_elapsed_ns,"+
-                        "dispatch_api_call_start_elapsed_ns,dispatch_api_call_return_elapsed_ns,"+
-                        "dispatch_worker_to_decision_ns,dispatch_decision_to_api_ns,"+
-                        "dispatch_api_duration_ns,scheduler_loop_entry_elapsed_ns,"+
-                        "scheduler_wake_elapsed_ns,scheduler_last_unpark_elapsed_ns,"+
-                        "scheduler_decision_elapsed_ns,scheduler_dispatch_entry_elapsed_ns,"+
-                        "scheduler_wake_to_dispatch_ns,scheduler_loop_to_dispatch_ns,"+
-                        "scheduler_unpark_to_wake_ns");
-                out.newLine();
-                out.flush();
+                out.write("target_elapsed_ns,prepare_start_elapsed_ns,prepare_end_elapsed_ns,prepare_duration_ns,batch_build_start_elapsed_ns,batch_ready_elapsed_ns,batch_build_duration_ns,dispatch_worker_start_elapsed_ns,batch_ready_to_worker_ns,target_wait_ns,previous_callback_wait_ns,dispatch_start_elapsed_ns,dispatch_start_delta_ns,dispatch_pipeline_delay_ns,dispatch_duration_ns,completion_elapsed_ns,completion_delay_ns,dispatch_to_callback_ns,accepted,result,callback_result,x,y,callback_elapsed_ns,previous_callback_elapsed_ns,handoff_delay_ns,last_stroke_end_elapsed_ns,last_stroke_to_callback_ns,scheduler_park_start_ns,scheduler_wake_target_ns,scheduler_park_return_ns,scheduler_wake_lateness_ns,scheduler_spin_duration_ns,scheduler_wake_to_worker_ns,dispatch_worker_queue_delay_ns,dispatch_lock_wait_start_elapsed_ns,dispatch_lock_acquired_elapsed_ns,dispatch_lock_wait_ns,dispatch_decision_elapsed_ns,dispatch_api_call_start_elapsed_ns,dispatch_api_call_return_elapsed_ns,dispatch_worker_to_decision_ns,dispatch_decision_to_api_ns,dispatch_api_duration_ns,scheduler_loop_entry_elapsed_ns,scheduler_wake_elapsed_ns,scheduler_last_unpark_elapsed_ns,scheduler_decision_elapsed_ns,scheduler_dispatch_entry_elapsed_ns,scheduler_wake_to_dispatch_ns,scheduler_loop_to_dispatch_ns,scheduler_unpark_to_wake_ns,worker_park_start_elapsed_ns,worker_wake_target_elapsed_ns,worker_park_return_elapsed_ns,worker_wake_lateness_ns,worker_wake_to_start_ns,worker_park_duration_ns,worker_queue_depth,worker_spin_start_elapsed_ns,worker_spin_end_elapsed_ns,worker_spin_duration_ns");
+                out.newLine();out.flush();
             }
-
             while(!writerStopping||!logs.isEmpty()) {
                 Timing item;
-                try {
-                    item=logs.poll(500,TimeUnit.MILLISECONDS);
-                } catch(InterruptedException e) {
-                    continue;
-                }
+                try { item=logs.poll(500,TimeUnit.MILLISECONDS); }
+                catch(InterruptedException e) { continue; }
                 if(item==null)continue;
-                out.write(item.csv());
-                out.newLine();
-                out.flush();
+                out.write(item.csv());out.newLine();out.flush();
             }
-        } catch(IOException e) {
-            logPath="خطای نوشتن گزارش: "+e.getMessage();
-        } finally {
-            if(out!=null)try {
-                out.flush();
-                out.close();
-            } catch(IOException ignored) { }
-        }
+        } catch(IOException e) { logPath="خطای نوشتن گزارش: "+e.getMessage(); }
+        finally { if(out!=null)try { out.flush();out.close(); }catch(IOException ignored){} }
     }
 
     private void record(Request r,boolean success,boolean expired) {
-        if(r!=null&&r.recorded.compareAndSet(false,true))
-            logs.offer(new Timing(r,success,expired));
+        if(r!=null&&r.recorded.compareAndSet(false,true))logs.offer(new Timing(r,success,expired));
     }
 
     private void startPreparer() {
         if(preparer!=null&&!preparer.isShutdown())return;
         preparer=Executors.newSingleThreadExecutor(task->new Thread(()->{
-            try {
-                android.os.Process.setThreadPriority(
-                        android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY);
-            } catch(Exception ignored) { }
-            task.run();
+            try { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY); }
+            catch(Exception ignored){} task.run();
         },"PrecisionGesturePreparation"));
     }
 
-    private void startDispatchExecutor() {
-        if(dispatchExecutor!=null&&!dispatchExecutor.isShutdown())return;
-        dispatchExecutor=Executors.newSingleThreadExecutor(task->new Thread(()->{
-            try {
-                android.os.Process.setThreadPriority(
-                        android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY);
-            } catch(Exception ignored) { }
-            task.run();
-        },"PrecisionGestureDispatch"));
-    }
-
-    private void prepare(Request r) {
-        if(!current(r))return;
-        try {
-            r.prepare();
-        } catch(Exception e) {
-            boolean removed;
-            synchronized(lock) {
-                removed=pending.remove(r);
-            }
-            if(removed) {
-                r.callbackResult="PREPARATION_FAILED:"+e.getClass().getSimpleName();
-                postFinish(r,false,false);
-            }
-        }
-        unparkScheduler();
+    private void startWorker() {
+        Thread old=worker;if(old!=null&&old.isAlive())return;
+        worker=new Thread(this::workerLoop,"PrecisionClickDispatchWorker");worker.start();
     }
 
     private void startScheduler() {
         if(scheduler!=null&&scheduler.isAlive())return;
-        scheduler=new Thread(this::schedulerLoop,"PrecisionClickNanoScheduler");
-        scheduler.start();
+        scheduler=new Thread(this::schedulerLoop,"PrecisionClickNanoScheduler");scheduler.start();
     }
 
-    private void parkForBatch(PreparedBatch batch,long wakeTarget) {
-        long parkStart=SystemClock.elapsedRealtimeNanos();
-        for(Request r:batch.requests) {
-            r.schedulerParkStart=parkStart;
-            r.schedulerWakeTarget=wakeTarget;
-            r.schedulerSpinDuration=-1;
-        }
+    private boolean current(Request r) { return r!=null&&r.generation==generation&&ready&&!stopping; }
 
-        LockSupport.parkNanos(this,Math.max(1,wakeTarget-parkStart));
-
-        long parkReturn=SystemClock.elapsedRealtimeNanos();
-        long lateness=Math.max(0,parkReturn-wakeTarget);
-        for(Request r:batch.requests) {
-            r.schedulerParkReturn=parkReturn;
-            r.schedulerWakeLateness=lateness;
+    private void prepare(Request r) {
+        if(!current(r))return;
+        try { r.prepare(); }
+        catch(Exception e) {
+            boolean removed;
+            synchronized(lock) { removed=pending.remove(r); }
+            if(removed) { r.callbackResult="PREPARATION_FAILED:"+e.getClass().getSimpleName();postFinish(r,false,false); }
         }
+        unparkScheduler();
     }
 
     private void schedulerLoop() {
-        try {
-            android.os.Process.setThreadPriority(
-                    android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY);
-        } catch(Exception ignored) { }
-
+        try { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY); }
+        catch(Exception ignored){}
         while(!stopping) {
             long loopEntry=SystemClock.elapsedRealtimeNanos();
-            PreparedBatch headBatch;
-            Request first;
-            boolean busy,canBuild;
-            ArrayList<Request> stale=new ArrayList<>();
-
+            Request first;boolean canBuild;ArrayList<Request> stale=new ArrayList<>();
             synchronized(lock) {
-                long now=SystemClock.elapsedRealtimeNanos();
-
-                if(!active.isEmpty()&&activeGestureReleaseElapsed>0&&
-                        now>=activeGestureReleaseElapsed) {
-                    active.clear();
-                    activeGestureReleaseElapsed=0;
-                }
-
-                while(!pending.isEmpty()&&pending.peekFirst().generation!=generation)
-                    stale.add(pending.pollFirst());
-
-                while(!preparedBatches.isEmpty()&&
-                        preparedBatches.peekFirst().requests.get(0).generation!=generation)
-                    stale.addAll(preparedBatches.pollFirst().requests);
-
-                headBatch=preparedBatches.peekFirst();
-                first=pending.peekFirst();
-                busy=!active.isEmpty()||dispatching;
-                canBuild=preparedBatches.size()<MAX_PREPARED_BATCHES;
-
-                if(headBatch!=null) {
-                    for(Request r:headBatch.requests) {
-                        r.schedulerLoopEntry=loopEntry;
-                        r.schedulerWakeElapsed=loopEntry;
-                        r.schedulerUnparkElapsed=lastSchedulerUnparkElapsed;
-                    }
-                }
+                while(!pending.isEmpty()&&pending.peekFirst().generation!=generation)stale.add(pending.pollFirst());
+                canBuild=prepared.size()<MAX_PREPARED;first=pending.peekFirst();
             }
-
-            for(Request r:stale) {
-                r.callbackResult="STALE_GENERATION";
-                postFinish(r,false,true);
-            }
-
+            for(Request r:stale) { r.callbackResult="STALE_GENERATION";postFinish(r,false,true); }
             if(stopping)break;
-
-            if(headBatch!=null&&!busy&&
-                    headBatch.baseTarget-DISPATCH_LEAD_NS<=
-                            SystemClock.elapsedRealtimeNanos()) {
-                long decision=SystemClock.elapsedRealtimeNanos();
-                for(Request r:headBatch.requests)
-                    r.schedulerDecisionElapsed=decision;
-                dispatchPrepared();
-                continue;
+            if(first==null||!canBuild) { LockSupport.park(this);continue; }
+            if(!current(first)) { unparkScheduler();continue; }
+            if(first.path==null||hasUnpreparedBatchMember(first)) { LockSupport.park(this);continue; }
+            ArrayList<Request> requests=collect(first);
+            if(requests.isEmpty()) { LockSupport.park(this);continue; }
+            synchronized(lock) { building.addAll(requests); }
+            long buildStart=SystemClock.elapsedRealtimeNanos();
+            for(Request r:requests) {
+                r.batchBuildStart=buildStart;r.schedulerLoopEntry=loopEntry;
+                r.schedulerWakeElapsed=loopEntry;r.schedulerUnparkElapsed=lastSchedulerUnparkElapsed;
             }
-
-            if(canBuild&&first!=null&&first.path!=null) {
-                if(hasUnpreparedBatchMember(first)) {
-                    LockSupport.parkNanos(this,100_000L);
-                    continue;
-                }
-
-                ArrayList<Request> requests=collect(first);
-                if(!requests.isEmpty()) {
-                    long buildStart=SystemClock.elapsedRealtimeNanos();
-                    for(Request r:requests)r.batchBuildStart=buildStart;
-
-                    try {
-                        GestureDescription[] gestures=buildGestures(requests);
-                        long readyTime=SystemClock.elapsedRealtimeNanos();
-
-                        synchronized(lock) {
-                            if(!stopping&&preparedBatches.size()<MAX_PREPARED_BATCHES&&
-                                    current(requests.get(0))) {
-                                for(Request r:requests)r.batchReady=readyTime;
-                                preparedBatches.addLast(new PreparedBatch(requests,gestures));
-                            } else {
-                                requeueCurrentInOrder(requests);
-                            }
-                        }
-                    } catch(Exception e) {
-                        finishWithoutDispatch(requests,
-                                "BATCH_BUILD_FAILED:"+e.getClass().getSimpleName(),false);
-                    }
-                    continue;
-                }
-            }
-
-            if(headBatch!=null&&!busy) {
-                long wakeTarget=headBatch.baseTarget-DISPATCH_LEAD_NS;
-                long remaining=wakeTarget-SystemClock.elapsedRealtimeNanos();
-                if(remaining>0)parkForBatch(headBatch,wakeTarget);
-                continue;
-            }
-
-            if(busy) {
-                long wait;
+            try {
+                GestureDescription[] gestures=buildGestures(requests);
+                long readyTime=SystemClock.elapsedRealtimeNanos();
+                PreparedBatch batch=new PreparedBatch(requests,gestures);boolean queued=false;
                 synchronized(lock) {
-                    wait=!active.isEmpty()?activeGestureReleaseElapsed-
-                            SystemClock.elapsedRealtimeNanos():0;
+                    building.removeAll(requests);
+                    if(!stopping&&current(requests.get(0))&&prepared.size()<MAX_PREPARED) {
+                        for(Request r:requests) {
+                            r.batchReady=readyTime;r.schedulerDecisionElapsed=readyTime;r.schedulerDispatchEntry=readyTime;
+                        }
+                        prepared.offer(batch);queued=true;
+                    } else if(!stopping&&current(requests.get(0)))requeueCurrentInOrder(requests);
                 }
-
-                if(wait>0)LockSupport.parkNanos(this,wait);
-                else if(dispatching)LockSupport.park(this);
-                else LockSupport.parkNanos(this,100_000L);
-                continue;
+                if(queued)unparkWorker();else unparkScheduler();
+            } catch(Exception e) {
+                synchronized(lock) { building.removeAll(requests); }
+                finishWithoutDispatch(requests,"BATCH_BUILD_FAILED:"+e.getClass().getSimpleName(),false);
             }
-
-            if(first==null||first.path==null||!canBuild) {
-                LockSupport.park(this);
-                continue;
-            }
-
-            LockSupport.park(this);
         }
+    }
+
+    private boolean hasUnpreparedBatchMember(Request first) {
+        synchronized(lock) {
+            if(pending.peekFirst()!=first||!current(first))return false;
+            long base=first.target,gen=first.generation;int count=0;
+            for(Request r:pending) {
+                if(count>=MAX_STROKES)break;
+                if(r.generation!=gen||r.target<base)break;
+                long delta=r.target-base;if(delta%NS_MS!=0)break;
+                long offset=delta/NS_MS;
+                if(offset>MAX_DURATION_MS-LEAD_MS||r.durationMs>MAX_DURATION_MS-LEAD_MS-offset)break;
+                if(r.path==null)return true;count++;
+            }
+        }
+        return false;
+    }
+
+    private ArrayList<Request> collect(Request first) {
+        ArrayList<Request> result=new ArrayList<>(MAX_STROKES);
+        synchronized(lock) {
+            if(pending.peekFirst()!=first||!current(first))return result;
+            long base=first.target,gen=first.generation;
+            while(!pending.isEmpty()&&result.size()<MAX_STROKES) {
+                Request r=pending.peekFirst();
+                if(r.generation!=gen||r.path==null||r.target<base)break;
+                long delta=r.target-base;if(delta%NS_MS!=0)break;
+                long offset=delta/NS_MS;
+                if(offset>MAX_DURATION_MS-LEAD_MS||r.durationMs>MAX_DURATION_MS-LEAD_MS-offset)break;
+                r.offsetMs=offset;result.add(pending.pollFirst());
+            }
+        }
+        return result;
     }
 
     private void requeueCurrentInOrder(List<Request> requests) {
@@ -558,319 +328,229 @@ public class AutoClickService extends AccessibilityService {
         }
     }
 
-    private boolean hasUnpreparedBatchMember(Request first) {
-        synchronized(lock) {
-            if(pending.peekFirst()!=first||!current(first))return false;
-
-            long base=first.target,gen=first.generation;
-            int count=0;
-
-            for(Request r:pending) {
-                if(count>=MAX_STROKES)break;
-                if(r.generation!=gen||r.target<base)break;
-
-                long delta=r.target-base;
-                if(delta%NS_MS!=0)break;
-
-                long offset=delta/NS_MS;
-                if(offset>MAX_DURATION_MS-DISPATCH_LEAD_MS||
-                        r.durationMs>MAX_DURATION_MS-DISPATCH_LEAD_MS-offset)break;
-
-                if(r.path==null)return true;
-                count++;
-            }
-        }
-        return false;
-    }
-
-    private ArrayList<Request> collect(Request first) {
-        ArrayList<Request> result=new ArrayList<>(MAX_STROKES);
-
-        synchronized(lock) {
-            if(pending.peekFirst()!=first||!current(first))return result;
-
-            long base=first.target,gen=first.generation;
-
-            while(!pending.isEmpty()&&result.size()<MAX_STROKES) {
-                Request r=pending.peekFirst();
-
-                if(r.generation!=gen||r.path==null||r.target<base)break;
-
-                long delta=r.target-base;
-                if(delta%NS_MS!=0)break;
-
-                long offset=delta/NS_MS;
-                if(offset>MAX_DURATION_MS-DISPATCH_LEAD_MS||
-                        r.durationMs>MAX_DURATION_MS-DISPATCH_LEAD_MS-offset)break;
-
-                r.offsetMs=offset;
-                result.add(pending.pollFirst());
-            }
-        }
-        return result;
-    }
-
-    private boolean current(Request r) {
-        return r!=null&&r.generation==generation&&ready&&!stopping;
-    }
-
     private GestureDescription[] buildGestures(List<Request> requests) {
-        GestureDescription[] result=new GestureDescription[(int)DISPATCH_LEAD_MS+1];
-
-        for(int lead=0;lead<=DISPATCH_LEAD_MS;lead++) {
+        GestureDescription[] result=new GestureDescription[(int)LEAD_MS+1];
+        for(int lead=0;lead<=LEAD_MS;lead++) {
             GestureDescription.Builder builder=new GestureDescription.Builder();
-
             for(Request r:requests) {
                 if(r.path==null)throw new IllegalStateException("PATH_NOT_PREPARED");
-
-                builder.addStroke(new GestureDescription.StrokeDescription(
-                        r.path,lead+r.offsetMs,r.durationMs));
+                builder.addStroke(new GestureDescription.StrokeDescription(r.path,lead+r.offsetMs,r.durationMs));
             }
-
             result[lead]=builder.build();
         }
         return result;
     }
 
-    private void dispatchPrepared() {
-        PreparedBatch batch;
-        long handoff=SystemClock.elapsedRealtimeNanos();
-
-        synchronized(lock) {
-            if(preparedBatches.isEmpty()||!active.isEmpty()||dispatching||stopping||
-                    handoff<preparedBatches.peekFirst().baseTarget-DISPATCH_LEAD_NS)
-                return;
-
-            batch=preparedBatches.pollFirst();
-            dispatching=true;
-
-            for(Request r:batch.requests)
-                r.schedulerDispatchEntry=handoff;
-        }
-
-        ExecutorService executor=dispatchExecutor;
-        try {
-            if(executor==null||executor.isShutdown())
-                throw new RejectedExecutionException("DISPATCH_EXECUTOR_UNAVAILABLE");
-
-            executor.execute(()->dispatchBatch(batch));
-        } catch(Exception e) {
+    private void workerLoop() {
+        try { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY); }
+        catch(Exception ignored){}
+        while(!stopping) {
+            PreparedBatch batch=null,observed=null;
+            long wakeTarget=-1,waitNanos=-1,now=SystemClock.elapsedRealtimeNanos();
             synchronized(lock) {
-                dispatching=false;
+                if(stopping)break;
+                if(!active.isEmpty()&&activeRelease>0&&now>=activeRelease) {
+                    active.clear();activeRelease=0;
+                }
+                while(!prepared.isEmpty()&&prepared.peek().generation!=generation) {
+                    PreparedBatch stale=prepared.poll();
+                    for(Request r:stale.requests) { r.callbackResult="STALE_GENERATION";postFinish(r,false,true); }
+                }
+                if(!dispatching) {
+                    if(!active.isEmpty())waitNanos=activeRelease>0?activeRelease-now:-1;
+                    else {
+                        observed=prepared.peek();
+                        if(observed!=null) {
+                            wakeTarget=observed.baseTarget-LEAD_NS;waitNanos=wakeTarget-now;
+                            if(waitNanos<=0) {
+                                batch=prepared.poll();workerCurrentBatch=batch;
+                                int depth=prepared.size();
+                                for(Request r:batch.requests) { r.workerStart=now;r.workerQueueDepth=depth; }
+                            }
+                        }
+                    }
+                }
             }
-            finishWithoutDispatch(batch.requests,
-                    "DISPATCH_HANDOFF_FAILED:"+e.getClass().getSimpleName(),false);
-            unparkScheduler();
+            if(stopping)break;
+            if(batch!=null) {
+                dispatchBatch(batch);
+                synchronized(lock) { if(workerCurrentBatch==batch)workerCurrentBatch=null; }
+                unparkScheduler();continue;
+            }
+            if(waitNanos<0) { LockSupport.park(this);continue; }
+            long parkStart=SystemClock.elapsedRealtimeNanos();
+            if(observed!=null)for(Request r:observed.requests) {
+                r.workerParkStart=parkStart;r.workerWakeTarget=wakeTarget;
+                r.workerParkReturn=-1;r.workerWakeLateness=-1;r.workerSpinStart=-1;r.workerSpinEnd=-1;
+            }
+            if(waitNanos>SPIN_NS)LockSupport.parkNanos(this,waitNanos-SPIN_NS);
+            long parkReturn=SystemClock.elapsedRealtimeNanos();
+            if(observed!=null)for(Request r:observed.requests)r.workerParkReturn=parkReturn;
+            long spinStart=-1,spinEnd=-1;
+            long spinTarget=observed!=null?wakeTarget:activeRelease;
+            if(spinTarget>0&&parkReturn<spinTarget) {
+                spinStart=parkReturn;long currentTime;
+                while(!stopping&&(currentTime=SystemClock.elapsedRealtimeNanos())<spinTarget)
+                    if(workerQueueChanged(observed))break;
+                spinEnd=SystemClock.elapsedRealtimeNanos();
+            }
+            if(observed!=null) {
+                long actual=spinEnd>=0?spinEnd:parkReturn;
+                for(Request r:observed.requests) {
+                    r.workerWakeLateness=Math.max(0,actual-wakeTarget);
+                    r.workerSpinStart=spinStart;r.workerSpinEnd=spinEnd;
+                }
+            }
+            if(observed!=null&&workerQueueChanged(observed))continue;
+        }
+    }
+
+    private boolean workerQueueChanged(PreparedBatch observed) {
+        synchronized(lock) {
+            if(stopping)return true;
+            if(observed==null)return active.isEmpty()||activeRelease<=0;
+            return prepared.peek()!=observed||!active.isEmpty();
         }
     }
 
     private void dispatchBatch(PreparedBatch batch) {
         long workerStart=SystemClock.elapsedRealtimeNanos();
-        for(Request r:batch.requests)r.workerStart=workerStart;
-
-        Batch callback=null;
-        long dispatchStart=-1,previousCallback=-1,end=-1,maxStrokeEndOffsetMs=0;
-        int leadMs=0;
-        boolean accepted=false;
+        for(Request r:batch.requests)if(r.workerStart<0)r.workerStart=workerStart;
+        long lockStart=SystemClock.elapsedRealtimeNanos();
+        for(Request r:batch.requests)r.lockWaitStart=lockStart;
+        long previous=-1,maxEndOffsetMs=0;
         String failure="",error="";
-
-        long lockWaitStart=SystemClock.elapsedRealtimeNanos();
-        for(Request r:batch.requests)r.lockWaitStart=lockWaitStart;
+        Batch callback=new Batch(this,batch.requests);
+        boolean accepted=false;
+        long apiStart=-1,apiReturn=-1;
+        int leadMs=-1;
 
         synchronized(lock) {
-            long lockAcquired=SystemClock.elapsedRealtimeNanos();
-            for(Request r:batch.requests)r.lockAcquired=lockAcquired;
-
-            if(stopping||!current(batch.requests.get(0))||!active.isEmpty()) {
-                failure="SERVICE_OR_GENERATION_INVALID";
-            } else {
-                dispatchStart=SystemClock.elapsedRealtimeNanos();
-                long delta=batch.baseTarget-dispatchStart;
-                leadMs=delta<0?-1:(int)((delta+NS_MS-1)/NS_MS);
-
-                if(leadMs<0||leadMs>DISPATCH_LEAD_MS) {
-                    failure="TARGET_MISSED_BEFORE_DISPATCH";
-                } else {
-                    long latestStart=Long.MAX_VALUE;
-
-                    for(Request r:batch.requests) {
-                        if(!current(r)) {
-                            failure="STALE_GENERATION";
-                            break;
-                        }
-
-                        long offsetMs=leadMs+r.offsetMs;
-                        long allowedStart=r.deadline-offsetMs*NS_MS-r.durationNs;
-
-                        if(allowedStart<latestStart)latestStart=allowedStart;
-
-                        maxStrokeEndOffsetMs=Math.max(maxStrokeEndOffsetMs,
-                                offsetMs+r.durationMs);
-                    }
-
-                    if(failure.isEmpty()&&dispatchStart>latestStart)
-                        failure="DEADLINE_AFTER_PREPARATION";
-                }
-
-                if(failure.isEmpty()) {
-                    previousCallback=lastCallbackElapsed>0?lastCallbackElapsed:-1;
-                    callback=new Batch(this,batch.requests);
-                    active.addAll(batch.requests);
-
-                    for(Request r:batch.requests) {
-                        r.dispatchStart=dispatchStart;
-                        r.previousCallbackElapsed=previousCallback;
-                        r.handoffDelay=previousCallback<0?-1:
-                                Math.max(0,dispatchStart-previousCallback);
-                        r.callbackResult="WAITING_FOR_CALLBACK";
-                    }
+            long acquired=SystemClock.elapsedRealtimeNanos();
+            for(Request r:batch.requests)r.lockAcquired=acquired;
+            if(stopping||!current(batch.requests.get(0))||!active.isEmpty()||dispatching)failure="SERVICE_OR_GENERATION_INVALID";
+            else {
+                dispatching=true;previous=lastCallbackElapsed>0?lastCallbackElapsed:-1;
+                active.addAll(batch.requests);
+                for(Request r:batch.requests) {
+                    r.previousCallbackElapsed=previous;
+                    r.handoffDelay=previous<0?-1:Math.max(0,workerStart-previous);
+                    r.callbackResult="WAITING_FOR_CALLBACK";
                 }
             }
-
             long decision=SystemClock.elapsedRealtimeNanos();
             for(Request r:batch.requests)r.dispatchDecision=decision;
         }
 
         if(!failure.isEmpty()) {
-            synchronized(lock) {
-                dispatching=false;
-            }
-            for(Request r:batch.requests) {
-                r.callbackResult=failure;
-                postFinish(r,false,true);
-            }
-            unparkScheduler();
-            return;
+            for(Request r:batch.requests)r.callbackResult=failure;
+            finishWithoutDispatch(batch.requests,failure,true);
+            synchronized(lock) { dispatching=false;active.removeAll(batch.requests); }
+            unparkWorker();return;
         }
-
-        try {
-            Handler target=callbackHandler;
-            for(Request r:batch.requests)
-                r.apiCallStart=SystemClock.elapsedRealtimeNanos();
-
-            accepted=target!=null&&dispatchGesture(
-                    batch.gestures[leadMs],callback,target);
-        } catch(Exception e) {
-            error="DISPATCH_EXCEPTION:"+e.getClass().getSimpleName();
-        }
-
-        end=SystemClock.elapsedRealtimeNanos();
 
         synchronized(lock) {
+            apiStart=SystemClock.elapsedRealtimeNanos();
+            if(stopping||!current(batch.requests.get(0)))failure="STALE_GENERATION";
+            else {
+                long delta=batch.baseTarget-apiStart;
+                leadMs=delta<0?-1:(int)((delta+NS_MS-1)/NS_MS);
+                if(leadMs<0||leadMs>LEAD_MS)failure="TARGET_MISSED_BEFORE_API";
+                else {
+                    long latestStart=Long.MAX_VALUE;
+                    for(Request r:batch.requests) {
+                        if(!current(r)) { failure="STALE_GENERATION";break; }
+                        long endOffset=leadMs+r.offsetMs+r.durationMs;
+                        long allowedStart=r.deadline-endOffset*NS_MS;
+                        latestStart=Math.min(latestStart,allowedStart);
+                        maxEndOffsetMs=Math.max(maxEndOffsetMs,endOffset);
+                    }
+                    if(failure.isEmpty()&&apiStart>latestStart)failure="DEADLINE_BEFORE_API";
+                }
+            }
+            Handler target=callbackHandler;
+            if(failure.isEmpty()&&(target==null||stopping))failure="CALLBACK_HANDLER_UNAVAILABLE";
+            if(failure.isEmpty()) {
+                for(Request r:batch.requests) { r.dispatchStart=apiStart;r.apiCallStart=apiStart; }
+                try { accepted=dispatchGesture(batch.gestures[leadMs],callback,target); }
+                catch(Exception e) { error="DISPATCH_EXCEPTION:"+e.getClass().getSimpleName(); }
+            }
+            apiReturn=SystemClock.elapsedRealtimeNanos();
             for(Request r:batch.requests) {
-                r.apiCallReturn=end;
-                r.dispatchDuration=end-dispatchStart;
-                r.accepted=accepted;
+                r.apiCallReturn=apiReturn;r.dispatchDuration=apiReturn-apiStart;r.accepted=accepted;
+                if(r.dispatchStart<0)r.dispatchStart=apiStart;
+                if(r.apiCallStart<0)r.apiCallStart=apiStart;
             }
-
             if(accepted) {
-                long expectedEnd=end+maxStrokeEndOffsetMs*NS_MS;
-
-                for(Request r:batch.requests)
-                    r.lastStrokeEndElapsed=expectedEnd;
-
+                // روش سریع: مبدأ پایان، زمان شروع فراخوانی API است.
+                long expectedEnd=apiStart+maxEndOffsetMs*NS_MS;
+                activeRelease=expectedEnd;
+                for(Request r:batch.requests)r.lastStrokeEndElapsed=expectedEnd;
                 callbackPending.addAll(batch.requests);
-                activeGestureReleaseElapsed=expectedEnd;
             } else {
-                active.removeAll(batch.requests);
-                activeGestureReleaseElapsed=0;
+                active.removeAll(batch.requests);activeRelease=0;
             }
-
             dispatching=false;
         }
 
-        unparkScheduler();
-
-        if(accepted) {
-            callback.onDispatchReturned(true);
-        } else {
-            finishWithoutDispatch(batch.requests,
-                    error.isEmpty()?"API_RETURNED_FALSE":error,false);
+        if(accepted)callback.onDispatchReturned(true);
+        else {
+            String reason=!failure.isEmpty()?failure:!error.isEmpty()?error:"API_RETURNED_FALSE";
+            for(Request r:batch.requests)r.callbackResult=reason;
+            callback.onDispatchReturned(false);
+            finishWithoutDispatch(batch.requests,reason,
+                failure.contains("DEADLINE")||failure.contains("TARGET_MISSED")||failure.contains("STALE"));
         }
+        unparkWorker();
     }
 
     private void finishWithoutDispatch(List<Request> requests,String reason,boolean expired) {
-        for(Request r:requests) {
-            r.callbackResult=reason;
-            postFinish(r,false,expired);
-        }
+        for(Request r:requests) { r.callbackResult=reason;postFinish(r,false,expired); }
     }
 
     private void finishBatch(Batch batch,boolean success,long callbackTime) {
         synchronized(lock) {
-            active.removeAll(batch.requests);
-            callbackPending.removeAll(batch.requests);
-            if(active.isEmpty())activeGestureReleaseElapsed=0;
+            active.removeAll(batch.requests);callbackPending.removeAll(batch.requests);
+            if(active.isEmpty())activeRelease=0;
         }
-
         lastCallbackElapsed=Math.max(lastCallbackElapsed,callbackTime);
-
         for(Request r:batch.requests) {
-            r.completed=callbackTime;
-            r.callbackElapsed=callbackTime;
+            r.completed=callbackTime;r.callbackElapsed=callbackTime;
             r.callbackResult=success?"ON_COMPLETED":"ON_CANCELLED";
         }
-
-        unparkScheduler();
-
-        for(Request r:batch.requests)
-            postFinish(r,success,false);
+        unparkWorker();
+        for(Request r:batch.requests)postFinish(r,success,false);
     }
 
     private void postFinish(Request r,boolean success,boolean expired) {
-        if(Looper.myLooper()==Looper.getMainLooper())
-            finish(r,success,expired);
-        else
-            main.post(()->finish(r,success,expired));
+        if(Looper.myLooper()==Looper.getMainLooper())finish(r,success,expired);
+        else main.post(()->finish(r,success,expired));
     }
 
     private void finish(Request r,boolean success,boolean expired) {
         if(r==null||!r.delivered.compareAndSet(false,true))return;
-
-        if(r.completed<0)
-            r.completed=SystemClock.elapsedRealtimeNanos();
-
+        if(r.completed<0)r.completed=SystemClock.elapsedRealtimeNanos();
         record(r,success,expired);
-
-        GestureCompletion callback=r.completion;
-        r.completion=null;
-
-        if(callback!=null)try {
-            callback.onFinished(success,expired);
-        } catch(Exception ignored) { }
+        GestureCompletion c=r.completion;r.completion=null;
+        if(c!=null)try { c.onFinished(success,expired); }catch(Exception ignored){}
     }
 
-    public boolean performClickAtTarget(long targetNanos,long cycleStartNanos,
-            long deadlineNanos,long touchDurationNanos,GestureCompletion completion) {
-
+    public boolean performClickAtTarget(long targetNanos,long cycleStartNanos,long deadlineNanos,
+            long touchDurationNanos,GestureCompletion completion) {
         if(!ready||stopping||completion==null||touchDurationNanos<0||
-                deadlineNanos<=cycleStartNanos||targetNanos<cycleStartNanos||
-                targetNanos>=deadlineNanos)return false;
-
+            deadlineNanos<=cycleStartNanos||targetNanos<cycleStartNanos||targetNanos>=deadlineNanos)return false;
         long durationMs=toDurationMs(touchDurationNanos);
         if(durationMs>MAX_DURATION_MS)return false;
-
         long durationNs=durationMs*NS_MS;
         if(durationNs>deadlineNanos-targetNanos)return false;
-
         synchronized(lock) {
             if(!ready||stopping||preparer==null||preparer.isShutdown())return false;
-
-            Request r=new Request(targetNanos,deadlineNanos,durationMs,
-                    x,y,generation,completion);
-
+            Request r=new Request(targetNanos,deadlineNanos,durationMs,x,y,generation,completion);
             pending.offerLast(r);
-
-            try {
-                preparer.execute(()->prepare(r));
-            } catch(Exception e) {
-                pending.remove(r);
-                return false;
-            }
+            try { preparer.execute(()->prepare(r)); }
+            catch(Exception e) { pending.remove(r);return false; }
         }
-
-        unparkScheduler();
-        return true;
+        unparkScheduler();return true;
     }
 
     private static long toDurationMs(long nanos) {
@@ -880,152 +560,78 @@ public class AutoClickService extends AccessibilityService {
 
     private void unparkScheduler() {
         lastSchedulerUnparkElapsed=SystemClock.elapsedRealtimeNanos();
-        Thread t=scheduler;
-        if(t!=null)LockSupport.unpark(t);
+        Thread t=scheduler;if(t!=null)LockSupport.unpark(t);
     }
 
-    public void cancelPendingScheduledClick() {
-        cancelPending();
-    }
+    private void unparkWorker() { Thread t=worker;if(t!=null)LockSupport.unpark(t); }
+
+    public void cancelPendingScheduledClick() { cancelPending(); }
 
     private void cancelPending() {
         List<Request> cancelled=new ArrayList<>();
-
         synchronized(lock) {
             generation++;
-
-            while(!pending.isEmpty())
-                cancelled.add(pending.pollFirst());
-
-            while(!preparedBatches.isEmpty())
-                cancelled.addAll(preparedBatches.pollFirst().requests);
+            while(!pending.isEmpty())cancelled.add(pending.pollFirst());
+            cancelled.addAll(building);building.clear();
+            while(!prepared.isEmpty())cancelled.addAll(prepared.poll().requests);
         }
-
-        unparkScheduler();
-
+        unparkScheduler();unparkWorker();
         for(Request r:cancelled) {
-            r.callbackResult="CANCELLED_BEFORE_DISPATCH";
-            postFinish(r,false,true);
+            r.callbackResult="CANCELLED_BEFORE_DISPATCH";postFinish(r,false,true);
         }
     }
 
-    @Override public void onInterrupt() {
-        cancelPending();
-    }
-
+    @Override public void onInterrupt() { cancelPending(); }
     @Override public void onAccessibilityEvent(AccessibilityEvent event) { }
 
     @Override public void onDestroy() {
-        ready=false;
-        stopping=true;
-
-        Thread t=scheduler;
-        scheduler=null;
-
-        if(t!=null) {
-            LockSupport.unpark(t);
-            t.interrupt();
-        }
-
-        ExecutorService executor=preparer;
-        preparer=null;
-        if(executor!=null)executor.shutdownNow();
-
-        ExecutorService dispatch=dispatchExecutor;
-        dispatchExecutor=null;
-        if(dispatch!=null)dispatch.shutdownNow();
-
+        ready=false;stopping=true;
+        Thread st=scheduler;scheduler=null;
+        if(st!=null) { LockSupport.unpark(st);st.interrupt(); }
+        Thread wt=worker;worker=null;
+        if(wt!=null) { LockSupport.unpark(wt);wt.interrupt(); }
+        ExecutorService ex=preparer;preparer=null;
+        if(ex!=null)ex.shutdownNow();
         List<Request> waiting=new ArrayList<>(),running=new ArrayList<>();
-
         synchronized(lock) {
             generation++;
-
-            while(!pending.isEmpty())
-                waiting.add(pending.pollFirst());
-
-            while(!preparedBatches.isEmpty())
-                waiting.addAll(preparedBatches.pollFirst().requests);
-
+            while(!pending.isEmpty())waiting.add(pending.pollFirst());
+            waiting.addAll(building);building.clear();
+            while(!prepared.isEmpty())waiting.addAll(prepared.poll().requests);
+            if(workerCurrentBatch!=null)waiting.addAll(workerCurrentBatch.requests);
             running.addAll(active);
-
-            for(Request r:callbackPending)
-                if(!running.contains(r))running.add(r);
-
-            callbackPending.clear();
-            active.clear();
-            activeGestureReleaseElapsed=0;
-            dispatching=false;
+            for(Request r:callbackPending)if(!running.contains(r))running.add(r);
+            callbackPending.clear();active.clear();activeRelease=0;
+            dispatching=false;workerCurrentBatch=null;
         }
-
-        for(Request r:waiting) {
-            r.callbackResult="SERVICE_DESTROYED_PENDING";
-            finish(r,false,true);
-        }
-
-        for(Request r:running) {
-            r.callbackResult="SERVICE_DESTROYED_ACTIVE";
-            finish(r,false,false);
-        }
-
-        writerStopping=true;
-        if(writerThread!=null)writerThread.interrupt();
-
-        HandlerThread callback=callbackThread;
-        callbackThread=null;
-        callbackHandler=null;
-        if(callback!=null)callback.quitSafely();
-
+        for(Request r:waiting) { r.callbackResult="SERVICE_DESTROYED_PENDING";finish(r,false,true); }
+        for(Request r:running) { r.callbackResult="SERVICE_DESTROYED_ACTIVE";finish(r,false,false); }
+        writerStopping=true;if(writerThread!=null)writerThread.interrupt();
+        HandlerThread cb=callbackThread;callbackThread=null;callbackHandler=null;
+        if(cb!=null)cb.quitSafely();
         if(instance==this)instance=null;
-
-        preferences=null;
-        super.onDestroy();
+        preferences=null;super.onDestroy();
     }
 
-    public static AutoClickService getInstance() {
-        return instance;
-    }
-
-    public boolean isServiceReady() {
-        return ready;
-    }
-
-    public boolean isGestureInProgress() {
-        synchronized(lock) {
-            return !active.isEmpty();
-        }
-    }
-
-    public int getTargetX() {
-        return x;
-    }
-
-    public int getTargetY() {
-        return y;
-    }
-
-    public String getTimingFilePath() {
-        return logPath;
-    }
+    public static AutoClickService getInstance() { return instance; }
+    public boolean isServiceReady() { return ready; }
+    public boolean isGestureInProgress() { synchronized(lock) { return !active.isEmpty(); } }
+    public int getTargetX() { return x; }
+    public int getTargetY() { return y; }
+    public String getTimingFilePath() { return logPath; }
 
     public void setTarget(int newX,int newY) {
         int nx=Math.max(0,newX),ny=Math.max(0,newY);
-
         runOnMain(()->{
             if(!ready||(x==nx&&y==ny))return;
-
-            x=nx;
-            y=ny;
-
+            x=nx;y=ny;
             SharedPreferences p=preferences;
-            if(p!=null)
-                p.edit().putInt(KEY_X,nx).putInt(KEY_Y,ny).apply();
+            if(p!=null)p.edit().putInt(KEY_X,nx).putInt(KEY_Y,ny).apply();
         });
     }
 
     private void runOnMain(Runnable action) {
-        if(Looper.myLooper()==Looper.getMainLooper())
-            action.run();
-        else
-            main.post(action);
+        if(Looper.myLooper()==Looper.getMainLooper())action.run();
+        else main.post(action);
     }
 }
