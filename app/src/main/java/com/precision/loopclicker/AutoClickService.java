@@ -1,4 +1,3 @@
-<CodeBlock language="java" id="autoclick-part1">
 package com.precision.loopclicker;
 import android.accessibilityservice.AccessibilityService; import android.accessibilityservice.GestureDescription;
 import android.content.SharedPreferences; import android.graphics.Path;
@@ -6,7 +5,7 @@ import android.os.Handler; import android.os.HandlerThread; import android.os.Lo
 import android.view.accessibility.AccessibilityEvent; import java.io.*; import java.nio.charset.StandardCharsets;
 import java.util.*; import java.util.concurrent.*; import java.util.concurrent.atomic.AtomicBoolean; import java.util.concurrent.locks.LockSupport;
 public class AutoClickService extends AccessibilityService {
-    private static final long NS_MS = 1_000_000L, DISPATCH_LEAD_MS = 12L, DISPATCH_LEAD_NS = DISPATCH_LEAD_MS * NS_MS;
+    private static final long NS_MS = 1_000_000L, SPIN_NS = 5_000_000L, DISPATCH_LEAD_NS = 12L * NS_MS;
     private static final long MAX_DURATION_MS = GestureDescription.getMaxGestureDuration();
     private static final int MAX_STROKES = Math.min(10, GestureDescription.getMaxStrokeCount());
     private static final int MAX_PREPARED_BATCHES = 20;
@@ -348,7 +347,6 @@ public class AutoClickService extends AccessibilityService {
                 long remaining = headBatch.baseTarget - DISPATCH_LEAD_NS
                         - SystemClock.elapsedRealtimeNanos();
                 if (remaining > 0L) LockSupport.parkNanos(this, remaining);
-                else unparkScheduler();
                 continue;
             }
             if (first == null || first.path == null || !canBuild || busy) {
@@ -374,7 +372,7 @@ public class AutoClickService extends AccessibilityService {
                 if (r.generation != gen || r.target < base) break;
                 long delta = r.target - base;
                 if (delta % NS_MS != 0) break;
-                long offset = DISPATCH_LEAD_MS + delta / NS_MS;
+                long offset = delta / NS_MS;
                 if (offset > MAX_DURATION_MS
                         || r.durationMs > MAX_DURATION_MS - offset) break;
                 if (r.path == null) return true;
@@ -393,7 +391,7 @@ public class AutoClickService extends AccessibilityService {
                 if (r.generation != gen || r.path == null || r.target < base) break;
                 long delta = r.target - base;
                 if (delta % NS_MS != 0) break;
-                long offset = DISPATCH_LEAD_MS + delta / NS_MS;
+                long offset = delta / NS_MS;
                 if (offset > MAX_DURATION_MS
                         || r.durationMs > MAX_DURATION_MS - offset) break;
                 r.offsetMs = offset;
@@ -402,11 +400,6 @@ public class AutoClickService extends AccessibilityService {
         }
         return result;
     }
-</CodeBlock>
-
-بخش دوم؛ از ادامه‌ی همان فایل تا انتهای کلاس:
-
-<CodeBlock language="java" id="autoclick-part2">
     private boolean current(Request r) {
         return r != null && r.generation == generation && ready && !stopping;
     }
@@ -419,20 +412,18 @@ public class AutoClickService extends AccessibilityService {
         }
         return builder.build();
     }
-    private boolean validAtDispatch(Request r, long now) {
-        if (now >= r.target) {
-            r.callbackResult = "TARGET_MISSED_BEFORE_DISPATCH";
-            return false;
-        }
-        if (r.offsetMs > MAX_DURATION_MS
-                || r.durationMs > MAX_DURATION_MS - r.offsetMs) {
-            r.callbackResult = "GESTURE_DURATION_LIMIT";
-            return false;
-        }
-        long offset = r.offsetMs * NS_MS, remaining = r.deadline - now;
-        if (remaining <= 0 || offset > remaining
-                || r.durationNs > remaining - offset) {
-            r.callbackResult = "DEADLINE_BEFORE_DISPATCH";
+    private boolean fitsDeadline(Request r, long start) {
+        if (start >= r.deadline) return false;
+        long offset = r.offsetMs * NS_MS, remaining = r.deadline - start;
+        return offset <= remaining && r.durationNs <= remaining - offset;
+    }
+    private boolean rebaseForDispatch(Request r, long now) {
+        long delta = r.target - now;
+        if (delta <= 0) { r.callbackResult = "TARGET_MISSED_BEFORE_DISPATCH"; return false; }
+        r.offsetMs = delta / NS_MS + (delta % NS_MS == 0 ? 0 : 1);
+        if (r.offsetMs > MAX_DURATION_MS || r.durationMs > MAX_DURATION_MS - r.offsetMs
+                || !fitsDeadline(r, now)) {
+            r.callbackResult = "DEADLINE_AFTER_REBASE";
             return false;
         }
         return true;
@@ -451,9 +442,10 @@ public class AutoClickService extends AccessibilityService {
         boolean changed = false;
         for (Request r : batch.requests) {
             r.workerStart = workerStart;
-            if (current(r) && validAtDispatch(r, workerStart)) {
-                valid.add(r);
-            } else { expired.add(r); changed = true; }
+            long old = r.offsetMs;
+            if (current(r) && rebaseForDispatch(r, workerStart)) {
+                valid.add(r); changed |= old != r.offsetMs;
+            } else expired.add(r);
         }
         for (Request r : expired) postFinish(r, false, true);
         if (valid.isEmpty()) { clearDispatching(); unparkScheduler(); return; }
@@ -476,7 +468,9 @@ public class AutoClickService extends AccessibilityService {
                 } else {
                     long now = SystemClock.elapsedRealtimeNanos();
                     for (Request r : valid) {
-                        if (!current(r) || !validAtDispatch(r, now)) invalid.add(r);
+                        long old = r.offsetMs;
+                        if (!current(r) || !rebaseForDispatch(r, now)) invalid.add(r);
+                        else changed |= old != r.offsetMs;
                     }
                     if (!invalid.isEmpty()) { valid.removeAll(invalid); changed = true; retry = true; }
                     if (valid.isEmpty()) dispatching = false;
@@ -489,8 +483,8 @@ public class AutoClickService extends AccessibilityService {
                             for (Request r : valid) {
                                 if (r.target <= start) {
                                     r.callbackResult = "TARGET_MISSED_DURING_REBUILD"; invalid.add(r);
-                                } else if (!validAtDispatch(r, start)) {
-                                    invalid.add(r);
+                                } else if (!fitsDeadline(r, start)) {
+                                    r.callbackResult = "DEADLINE_AFTER_REBUILD"; invalid.add(r);
                                 }
                             }
                             if (!invalid.isEmpty()) {
@@ -704,6 +698,3 @@ public class AutoClickService extends AccessibilityService {
         }
     }
 }
-</CodeBlock>
-
-**نکته‌ی مهم درباره‌ی آزمایش:** این نسخه را از نظر ساختار و توازن آکولادها بررسی کردم، اما در این محیط کامپایل اندروید اجرا نشده است. همچنین ۱۲ میلی‌ثانیه، زمان پیش‌ارسال است؛ تضمین زمان فیزیکی لمس در اندروید ممکن نیست. بعد از جایگزینی فایل و اجرا، گزارش CSV جدید را بفرست تا ببینیم `TARGET_MISSED_BEFORE_DISPATCH` و `TARGET_MISSED_DURING_REBUILD` چقدر کاهش پیدا کرده‌اند.
