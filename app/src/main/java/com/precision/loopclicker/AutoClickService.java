@@ -5,9 +5,10 @@ import android.os.Handler; import android.os.HandlerThread; import android.os.Lo
 import android.view.accessibility.AccessibilityEvent; import java.io.*; import java.nio.charset.StandardCharsets;
 import java.util.*; import java.util.concurrent.*; import java.util.concurrent.atomic.AtomicBoolean; import java.util.concurrent.locks.LockSupport;
 public class AutoClickService extends AccessibilityService {
-    private static final long NS_MS = 1_000_000L, SPIN_NS = 5_000_000L, DISPATCH_LEAD_NS = 12L * NS_MS;
+    private static final long NS_MS = 1_000_000L, DISPATCH_LEAD_MS = 12L;
+    private static final long DISPATCH_LEAD_NS = DISPATCH_LEAD_MS * NS_MS;
     private static final long MAX_DURATION_MS = GestureDescription.getMaxGestureDuration();
-    private static final int MAX_STROKES = Math.min(10, GestureDescription.getMaxStrokeCount());
+    private static final int MAX_STROKES = GestureDescription.getMaxStrokeCount();
     private static final int MAX_PREPARED_BATCHES = 20;
     private static final String PREFS = "auto_click_target", KEY_X = "target_x",
             KEY_Y = "target_y", LOG_FILE = "PrecisionClickTiming_v3.txt";
@@ -68,11 +69,11 @@ public class AutoClickService extends AccessibilityService {
     }
     private static final class PreparedBatch {
         final ArrayList<Request> requests;
-        final GestureDescription gesture;
+        final GestureDescription[] gestures;
         final long baseTarget;
-        PreparedBatch(ArrayList<Request> requests, GestureDescription gesture) {
+        PreparedBatch(ArrayList<Request> requests, GestureDescription[] gestures) {
             this.requests = requests;
-            this.gesture = gesture;
+            this.gestures = gestures;
             baseTarget = requests.get(0).target;
         }
     }
@@ -325,13 +326,13 @@ public class AutoClickService extends AccessibilityService {
                     long buildStart = SystemClock.elapsedRealtimeNanos();
                     for (Request r : requests) r.batchBuildStart = buildStart;
                     try {
-                        GestureDescription gesture = buildGesture(requests);
+                        GestureDescription[] gestures = buildGestures(requests);
                         long readyTime = SystemClock.elapsedRealtimeNanos();
                         synchronized (lock) {
                             if (!stopping && preparedBatches.size() < MAX_PREPARED_BATCHES
                                     && current(requests.get(0))) {
                                 for (Request r : requests) r.batchReady = readyTime;
-                                preparedBatches.addLast(new PreparedBatch(requests, gesture));
+                                preparedBatches.addLast(new PreparedBatch(requests, gestures));
                             } else {
                                 requeueCurrentInOrder(requests);
                             }
@@ -373,8 +374,8 @@ public class AutoClickService extends AccessibilityService {
                 long delta = r.target - base;
                 if (delta % NS_MS != 0) break;
                 long offset = delta / NS_MS;
-                if (offset > MAX_DURATION_MS
-                        || r.durationMs > MAX_DURATION_MS - offset) break;
+                if (offset > MAX_DURATION_MS - DISPATCH_LEAD_MS
+                        || r.durationMs > MAX_DURATION_MS - DISPATCH_LEAD_MS - offset) break;
                 if (r.path == null) return true;
                 count++;
             }
@@ -392,8 +393,8 @@ public class AutoClickService extends AccessibilityService {
                 long delta = r.target - base;
                 if (delta % NS_MS != 0) break;
                 long offset = delta / NS_MS;
-                if (offset > MAX_DURATION_MS
-                        || r.durationMs > MAX_DURATION_MS - offset) break;
+                if (offset > MAX_DURATION_MS - DISPATCH_LEAD_MS
+                        || r.durationMs > MAX_DURATION_MS - DISPATCH_LEAD_MS - offset) break;
                 r.offsetMs = offset;
                 result.add(pending.pollFirst());
             }
@@ -403,30 +404,18 @@ public class AutoClickService extends AccessibilityService {
     private boolean current(Request r) {
         return r != null && r.generation == generation && ready && !stopping;
     }
-    private GestureDescription buildGesture(List<Request> requests) {
-        GestureDescription.Builder builder = new GestureDescription.Builder();
-        for (Request r : requests) {
-            if (r.path == null) throw new IllegalStateException("PATH_NOT_PREPARED");
-            builder.addStroke(new GestureDescription.StrokeDescription(
-                    r.path, r.offsetMs, r.durationMs));
+    private GestureDescription[] buildGestures(List<Request> requests) {
+        GestureDescription[] result = new GestureDescription[(int) DISPATCH_LEAD_MS + 1];
+        for (int lead = 1; lead <= DISPATCH_LEAD_MS; lead++) {
+            GestureDescription.Builder builder = new GestureDescription.Builder();
+            for (Request r : requests) {
+                if (r.path == null) throw new IllegalStateException("PATH_NOT_PREPARED");
+                builder.addStroke(new GestureDescription.StrokeDescription(
+                        r.path, lead + r.offsetMs, r.durationMs));
+            }
+            result[lead] = builder.build();
         }
-        return builder.build();
-    }
-    private boolean fitsDeadline(Request r, long start) {
-        if (start >= r.deadline) return false;
-        long offset = r.offsetMs * NS_MS, remaining = r.deadline - start;
-        return offset <= remaining && r.durationNs <= remaining - offset;
-    }
-    private boolean rebaseForDispatch(Request r, long now) {
-        long delta = r.target - now;
-        if (delta <= 0) { r.callbackResult = "TARGET_MISSED_BEFORE_DISPATCH"; return false; }
-        r.offsetMs = delta / NS_MS + (delta % NS_MS == 0 ? 0 : 1);
-        if (r.offsetMs > MAX_DURATION_MS || r.durationMs > MAX_DURATION_MS - r.offsetMs
-                || !fitsDeadline(r, now)) {
-            r.callbackResult = "DEADLINE_AFTER_REBASE";
-            return false;
-        }
-        return true;
+        return result;
     }
     private void dispatchPrepared() {
         PreparedBatch batch;
@@ -438,106 +427,76 @@ public class AutoClickService extends AccessibilityService {
             dispatching = true;
         }
         long workerStart = SystemClock.elapsedRealtimeNanos();
-        ArrayList<Request> valid = new ArrayList<>(), expired = new ArrayList<>();
-        boolean changed = false;
-        for (Request r : batch.requests) {
-            r.workerStart = workerStart;
-            long old = r.offsetMs;
-            if (current(r) && rebaseForDispatch(r, workerStart)) {
-                valid.add(r); changed |= old != r.offsetMs;
-            } else expired.add(r);
-        }
-        for (Request r : expired) postFinish(r, false, true);
-        if (valid.isEmpty()) { clearDispatching(); unparkScheduler(); return; }
-        GestureDescription gesture;
-        try { gesture = changed ? buildGesture(valid) : batch.gesture; }
-        catch (Exception e) {
-            clearDispatching(); finishWithoutDispatch(valid,
-                    "BATCH_REBUILD_FAILED:" + e.getClass().getSimpleName(), false);
-            unparkScheduler(); return;
-        }
-        while (!valid.isEmpty() && !stopping) {
-            ArrayList<Request> invalid = new ArrayList<>();
-            Batch callback = null;
-            boolean aborted = false, accepted = false, exception = false, retry = false;
-            long start = 0, end = 0, previousCallback = 0;
-            String exceptionName = "", buildError = "";
-            synchronized (lock) {
-                if (stopping || !current(valid.get(0)) || !active.isEmpty()) {
-                    dispatching = false; aborted = true;
+        for (Request r : batch.requests) r.workerStart = workerStart;
+
+        Batch callback = null;
+        long dispatchStart = 0, previousCallback = 0, end = 0;
+        int leadMs = 0;
+        boolean accepted = false;
+        String failure = "", error = "";
+        synchronized (lock) {
+            if (stopping || !current(batch.requests.get(0)) || !active.isEmpty()) {
+                failure = "SERVICE_OR_GENERATION_INVALID";
+            } else {
+                dispatchStart = SystemClock.elapsedRealtimeNanos();
+                long delta = batch.baseTarget - dispatchStart;
+                leadMs = delta <= 0 ? 0 : (int) ((delta + NS_MS - 1) / NS_MS);
+                if (leadMs < 1 || leadMs > DISPATCH_LEAD_MS) {
+                    failure = "TARGET_MISSED_BEFORE_DISPATCH";
                 } else {
-                    long now = SystemClock.elapsedRealtimeNanos();
-                    for (Request r : valid) {
-                        long old = r.offsetMs;
-                        if (!current(r) || !rebaseForDispatch(r, now)) invalid.add(r);
-                        else changed |= old != r.offsetMs;
-                    }
-                    if (!invalid.isEmpty()) { valid.removeAll(invalid); changed = true; retry = true; }
-                    if (valid.isEmpty()) dispatching = false;
-                    else if (!retry) {
-                        try { if (changed) gesture = buildGesture(valid); }
-                        catch (Exception e) { buildError = e.getClass().getSimpleName(); }
-                        if (!buildError.isEmpty()) dispatching = false;
-                        else {
-                            start = SystemClock.elapsedRealtimeNanos();
-                            for (Request r : valid) {
-                                if (r.target <= start) {
-                                    r.callbackResult = "TARGET_MISSED_DURING_REBUILD"; invalid.add(r);
-                                } else if (!fitsDeadline(r, start)) {
-                                    r.callbackResult = "DEADLINE_AFTER_REBUILD"; invalid.add(r);
-                                }
-                            }
-                            if (!invalid.isEmpty()) {
-                                valid.removeAll(invalid); changed = true; retry = true;
-                                if (valid.isEmpty()) dispatching = false;
-                            } else {
-                                previousCallback = lastCallbackElapsed;
-                                for (Request r : valid) {
-                                    r.dispatchStart = start; r.previousCallbackElapsed = previousCallback;
-                                    r.handoffDelay = previousCallback == 0 ? 0 : Math.max(0, start - previousCallback);
-                                    r.callbackResult = "WAITING_FOR_CALLBACK";
-                                }
-                                callback = new Batch(this, valid); active.addAll(valid);
-                                try {
-                                    Handler callbackTarget = callbackHandler;
-                                    accepted = callbackTarget != null
-                                            && dispatchGesture(gesture, callback, callbackTarget);
-                                }
-                                catch (Exception e) { exception = true; exceptionName = e.getClass().getSimpleName(); }
-                                end = SystemClock.elapsedRealtimeNanos();
-                                for (Request r : valid) { r.dispatchDuration = end - start; r.accepted = accepted; }
-                                if (!accepted || exception) active.removeAll(valid);
-                                dispatching = false;
-                            }
+                    long latestStart = Long.MAX_VALUE;
+                    for (Request r : batch.requests) {
+                        if (!current(r)) {
+                            failure = "STALE_GENERATION";
+                            break;
                         }
+                        long offsetNs = (leadMs + r.offsetMs) * NS_MS;
+                        long allowedStart = r.deadline - offsetNs - r.durationNs;
+                        if (allowedStart < latestStart) latestStart = allowedStart;
                     }
+                    if (failure.isEmpty() && dispatchStart > latestStart)
+                        failure = "DEADLINE_AFTER_PREPARATION";
+                }
+                if (failure.isEmpty()) {
+                    previousCallback = lastCallbackElapsed;
+                    callback = new Batch(this, batch.requests);
+                    active.addAll(batch.requests);
+                    for (Request r : batch.requests) {
+                        r.dispatchStart = dispatchStart;
+                        r.previousCallbackElapsed = previousCallback;
+                        r.handoffDelay = previousCallback == 0
+                                ? 0 : Math.max(0, dispatchStart - previousCallback);
+                        r.callbackResult = "WAITING_FOR_CALLBACK";
+                    }
+                    try {
+                        Handler target = callbackHandler;
+                        accepted = target != null
+                                && dispatchGesture(batch.gestures[leadMs], callback, target);
+                    } catch (Exception e) {
+                        error = "DISPATCH_EXCEPTION:" + e.getClass().getSimpleName();
+                    }
+                    end = SystemClock.elapsedRealtimeNanos();
+                    for (Request r : batch.requests) {
+                        r.dispatchDuration = end - dispatchStart;
+                        r.accepted = accepted;
+                    }
+                    if (!accepted) active.removeAll(batch.requests);
                 }
             }
-            for (Request r : invalid) postFinish(r, false, true);
-            if (aborted) { finishWithoutDispatch(valid, "CANCELLED_BEFORE_REGISTRATION", true); unparkScheduler(); return; }
-            if (!buildError.isEmpty()) {
-                clearDispatching(); finishWithoutDispatch(valid, "BATCH_REBUILD_FAILED:" + buildError, false);
-                unparkScheduler(); return;
-            }
-            if (retry) {
-                if (valid.isEmpty()) { clearDispatching(); unparkScheduler(); return; }
-                continue;
-            }
-            if (exception || !accepted) {
-                String reason = exception ? "DISPATCH_EXCEPTION:" + exceptionName : "API_RETURNED_FALSE";
-                for (Request r : valid) r.callbackResult = reason;
-                finishWithoutDispatch(valid, reason, false); unparkScheduler(); return;
-            }
-            callback.onDispatchReturned(true); unparkScheduler(); return;
-        }
-        clearDispatching();
-        if (!valid.isEmpty()) finishWithoutDispatch(valid, "SERVICE_STOPPING", true);
-        unparkScheduler();
-    }
-    private void clearDispatching() {
-        synchronized (lock) {
             dispatching = false;
         }
+        if (!failure.isEmpty()) {
+            for (Request r : batch.requests) {
+                r.callbackResult = failure;
+                postFinish(r, false, true);
+            }
+        } else if (!accepted) {
+            String reason = error.isEmpty() ? "API_RETURNED_FALSE" : error;
+            finishWithoutDispatch(batch.requests, reason, false);
+        } else {
+            callback.onDispatchReturned(true);
+        }
+        unparkScheduler();
     }
     private void finishWithoutDispatch(List<Request> requests,
             String reason, boolean expired) {
