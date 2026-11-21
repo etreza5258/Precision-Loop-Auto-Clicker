@@ -20,13 +20,13 @@ public class AutoClickService extends AccessibilityService {
     private static final long MAX_DURATION_MS=GestureDescription.getMaxGestureDuration();
     private static final int MAX_STROKES=GestureDescription.getMaxStrokeCount();
     private static final int MAX_PREPARED_BATCHES=20;
-    private static final String PREFS="auto_click_target", KEY_X="target_x",
-            KEY_Y="target_y", LOG_FILE="PrecisionClickTiming_v3.txt";
-    private static final int DEFAULT_X=350, DEFAULT_Y=700;
+    private static final String PREFS="auto_click_target",KEY_X="target_x",
+            KEY_Y="target_y",LOG_FILE="PrecisionClickTiming_v3.txt";
+    private static final int DEFAULT_X=350,DEFAULT_Y=700;
     private static volatile AutoClickService instance;
 
     public interface GestureCompletion {
-        void onFinished(boolean success, boolean expired);
+        void onFinished(boolean success,boolean expired);
     }
 
     private final Handler main=new Handler(Looper.getMainLooper());
@@ -37,32 +37,41 @@ public class AutoClickService extends AccessibilityService {
     private final ArrayList<Request> active=new ArrayList<>(64);
     private final ArrayList<Request> callbackPending=new ArrayList<>(64);
     private final LinkedBlockingQueue<Timing> logs=new LinkedBlockingQueue<>();
-    private volatile boolean ready, stopping, writerStopping;
-    private volatile int x=DEFAULT_X, y=DEFAULT_Y;
-    private volatile long generation, lastCallbackElapsed;
-    private volatile Thread scheduler, writerThread;
+    private volatile boolean ready,stopping,writerStopping;
+    private volatile int x=DEFAULT_X,y=DEFAULT_Y;
+    private volatile long generation,lastCallbackElapsed;
+    private volatile long lastSchedulerUnparkElapsed=-1;
+    private volatile Thread scheduler,writerThread;
     private volatile ExecutorService preparer;
     private volatile String logPath="فایل گزارش هنوز ساخته نشده است";
-    private final ArrayDeque<PreparedBatch> preparedBatches=new ArrayDeque<>(MAX_PREPARED_BATCHES);
+    private final ArrayDeque<PreparedBatch> preparedBatches=
+            new ArrayDeque<>(MAX_PREPARED_BATCHES);
     private boolean dispatching;
     private long activeGestureReleaseElapsed;
     private SharedPreferences preferences;
 
     private static final class Request {
-        final long target, deadline, durationMs, durationNs, generation;
+        final long target,deadline,durationMs,durationNs,generation;
         final int x,y;
-        final AtomicBoolean recorded=new AtomicBoolean(), delivered=new AtomicBoolean();
+        final AtomicBoolean recorded=new AtomicBoolean(),delivered=new AtomicBoolean();
 
         volatile Path path;
-        volatile long offsetMs, prepareStart, prepareEnd, batchBuildStart, batchReady,
-                workerStart, dispatchStart, dispatchDuration, completed, callbackElapsed,
-                previousCallbackElapsed, handoffDelay, lastStrokeEndElapsed;
+        volatile long offsetMs;
+        volatile long prepareStart=-1,prepareEnd=-1,batchBuildStart=-1,batchReady=-1;
+        volatile long workerStart=-1,dispatchStart=-1,dispatchDuration=-1;
+        volatile long completed=-1,callbackElapsed=-1,previousCallbackElapsed=-1;
+        volatile long handoffDelay=-1,lastStrokeEndElapsed=-1;
 
-        volatile long schedulerParkStart, schedulerWakeTarget, schedulerParkReturn,
-                schedulerWakeLateness, schedulerSpinDuration;
+        volatile long schedulerParkStart=-1,schedulerWakeTarget=-1;
+        volatile long schedulerParkReturn=-1,schedulerWakeLateness=-1;
+        volatile long schedulerSpinDuration=-1;
 
-        volatile long lockWaitStart=-1, lockAcquired=-1, dispatchDecision=-1,
-                apiCallStart=-1, apiCallReturn=-1;
+        volatile long schedulerLoopEntry=-1,schedulerWakeElapsed=-1;
+        volatile long schedulerUnparkElapsed=-1,schedulerDecisionElapsed=-1;
+        volatile long schedulerDispatchEntry=-1;
+
+        volatile long lockWaitStart=-1,lockAcquired=-1,dispatchDecision=-1;
+        volatile long apiCallStart=-1,apiCallReturn=-1;
 
         volatile boolean accepted;
         volatile String callbackResult="NOT_DISPATCHED";
@@ -73,7 +82,7 @@ public class AutoClickService extends AccessibilityService {
             this.target=target;
             this.deadline=deadline;
             this.durationMs=durationMs;
-            this.durationNs=durationMs*NS_MS;
+            durationNs=durationMs*NS_MS;
             this.x=x;
             this.y=y;
             this.generation=generation;
@@ -148,15 +157,14 @@ public class AutoClickService extends AccessibilityService {
     }
 
     private static final class Timing {
-        final long target,prepareStart,prepareEnd,batchBuildStart,batchReady,workerStart,
-                dispatchStart,dispatchDuration,completed,callbackElapsed,
-                previousCallbackElapsed,handoffDelay,lastStrokeEndElapsed;
-
-        final long schedulerParkStart,schedulerWakeTarget,schedulerParkReturn,
-                schedulerWakeLateness,schedulerSpinDuration;
-
+        final long target,prepareStart,prepareEnd,batchBuildStart,batchReady;
+        final long workerStart,dispatchStart,dispatchDuration,completed,callbackElapsed;
+        final long previousCallbackElapsed,handoffDelay,lastStrokeEndElapsed;
+        final long schedulerParkStart,schedulerWakeTarget,schedulerParkReturn;
+        final long schedulerWakeLateness,schedulerSpinDuration;
+        final long schedulerLoopEntry,schedulerWakeElapsed,schedulerUnparkElapsed;
+        final long schedulerDecisionElapsed,schedulerDispatchEntry;
         final long lockWaitStart,lockAcquired,dispatchDecision,apiCallStart,apiCallReturn;
-
         final int x,y;
         final boolean accepted,success,expired;
         final String callback;
@@ -182,6 +190,12 @@ public class AutoClickService extends AccessibilityService {
             schedulerWakeLateness=r.schedulerWakeLateness;
             schedulerSpinDuration=r.schedulerSpinDuration;
 
+            schedulerLoopEntry=r.schedulerLoopEntry;
+            schedulerWakeElapsed=r.schedulerWakeElapsed;
+            schedulerUnparkElapsed=r.schedulerUnparkElapsed;
+            schedulerDecisionElapsed=r.schedulerDecisionElapsed;
+            schedulerDispatchEntry=r.schedulerDispatchEntry;
+
             lockWaitStart=r.lockWaitStart;
             lockAcquired=r.lockAcquired;
             dispatchDecision=r.dispatchDecision;
@@ -197,30 +211,26 @@ public class AutoClickService extends AccessibilityService {
         }
 
         String csv() {
-            long prepare=prepareStart==0||prepareEnd==0?0:prepareEnd-prepareStart;
-            long build=batchBuildStart==0||batchReady==0?0:batchReady-batchBuildStart;
-            long readyToWorker=batchReady==0||workerStart==0?0:workerStart-batchReady;
-            long targetWait=batchReady==0?0:Math.max(0,target-batchReady);
-            long previousWait=batchReady==0||previousCallbackElapsed==0?0:
+            long prepare=diff(prepareStart,prepareEnd);
+            long build=diff(batchBuildStart,batchReady);
+            long readyToWorker=diff(batchReady,workerStart);
+            long targetWait=batchReady<0?-1:Math.max(0,target-batchReady);
+            long previousWait=batchReady<0||previousCallbackElapsed<0?-1:
                     Math.max(0,previousCallbackElapsed-batchReady);
-            long dispatchDelta=dispatchStart==0?0:dispatchStart-target;
-            long pipeline=dispatchStart==0||workerStart==0?0:dispatchStart-workerStart;
-            long completionDelay=completed==0?0:completed-target;
-            long dispatchToCallback=dispatchStart==0||callbackElapsed==0?0:
-                    callbackElapsed-dispatchStart;
-            long lastStrokeToCallback=lastStrokeEndElapsed==0||callbackElapsed==0?0:
-                    callbackElapsed-lastStrokeEndElapsed;
-            long wakeToWorker=schedulerParkReturn==0||workerStart==0?0:
-                    workerStart-schedulerParkReturn;
+            long dispatchDelta=dispatchStart<0?-1:dispatchStart-target;
+            long pipeline=diff(workerStart,dispatchStart);
+            long completionDelay=completed<0?-1:completed-target;
+            long dispatchToCallback=diff(dispatchStart,callbackElapsed);
+            long lastStrokeToCallback=diff(lastStrokeEndElapsed,callbackElapsed);
+            long wakeToWorker=diff(schedulerParkReturn,workerStart);
 
-            long lockWait=lockWaitStart<0||lockAcquired<0?-1:
-                    lockAcquired-lockWaitStart;
-            long workerToDecision=workerStart==0||dispatchDecision<0?-1:
-                    dispatchDecision-workerStart;
-            long decisionToApi=dispatchDecision<0||apiCallStart<0?-1:
-                    apiCallStart-dispatchDecision;
-            long apiDuration=apiCallStart<0||apiCallReturn<0?-1:
-                    apiCallReturn-apiCallStart;
+            long lockWait=diff(lockWaitStart,lockAcquired);
+            long workerToDecision=diff(workerStart,dispatchDecision);
+            long decisionToApi=diff(dispatchDecision,apiCallStart);
+            long apiDuration=diff(apiCallStart,apiCallReturn);
+            long schedulerWakeToDispatch=diff(schedulerWakeElapsed,schedulerDispatchEntry);
+            long schedulerLoopToDispatch=diff(schedulerLoopEntry,schedulerDispatchEntry);
+            long unparkToWake=diff(schedulerUnparkElapsed,schedulerWakeElapsed);
 
             String result=expired?"EXPIRED":success?"SUCCESS":"FAILED";
 
@@ -237,7 +247,15 @@ public class AutoClickService extends AccessibilityService {
                     schedulerSpinDuration+","+wakeToWorker+",-1,"+
                     lockWaitStart+","+lockAcquired+","+lockWait+","+
                     dispatchDecision+","+apiCallStart+","+apiCallReturn+","+
-                    workerToDecision+","+decisionToApi+","+apiDuration;
+                    workerToDecision+","+decisionToApi+","+apiDuration+","+
+                    schedulerLoopEntry+","+schedulerWakeElapsed+","+
+                    schedulerUnparkElapsed+","+schedulerDecisionElapsed+","+
+                    schedulerDispatchEntry+","+schedulerWakeToDispatch+","+
+                    schedulerLoopToDispatch+","+unparkToWake;
+        }
+
+        private static long diff(long start,long end) {
+            return start<0||end<0?-1:end-start;
         }
     }
 
@@ -307,7 +325,11 @@ public class AutoClickService extends AccessibilityService {
                         "dispatch_lock_wait_ns,dispatch_decision_elapsed_ns,"+
                         "dispatch_api_call_start_elapsed_ns,dispatch_api_call_return_elapsed_ns,"+
                         "dispatch_worker_to_decision_ns,dispatch_decision_to_api_ns,"+
-                        "dispatch_api_duration_ns");
+                        "dispatch_api_duration_ns,scheduler_loop_entry_elapsed_ns,"+
+                        "scheduler_wake_elapsed_ns,scheduler_last_unpark_elapsed_ns,"+
+                        "scheduler_decision_elapsed_ns,scheduler_dispatch_entry_elapsed_ns,"+
+                        "scheduler_wake_to_dispatch_ns,scheduler_loop_to_dispatch_ns,"+
+                        "scheduler_unpark_to_wake_ns");
                 out.newLine();
                 out.flush();
             }
@@ -378,7 +400,7 @@ public class AutoClickService extends AccessibilityService {
         for(Request r:batch.requests) {
             r.schedulerParkStart=parkStart;
             r.schedulerWakeTarget=wakeTarget;
-            r.schedulerSpinDuration=0;
+            r.schedulerSpinDuration=-1;
         }
 
         LockSupport.parkNanos(this,Math.max(1,wakeTarget-parkStart));
@@ -398,6 +420,7 @@ public class AutoClickService extends AccessibilityService {
         } catch(Exception ignored) { }
 
         while(!stopping) {
+            long loopEntry=SystemClock.elapsedRealtimeNanos();
             PreparedBatch headBatch;
             Request first;
             boolean busy,canBuild;
@@ -423,6 +446,14 @@ public class AutoClickService extends AccessibilityService {
                 first=pending.peekFirst();
                 busy=!active.isEmpty()||dispatching;
                 canBuild=preparedBatches.size()<MAX_PREPARED_BATCHES;
+
+                if(headBatch!=null) {
+                    for(Request r:headBatch.requests) {
+                        r.schedulerLoopEntry=loopEntry;
+                        r.schedulerWakeElapsed=loopEntry;
+                        r.schedulerUnparkElapsed=lastSchedulerUnparkElapsed;
+                    }
+                }
             }
 
             for(Request r:stale) {
@@ -433,7 +464,13 @@ public class AutoClickService extends AccessibilityService {
             if(stopping)break;
 
             if(headBatch!=null&&!busy&&
-                    headBatch.baseTarget-DISPATCH_LEAD_NS<=SystemClock.elapsedRealtimeNanos()) {
+                    headBatch.baseTarget-DISPATCH_LEAD_NS<=
+                            SystemClock.elapsedRealtimeNanos()) {
+                long decision=SystemClock.elapsedRealtimeNanos();
+                for(Request r:headBatch.requests) {
+                    r.schedulerDecisionElapsed=decision;
+                    r.schedulerDispatchEntry=decision;
+                }
                 dispatchPrepared();
                 continue;
             }
@@ -592,11 +629,13 @@ public class AutoClickService extends AccessibilityService {
             dispatching=true;
         }
 
-        long workerStart=methodEntry;
-        for(Request r:batch.requests)r.workerStart=workerStart;
+        for(Request r:batch.requests) {
+            r.workerStart=methodEntry;
+            r.schedulerDispatchEntry=methodEntry;
+        }
 
         Batch callback=null;
-        long dispatchStart=0,previousCallback=0,end=0,maxStrokeEndOffsetMs=0;
+        long dispatchStart=-1,previousCallback=-1,end=-1,maxStrokeEndOffsetMs=0;
         int leadMs=0;
         boolean accepted=false;
         String failure="",error="";
@@ -640,14 +679,14 @@ public class AutoClickService extends AccessibilityService {
                 }
 
                 if(failure.isEmpty()) {
-                    previousCallback=lastCallbackElapsed;
+                    previousCallback=lastCallbackElapsed>0?lastCallbackElapsed:-1;
                     callback=new Batch(this,batch.requests);
                     active.addAll(batch.requests);
 
                     for(Request r:batch.requests) {
                         r.dispatchStart=dispatchStart;
                         r.previousCallbackElapsed=previousCallback;
-                        r.handoffDelay=previousCallback==0?0:
+                        r.handoffDelay=previousCallback<0?-1:
                                 Math.max(0,dispatchStart-previousCallback);
                         r.callbackResult="WAITING_FOR_CALLBACK";
                     }
@@ -746,7 +785,7 @@ public class AutoClickService extends AccessibilityService {
     private void finish(Request r,boolean success,boolean expired) {
         if(r==null||!r.delivered.compareAndSet(false,true))return;
 
-        if(r.completed==0)
+        if(r.completed<0)
             r.completed=SystemClock.elapsedRealtimeNanos();
 
         record(r,success,expired);
@@ -798,6 +837,7 @@ public class AutoClickService extends AccessibilityService {
     }
 
     private void unparkScheduler() {
+        lastSchedulerUnparkElapsed=SystemClock.elapsedRealtimeNanos();
         Thread t=scheduler;
         if(t!=null)LockSupport.unpark(t);
     }
