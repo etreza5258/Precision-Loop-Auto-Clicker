@@ -1,3 +1,4 @@
+
 package com.precision.loopclicker;
 
 import android.accessibilityservice.AccessibilityService;
@@ -12,6 +13,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
 
 public class AutoClickService extends AccessibilityService {
@@ -24,7 +26,9 @@ public class AutoClickService extends AccessibilityService {
     private static final String PREFS = "auto_click_target";
     private static final String KEY_X = "target_x", KEY_Y = "target_y";
     private static final String LOG_FILE = "PrecisionClickTiming_v5.txt";
+    private static final String ATTEMPT_LOG_FILE = "PrecisionClickAttempts_v1.csv";
     private static final int DEFAULT_X = 350, DEFAULT_Y = 700;
+    private static final AtomicLong ATTEMPT_IDS = new AtomicLong();
     private static volatile AutoClickService instance;
 
     public interface GestureCompletion {
@@ -40,6 +44,7 @@ public class AutoClickService extends AccessibilityService {
     private final ArrayList<Request> active = new ArrayList<>(64);
     private final ArrayList<Request> callbackPending = new ArrayList<>(64);
     private final LinkedBlockingQueue<Timing> logs = new LinkedBlockingQueue<>();
+    private final LinkedBlockingQueue<Attempt> attemptLogs = new LinkedBlockingQueue<>();
     private final PriorityQueue<PreparedBatch> prepared = new PriorityQueue<>(
             MAX_PREPARED, Comparator.comparingLong(b -> b.baseTarget));
 
@@ -50,13 +55,11 @@ public class AutoClickService extends AccessibilityService {
     private volatile Thread scheduler, worker, writerThread;
     private volatile ExecutorService preparer;
     private volatile String logPath = "فایل گزارش هنوز ساخته نشده است";
+    private volatile String attemptLogPath = "فایل گزارش تلاش‌ها هنوز ساخته نشده است";
 
     private boolean dispatching;
     private PreparedBatch workerCurrentBatch;
-
-    // زمان آزاد شدن مسیر dispatch؛ مستقل از زمان رسیدن Callback است.
     private long nextDispatchAllowedElapsedNs;
-
     private SharedPreferences preferences;
 
     private static final class Request {
@@ -178,20 +181,17 @@ public class AutoClickService extends AccessibilityService {
     }
 
     private static final class Timing {
-        final Request r;
-        final boolean success, expired;
+        final String row;
 
-        Timing(Request r, boolean s, boolean e) {
-            this.r = r;
-            success = s;
-            expired = e;
+        Timing(Request r, boolean success, boolean expired) {
+            row = createRow(r, success, expired);
         }
 
         private static long diff(long a, long b) {
             return a < 0 || b < 0 ? -1 : b - a;
         }
 
-        String csv() {
+        private static String createRow(Request r, boolean success, boolean expired) {
             long prepare = diff(r.prepareStart, r.prepareEnd);
             long build = diff(r.batchBuildStart, r.batchReady);
             long readyWorker = diff(r.batchReady, r.workerStart);
@@ -247,6 +247,44 @@ public class AutoClickService extends AccessibilityService {
                     workerWakeStart + "," + workerPark + "," + r.workerQueueDepth + "," +
                     r.workerSpinStart + "," + r.workerSpinEnd + "," + workerSpin;
         }
+
+        String csv() {
+            return row;
+        }
+    }
+
+    private static final class Attempt {
+        final String row;
+
+        Attempt(String type, long start, long end, List<Request> requests,
+                long apiStart, long apiReturn, boolean accepted,
+                int leadMs, String reason) {
+            long id = ATTEMPT_IDS.incrementAndGet();
+            long base = requests == null || requests.isEmpty()
+                    ? -1 : requests.get(0).target;
+            long cycleStart = requests == null || requests.isEmpty()
+                    ? -1 : requests.get(0).cycleStart;
+            long deadline = requests == null || requests.isEmpty()
+                    ? -1 : requests.get(0).deadline;
+            int count = requests == null ? 0 : requests.size();
+            String safeReason = reason == null ? "" :
+                    reason.replace(',', ';').replace('\n', ' ').replace('\r', ' ');
+
+            row = id + "," + type + "," + start + "," + end + "," +
+                    (start < 0 || end < 0 ? -1 : end - start) + "," +
+                    count + "," + base + "," + cycleStart + "," + deadline + "," +
+                    MAX_STROKES + "," + MAX_DURATION_MS + "," +
+                    apiStart + "," + apiReturn + "," + accepted + "," +
+                    leadMs + "," + safeReason;
+        }
+    }
+
+    private void recordAttempt(String type, long start, long end,
+                               List<Request> requests, long apiStart,
+                               long apiReturn, boolean accepted,
+                               int leadMs, String reason) {
+        attemptLogs.offer(new Attempt(type, start, end, requests,
+                apiStart, apiReturn, accepted, leadMs, reason));
     }
 
     @Override
@@ -284,49 +322,80 @@ public class AutoClickService extends AccessibilityService {
     }
 
     private void writerLoop() {
-        BufferedWriter out = null;
+        BufferedWriter timingOut = null, attemptOut = null;
         try {
             File dir = getExternalFilesDir(null);
             if (dir == null) dir = getFilesDir();
             if (!dir.exists() && !dir.mkdirs()) {
                 logPath = "خطا: پوشه گزارش ساخته نشد";
+                attemptLogPath = "خطا: پوشه گزارش ساخته نشد";
                 return;
             }
 
-            File file = new File(dir, LOG_FILE);
-            boolean header = !file.exists() || file.length() == 0;
-            out = new BufferedWriter(new OutputStreamWriter(
-                    new FileOutputStream(file, true), StandardCharsets.UTF_8));
-            logPath = file.getAbsolutePath();
+            File timingFile = new File(dir, LOG_FILE);
+            File attemptFile = new File(dir, ATTEMPT_LOG_FILE);
+            boolean timingHeader = !timingFile.exists() || timingFile.length() == 0;
+            boolean attemptHeader = !attemptFile.exists() || attemptFile.length() == 0;
 
-            if (header) {
-                out.write("target_elapsed_ns,prepare_start_elapsed_ns,prepare_end_elapsed_ns,prepare_duration_ns,batch_build_start_elapsed_ns,batch_ready_elapsed_ns,batch_build_duration_ns,dispatch_worker_start_elapsed_ns,batch_ready_to_worker_ns,target_wait_ns,previous_callback_wait_ns,dispatch_start_elapsed_ns,dispatch_start_delta_ns,dispatch_pipeline_delay_ns,dispatch_duration_ns,completion_elapsed_ns,completion_delay_ns,dispatch_to_callback_ns,accepted,result,callback_result,x,y,callback_elapsed_ns,previous_callback_elapsed_ns,handoff_delay_ns,last_stroke_end_elapsed_ns,last_stroke_to_callback_ns,scheduler_park_start_ns,scheduler_wake_target_ns,scheduler_park_return_ns,scheduler_wake_lateness_ns,scheduler_spin_duration_ns,scheduler_wake_to_worker_ns,dispatch_worker_queue_delay_ns,dispatch_lock_wait_start_elapsed_ns,dispatch_lock_acquired_elapsed_ns,dispatch_lock_wait_ns,dispatch_decision_elapsed_ns,dispatch_api_call_start_elapsed_ns,dispatch_api_call_return_elapsed_ns,dispatch_worker_to_decision_ns,dispatch_decision_to_api_ns,dispatch_api_duration_ns,scheduler_loop_entry_elapsed_ns,scheduler_wake_elapsed_ns,scheduler_last_unpark_elapsed_ns,scheduler_decision_elapsed_ns,scheduler_dispatch_entry_elapsed_ns,scheduler_wake_to_dispatch_ns,scheduler_loop_to_dispatch_ns,scheduler_unpark_to_wake_ns,worker_park_start_elapsed_ns,worker_wake_target_elapsed_ns,worker_park_return_elapsed_ns,worker_wake_lateness_ns,worker_wake_to_start_ns,worker_park_duration_ns,worker_queue_depth,worker_spin_start_elapsed_ns,worker_spin_end_elapsed_ns,worker_spin_duration_ns");
-                out.newLine();
-                out.flush();
+            timingOut = new BufferedWriter(new OutputStreamWriter(
+                    new FileOutputStream(timingFile, true), StandardCharsets.UTF_8));
+            attemptOut = new BufferedWriter(new OutputStreamWriter(
+                    new FileOutputStream(attemptFile, true), StandardCharsets.UTF_8));
+
+            logPath = timingFile.getAbsolutePath();
+            attemptLogPath = attemptFile.getAbsolutePath();
+
+            if (timingHeader) {
+                timingOut.write("target_elapsed_ns,prepare_start_elapsed_ns,prepare_end_elapsed_ns,prepare_duration_ns,batch_build_start_elapsed_ns,batch_ready_elapsed_ns,batch_build_duration_ns,dispatch_worker_start_elapsed_ns,batch_ready_to_worker_ns,target_wait_ns,previous_callback_wait_ns,dispatch_start_elapsed_ns,dispatch_start_delta_ns,dispatch_pipeline_delay_ns,dispatch_duration_ns,completion_elapsed_ns,completion_delay_ns,dispatch_to_callback_ns,accepted,result,callback_result,x,y,callback_elapsed_ns,previous_callback_elapsed_ns,handoff_delay_ns,last_stroke_end_elapsed_ns,last_stroke_to_callback_ns,scheduler_park_start_ns,scheduler_wake_target_ns,scheduler_park_return_ns,scheduler_wake_lateness_ns,scheduler_spin_duration_ns,scheduler_wake_to_worker_ns,dispatch_worker_queue_delay_ns,dispatch_lock_wait_start_elapsed_ns,dispatch_lock_acquired_elapsed_ns,dispatch_lock_wait_ns,dispatch_decision_elapsed_ns,dispatch_api_call_start_elapsed_ns,dispatch_api_call_return_elapsed_ns,dispatch_worker_to_decision_ns,dispatch_decision_to_api_ns,dispatch_api_duration_ns,scheduler_loop_entry_elapsed_ns,scheduler_wake_elapsed_ns,scheduler_last_unpark_elapsed_ns,scheduler_decision_elapsed_ns,scheduler_dispatch_entry_elapsed_ns,scheduler_wake_to_dispatch_ns,scheduler_loop_to_dispatch_ns,scheduler_unpark_to_wake_ns,worker_park_start_elapsed_ns,worker_wake_target_elapsed_ns,worker_park_return_elapsed_ns,worker_wake_lateness_ns,worker_wake_to_start_ns,worker_park_duration_ns,worker_queue_depth,worker_spin_start_elapsed_ns,worker_spin_end_elapsed_ns,worker_spin_duration_ns");
+                timingOut.newLine();
+                timingOut.flush();
             }
 
-            while (!writerStopping || !logs.isEmpty()) {
-                Timing item;
-                try {
-                    item = logs.poll(500, TimeUnit.MILLISECONDS);
-                } catch (InterruptedException e) {
-                    continue;
+            if (attemptHeader) {
+                attemptOut.write("attempt_id,attempt_type,start_elapsed_ns,end_elapsed_ns,duration_ns,batch_size,base_target_elapsed_ns,cycle_start_elapsed_ns,deadline_elapsed_ns,max_strokes,max_gesture_duration_ms,api_start_elapsed_ns,api_return_elapsed_ns,accepted,lead_ms,reason");
+                attemptOut.newLine();
+                attemptOut.flush();
+            }
+
+            while (!writerStopping || !logs.isEmpty() || !attemptLogs.isEmpty()) {
+                boolean wrote = false;
+                Timing timing = logs.poll();
+                if (timing != null) {
+                    timingOut.write(timing.csv());
+                    timingOut.newLine();
+                    timingOut.flush();
+                    wrote = true;
                 }
-                if (item == null) continue;
-                out.write(item.csv());
-                out.newLine();
-                out.flush();
+
+                Attempt attempt = attemptLogs.poll();
+                if (attempt != null) {
+                    attemptOut.write(attempt.row);
+                    attemptOut.newLine();
+                    attemptOut.flush();
+                    wrote = true;
+                }
+
+                if (!wrote) {
+                    try {
+                        Thread.sleep(20);
+                    } catch (InterruptedException ignored) {
+                    }
+                }
             }
         } catch (IOException e) {
             logPath = "خطای نوشتن گزارش: " + e.getMessage();
         } finally {
-            if (out != null) {
-                try {
-                    out.flush();
-                    out.close();
-                } catch (IOException ignored) {
-                }
-            }
+            closeWriter(timingOut);
+            closeWriter(attemptOut);
+        }
+    }
+
+    private static void closeWriter(BufferedWriter writer) {
+        if (writer == null) return;
+        try {
+            writer.flush();
+            writer.close();
+        } catch (IOException ignored) {
         }
     }
 
@@ -454,6 +523,9 @@ public class AutoClickService extends AccessibilityService {
             try {
                 GestureDescription[] gestures = buildGestures(requests);
                 long readyTime = SystemClock.elapsedRealtimeNanos();
+                recordAttempt("INITIAL_BUILD", buildStart, readyTime,
+                        requests, -1, -1, false, -1, "BUILT");
+
                 PreparedBatch batch = new PreparedBatch(requests, gestures);
                 boolean queued = false;
 
@@ -477,6 +549,11 @@ public class AutoClickService extends AccessibilityService {
                 else unparkScheduler();
 
             } catch (Exception e) {
+                long end = SystemClock.elapsedRealtimeNanos();
+                recordAttempt("INITIAL_BUILD", buildStart, end, requests,
+                        -1, -1, false, -1,
+                        "BUILD_FAILED:" + e.getClass().getSimpleName());
+
                 synchronized (lock) {
                     building.removeAll(requests);
                 }
@@ -717,11 +794,10 @@ public class AutoClickService extends AccessibilityService {
         for (Request r : future)
             r.offsetMs = ceilMs(r.target - base);
 
+        long buildStart = SystemClock.elapsedRealtimeNanos();
         try {
-            long buildStart = SystemClock.elapsedRealtimeNanos();
             GestureDescription[] gestures = buildGestures(future);
             long readyTime = SystemClock.elapsedRealtimeNanos();
-
             for (Request r : future) {
                 r.batchBuildStart = buildStart;
                 r.batchReady = readyTime;
@@ -735,6 +811,9 @@ public class AutoClickService extends AccessibilityService {
                 }
             }
 
+            recordAttempt("REBUILD", buildStart, readyTime, future,
+                    -1, -1, false, -1, queued ? "REBUILT" : "STALE_GENERATION");
+
             if (!queued) {
                 finishWithoutDispatch(future, "STALE_GENERATION", true);
                 return false;
@@ -744,6 +823,10 @@ public class AutoClickService extends AccessibilityService {
             return true;
 
         } catch (Exception e) {
+            long end = SystemClock.elapsedRealtimeNanos();
+            recordAttempt("REBUILD", buildStart, end, future,
+                    -1, -1, false, -1,
+                    "REBUILD_FAILED:" + e.getClass().getSimpleName());
             finishWithoutDispatch(future,
                     "REBUILD_FAILED:" + e.getClass().getSimpleName(), false);
             return false;
@@ -751,7 +834,8 @@ public class AutoClickService extends AccessibilityService {
     }
 
     private void dispatchBatch(PreparedBatch batch) {
-        long workerStart = SystemClock.elapsedRealtimeNanos();
+        long attemptStart = SystemClock.elapsedRealtimeNanos();
+        long workerStart = attemptStart;
         for (Request r : batch.requests)
             if (r.workerStart < 0) r.workerStart = workerStart;
 
@@ -792,6 +876,9 @@ public class AutoClickService extends AccessibilityService {
         if (!failure.isEmpty()) {
             for (Request r : batch.requests)
                 r.callbackResult = failure;
+            long end = SystemClock.elapsedRealtimeNanos();
+            recordAttempt("DISPATCH", attemptStart, end, batch.requests,
+                    -1, -1, false, -1, failure);
             finishWithoutDispatch(batch.requests, failure, true);
             unparkWorker();
             return;
@@ -874,8 +961,6 @@ public class AutoClickService extends AccessibilityService {
 
             if (accepted) {
                 long expectedEnd = apiStart + maxEndOffsetMs * NS_MS;
-
-                // Gesture بعدی زودتر از پایان زمانی این Gesture ارسال نمی‌شود.
                 nextDispatchAllowedElapsedNs = Math.max(
                         nextDispatchAllowedElapsedNs, expectedEnd);
 
@@ -891,16 +976,23 @@ public class AutoClickService extends AccessibilityService {
         }
 
         if (missed) {
+            recordAttempt("DISPATCH", attemptStart, apiReturn, batch.requests,
+                    apiStart, apiReturn, false, leadMs, "TARGET_MISSED_BEFORE_API");
             requeueFutureRequests(batch, apiStart);
             unparkWorker();
             return;
         }
 
         if (accepted) {
+            recordAttempt("DISPATCH", attemptStart, apiReturn, batch.requests,
+                    apiStart, apiReturn, true, leadMs, "ACCEPTED");
             callback.onDispatchReturned(true);
         } else {
             String reason = !failure.isEmpty() ? failure :
                     !error.isEmpty() ? error : "API_RETURNED_FALSE";
+
+            recordAttempt("DISPATCH", attemptStart, apiReturn, batch.requests,
+                    apiStart, apiReturn, false, leadMs, reason);
 
             for (Request r : batch.requests)
                 r.callbackResult = reason;
@@ -938,7 +1030,6 @@ public class AutoClickService extends AccessibilityService {
             r.callbackResult = success ? "ON_COMPLETED" : "ON_CANCELLED";
         }
 
-        // Callback فقط برای ثبت نتیجه است؛ زمان‌بند منتظر آن نمی‌ماند.
         for (Request r : batch.requests)
             postFinish(r, success, false);
     }
@@ -980,7 +1071,6 @@ public class AutoClickService extends AccessibilityService {
                 touchDurationNanos, new GestureCompletion[]{completion});
     }
 
-    // ثبت اتمی تمام کلیک‌های یک چرخه؛ زمان‌بند تا ثبت همه آن‌ها شروع به جمع‌آوری نمی‌کند.
     public boolean performClickBatchAtTargets(long[] targets,
                                               long cycleStartNanos,
                                               long deadlineNanos,
@@ -1031,7 +1121,6 @@ public class AutoClickService extends AccessibilityService {
             enqueueAll(requests);
 
             try {
-                // یک کار آماده‌سازی برای کل چرخه؛ نه یک کار جدا برای هر کلیک.
                 preparer.execute(() -> prepareGroup(requests));
             } catch (Exception e) {
                 pending.removeAll(requests);
@@ -1080,7 +1169,6 @@ public class AutoClickService extends AccessibilityService {
                 cancelled.addAll(prepared.poll().requests);
         }
 
-        // nextDispatchAllowedElapsedNs عمداً پاک نمی‌شود؛ ممکن است Gesture قبلی فعال باشد.
         unparkScheduler();
         unparkWorker();
 
@@ -1198,6 +1286,10 @@ public class AutoClickService extends AccessibilityService {
 
     public String getTimingFilePath() {
         return logPath;
+    }
+
+    public String getAttemptTimingFilePath() {
+        return attemptLogPath;
     }
 
     public void setTarget(int newX, int newY) {
