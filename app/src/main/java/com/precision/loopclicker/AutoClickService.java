@@ -79,6 +79,7 @@ public class AutoClickService extends AccessibilityService {
         final ArrayList<Request> requests;
         final GestureDescription[] gestures;
         final long baseTarget;
+
         PreparedBatch(ArrayList<Request> requests,GestureDescription[] gestures) {
             this.requests=requests; this.gestures=gestures;
             baseTarget=requests.get(0).target;
@@ -180,7 +181,7 @@ public class AutoClickService extends AccessibilityService {
         HandlerThread old=callbackThread;
         if(old!=null&&old.isAlive())return;
         HandlerThread thread=new HandlerThread("PrecisionGestureCallback",
-                Process.THREAD_PRIORITY_DISPLAY);
+                android.os.Process.THREAD_PRIORITY_DISPLAY);
         thread.start(); callbackThread=thread;
         callbackHandler=new Handler(thread.getLooper());
     }
@@ -240,8 +241,10 @@ public class AutoClickService extends AccessibilityService {
     private void startPreparer() {
         if(preparer!=null&&!preparer.isShutdown())return;
         preparer=Executors.newSingleThreadExecutor(task->new Thread(()->{
-            try { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY); }
-            catch(Exception ignored) { }
+            try {
+                android.os.Process.setThreadPriority(
+                        android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY);
+            } catch(Exception ignored) { }
             task.run();
         },"PrecisionGesturePreparation"));
     }
@@ -267,8 +270,10 @@ public class AutoClickService extends AccessibilityService {
     }
 
     private void schedulerLoop() {
-        try { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY); }
-        catch(Exception ignored) { }
+        try {
+            android.os.Process.setThreadPriority(
+                    android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY);
+        } catch(Exception ignored) { }
 
         while(!stopping) {
             PreparedBatch headBatch;
