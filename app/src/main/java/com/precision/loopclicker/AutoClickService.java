@@ -50,7 +50,7 @@ public class AutoClickService extends AccessibilityService {
     private SharedPreferences preferences;
 
     private static final class Request {
-        final long target,cycleStart,deadline,durationMs,generation;
+        final long target,cycleStart,deadline,durationNanos,durationMs,generation;
         final int x,y;
         final AtomicBoolean recorded=new AtomicBoolean(),delivered=new AtomicBoolean();
         volatile Path path;
@@ -67,8 +67,16 @@ public class AutoClickService extends AccessibilityService {
         volatile String callbackResult="NOT_DISPATCHED";
         volatile GestureCompletion completion;
 
-        Request(long t,long cs,long d,long ms,int px,int py,long gen,GestureCompletion c) {
-            target=t;cycleStart=cs;deadline=d;durationMs=ms;x=px;y=py;generation=gen;completion=c;
+        Request(long t,long cs,long d,long touchNanos,long ms,int px,int py,long gen,GestureCompletion c) {
+            target=t;
+            cycleStart=cs;
+            deadline=d;
+            durationNanos=touchNanos;
+            durationMs=ms;
+            x=px;
+            y=py;
+            generation=gen;
+            completion=c;
         }
 
         void prepare() {
@@ -88,8 +96,12 @@ public class AutoClickService extends AccessibilityService {
         final long baseTarget,generation,cycleStart,deadline;
 
         PreparedBatch(ArrayList<Request> r,GestureDescription[] g) {
-            requests=r;gestures=g;baseTarget=r.get(0).target;generation=r.get(0).generation;
-            cycleStart=r.get(0).cycleStart;deadline=r.get(0).deadline;
+            requests=r;
+            gestures=g;
+            baseTarget=r.get(0).target;
+            generation=r.get(0).generation;
+            cycleStart=r.get(0).cycleStart;
+            deadline=r.get(0).deadline;
         }
     }
 
@@ -100,7 +112,8 @@ public class AutoClickService extends AccessibilityService {
         private long callbackTime;
 
         Batch(AutoClickService o,ArrayList<Request> r) {
-            owner=o;requests=r;
+            owner=o;
+            requests=r;
         }
 
         @Override
@@ -117,7 +130,9 @@ public class AutoClickService extends AccessibilityService {
             boolean process;
             synchronized(this) {
                 if(handled||received)return;
-                received=true;success=result;callbackTime=SystemClock.elapsedRealtimeNanos();
+                received=true;
+                success=result;
+                callbackTime=SystemClock.elapsedRealtimeNanos();
                 process=returned&&accepted;
                 if(process)handled=true;
             }
@@ -128,9 +143,12 @@ public class AutoClickService extends AccessibilityService {
             boolean process,value;
             long time;
             synchronized(this) {
-                returned=true;accepted=result;process=result&&received&&!handled;
+                returned=true;
+                accepted=result;
+                process=result&&received&&!handled;
                 if(process)handled=true;
-                value=success;time=callbackTime;
+                value=success;
+                time=callbackTime;
             }
             if(process)owner.finishBatch(this,value,time);
         }
@@ -197,15 +215,24 @@ public class AutoClickService extends AccessibilityService {
         preferences=getSharedPreferences(PREFS,MODE_PRIVATE);
         x=preferences.getInt(KEY_X,DEFAULT_X);
         y=preferences.getInt(KEY_Y,DEFAULT_Y);
-        stopping=false;writerStopping=false;ready=true;instance=this;
-        startWriter();startPreparer();startCallbackThread();startWorker();startScheduler();
+        stopping=false;
+        writerStopping=false;
+        ready=true;
+        instance=this;
+        startWriter();
+        startPreparer();
+        startCallbackThread();
+        startWorker();
+        startScheduler();
     }
 
     private void startCallbackThread() {
         HandlerThread old=callbackThread;
         if(old!=null&&old.isAlive())return;
         HandlerThread t=new HandlerThread("PrecisionGestureCallback",android.os.Process.THREAD_PRIORITY_DISPLAY);
-        t.start();callbackThread=t;callbackHandler=new Handler(t.getLooper());
+        t.start();
+        callbackThread=t;
+        callbackHandler=new Handler(t.getLooper());
     }
 
     private void startWriter() {
@@ -221,31 +248,42 @@ public class AutoClickService extends AccessibilityService {
             File dir=getExternalFilesDir(null);
             if(dir==null)dir=getFilesDir();
             if(!dir.exists()&&!dir.mkdirs()) {
-                logPath="خطا: پوشه گزارش ساخته نشد";attemptLogPath="خطا: پوشه گزارش ساخته نشد";return;
+                logPath="خطا: پوشه گزارش ساخته نشد";
+                attemptLogPath="خطا: پوشه گزارش ساخته نشد";
+                return;
             }
             File timingFile=new File(dir,LOG_FILE),attemptFile=new File(dir,ATTEMPT_LOG_FILE);
             boolean timingHeader=!timingFile.exists()||timingFile.length()==0;
             boolean attemptHeader=!attemptFile.exists()||attemptFile.length()==0;
             timingOut=new BufferedWriter(new OutputStreamWriter(new FileOutputStream(timingFile,true),StandardCharsets.UTF_8));
             attemptOut=new BufferedWriter(new OutputStreamWriter(new FileOutputStream(attemptFile,true),StandardCharsets.UTF_8));
-            logPath=timingFile.getAbsolutePath();attemptLogPath=attemptFile.getAbsolutePath();
+            logPath=timingFile.getAbsolutePath();
+            attemptLogPath=attemptFile.getAbsolutePath();
             if(timingHeader) {
                 timingOut.write("target_elapsed_ns,prepare_start_elapsed_ns,prepare_end_elapsed_ns,prepare_duration_ns,batch_build_start_elapsed_ns,batch_ready_elapsed_ns,batch_build_duration_ns,dispatch_worker_start_elapsed_ns,batch_ready_to_worker_ns,target_wait_ns,previous_callback_wait_ns,dispatch_start_elapsed_ns,dispatch_start_delta_ns,dispatch_pipeline_delay_ns,dispatch_duration_ns,completion_elapsed_ns,completion_delay_ns,dispatch_to_callback_ns,accepted,result,callback_result,x,y,callback_elapsed_ns,previous_callback_elapsed_ns,handoff_delay_ns,last_stroke_end_elapsed_ns,last_stroke_to_callback_ns,scheduler_park_start_ns,scheduler_wake_target_ns,scheduler_park_return_ns,scheduler_wake_lateness_ns,scheduler_spin_duration_ns,scheduler_wake_to_worker_ns,dispatch_worker_queue_delay_ns,dispatch_lock_wait_start_elapsed_ns,dispatch_lock_acquired_elapsed_ns,dispatch_lock_wait_ns,dispatch_decision_elapsed_ns,dispatch_api_call_start_elapsed_ns,dispatch_api_call_return_elapsed_ns,dispatch_worker_to_decision_ns,dispatch_decision_to_api_ns,dispatch_api_duration_ns,scheduler_loop_entry_elapsed_ns,scheduler_wake_elapsed_ns,scheduler_last_unpark_elapsed_ns,scheduler_decision_elapsed_ns,scheduler_dispatch_entry_elapsed_ns,scheduler_wake_to_dispatch_ns,scheduler_loop_to_dispatch_ns,scheduler_unpark_to_wake_ns,worker_park_start_elapsed_ns,worker_wake_target_elapsed_ns,worker_park_return_elapsed_ns,worker_wake_lateness_ns,worker_wake_to_start_ns,worker_park_duration_ns,worker_queue_depth,worker_spin_start_elapsed_ns,worker_spin_end_elapsed_ns,worker_spin_duration_ns");
-                timingOut.newLine();timingOut.flush();
+                timingOut.newLine();
+                timingOut.flush();
             }
             if(attemptHeader) {
                 attemptOut.write("attempt_id,attempt_type,start_elapsed_ns,end_elapsed_ns,duration_ns,batch_size,base_target_elapsed_ns,cycle_start_elapsed_ns,deadline_elapsed_ns,max_strokes,max_gesture_duration_ms,api_start_elapsed_ns,api_return_elapsed_ns,accepted,lead_ms,reason");
-                attemptOut.newLine();attemptOut.flush();
+                attemptOut.newLine();
+                attemptOut.flush();
             }
             while(!writerStopping||!logs.isEmpty()||!attemptLogs.isEmpty()) {
                 boolean wrote=false;
                 Timing timing=logs.poll();
                 if(timing!=null) {
-                    timingOut.write(timing.csv());timingOut.newLine();timingOut.flush();wrote=true;
+                    timingOut.write(timing.csv());
+                    timingOut.newLine();
+                    timingOut.flush();
+                    wrote=true;
                 }
                 Attempt attempt=attemptLogs.poll();
                 if(attempt!=null) {
-                    attemptOut.write(attempt.row);attemptOut.newLine();attemptOut.flush();wrote=true;
+                    attemptOut.write(attempt.row);
+                    attemptOut.newLine();
+                    attemptOut.flush();
+                    wrote=true;
                 }
                 if(!wrote)try {
                     Thread.sleep(20);
@@ -255,14 +293,16 @@ public class AutoClickService extends AccessibilityService {
         } catch(IOException e) {
             logPath="خطای نوشتن گزارش: "+e.getMessage();
         } finally {
-            closeWriter(timingOut);closeWriter(attemptOut);
+            closeWriter(timingOut);
+            closeWriter(attemptOut);
         }
     }
 
     private static void closeWriter(BufferedWriter writer) {
         if(writer==null)return;
         try {
-            writer.flush();writer.close();
+            writer.flush();
+            writer.close();
         } catch(IOException ignored) {
         }
     }
@@ -285,12 +325,14 @@ public class AutoClickService extends AccessibilityService {
     private void startWorker() {
         Thread old=worker;
         if(old!=null&&old.isAlive())return;
-        worker=new Thread(this::workerLoop,"PrecisionClickDispatchWorker");worker.start();
+        worker=new Thread(this::workerLoop,"PrecisionClickDispatchWorker");
+        worker.start();
     }
 
     private void startScheduler() {
         if(scheduler!=null&&scheduler.isAlive())return;
-        scheduler=new Thread(this::schedulerLoop,"PrecisionClickNanoScheduler");scheduler.start();
+        scheduler=new Thread(this::schedulerLoop,"PrecisionClickNanoScheduler");
+        scheduler.start();
     }
 
     private boolean current(Request r) {
@@ -299,9 +341,11 @@ public class AutoClickService extends AccessibilityService {
 
     private void enqueueAll(List<Request> requests) {
         ArrayList<Request> sorted=new ArrayList<>(pending.size()+requests.size());
-        sorted.addAll(pending);sorted.addAll(requests);
+        sorted.addAll(pending);
+        sorted.addAll(requests);
         sorted.sort(Comparator.comparingLong(r->r.target));
-        pending.clear();pending.addAll(sorted);
+        pending.clear();
+        pending.addAll(sorted);
     }
 
     private void prepareGroup(List<Request> requests) {
@@ -335,49 +379,63 @@ public class AutoClickService extends AccessibilityService {
             ArrayList<Request> stale=new ArrayList<>();
             synchronized(lock) {
                 while(!pending.isEmpty()&&pending.peekFirst().generation!=generation)stale.add(pending.pollFirst());
-                canBuild=prepared.size()<MAX_PREPARED;first=pending.peekFirst();
+                canBuild=prepared.size()<MAX_PREPARED;
+                first=pending.peekFirst();
             }
             for(Request r:stale) {
-                r.callbackResult="STALE_GENERATION";postFinish(r,false,true);
+                r.callbackResult="STALE_GENERATION";
+                postFinish(r,false,true);
             }
             if(stopping)break;
             if(first==null||!canBuild) {
-                LockSupport.park(this);continue;
+                LockSupport.park(this);
+                continue;
             }
             if(!current(first)) {
-                unparkScheduler();continue;
+                unparkScheduler();
+                continue;
             }
             if(first.path==null||hasUnpreparedBatchMember(first)) {
-                LockSupport.park(this);continue;
+                LockSupport.park(this);
+                continue;
             }
             ArrayList<Request> requests=collect(first);
             if(requests.isEmpty()) {
-                LockSupport.park(this);continue;
+                LockSupport.park(this);
+                continue;
             }
             synchronized(lock) {
                 building.addAll(requests);
             }
             long buildStart=SystemClock.elapsedRealtimeNanos();
             for(Request r:requests) {
-                r.batchBuildStart=buildStart;r.schedulerLoopEntry=loopEntry;
-                r.schedulerWakeElapsed=loopEntry;r.schedulerUnparkElapsed=lastSchedulerUnparkElapsed;
+                r.batchBuildStart=buildStart;
+                r.schedulerLoopEntry=loopEntry;
+                r.schedulerWakeElapsed=loopEntry;
+                r.schedulerUnparkElapsed=lastSchedulerUnparkElapsed;
             }
             try {
                 GestureDescription[] gestures=buildGestures(requests);
                 long readyTime=SystemClock.elapsedRealtimeNanos();
                 recordAttempt("INITIAL_BUILD",buildStart,readyTime,requests,-1,-1,false,-1,"BUILT");
-                PreparedBatch batch=new PreparedBatch(requests,gestures);
+                PreparedBatch batch=new PreparedBatch(new ArrayList<>(requests),gestures);
                 boolean queued=false;
                 synchronized(lock) {
                     building.removeAll(requests);
                     if(!stopping&&current(requests.get(0))&&prepared.size()<MAX_PREPARED) {
                         for(Request r:requests) {
-                            r.batchReady=readyTime;r.schedulerDecisionElapsed=readyTime;r.schedulerDispatchEntry=readyTime;
+                            r.batchReady=readyTime;
+                            r.schedulerDecisionElapsed=readyTime;
+                            r.schedulerDispatchEntry=readyTime;
                         }
-                        prepared.offer(batch);queued=true;
-                    } else if(!stopping&&current(requests.get(0)))requeueCurrentInOrder(requests);
+                        prepared.offer(batch);
+                        queued=true;
+                    } else if(!stopping&&current(requests.get(0))) {
+                        requeueCurrentInOrder(requests);
+                    }
                 }
-                if(queued)unparkWorker();else unparkScheduler();
+                if(queued)unparkWorker();
+                else unparkScheduler();
             } catch(Exception e) {
                 long end=SystemClock.elapsedRealtimeNanos();
                 recordAttempt("INITIAL_BUILD",buildStart,end,requests,-1,-1,false,-1,"BUILD_FAILED:"+e.getClass().getSimpleName());
@@ -415,7 +473,9 @@ public class AutoClickService extends AccessibilityService {
                 if(r.generation!=first.generation||r.cycleStart!=first.cycleStart||r.deadline!=first.deadline||r.target<first.target||r.path==null)continue;
                 long offset=ceilMs(r.target-first.target);
                 if(offset>MAX_DURATION_MS-LEAD_MS||r.durationMs>MAX_DURATION_MS-LEAD_MS-offset)continue;
-                r.offsetMs=offset;result.add(r);iterator.remove();
+                r.offsetMs=offset;
+                result.add(r);
+                iterator.remove();
             }
         }
         return result;
@@ -467,7 +527,8 @@ public class AutoClickService extends AccessibilityService {
                 while(!prepared.isEmpty()&&prepared.peek().generation!=generation) {
                     PreparedBatch stale=prepared.poll();
                     for(Request r:stale.requests) {
-                        r.callbackResult="STALE_GENERATION";postFinish(r,false,true);
+                        r.callbackResult="STALE_GENERATION";
+                        postFinish(r,false,true);
                     }
                 }
                 if(!dispatching) {
@@ -477,10 +538,12 @@ public class AutoClickService extends AccessibilityService {
                         wakeTarget=Math.max(targetWake,nextDispatchAllowedElapsedNs);
                         waitNanos=wakeTarget-now;
                         if(waitNanos<=0) {
-                            batch=prepared.poll();workerCurrentBatch=batch;
+                            batch=prepared.poll();
+                            workerCurrentBatch=batch;
                             int depth=prepared.size();
                             for(Request r:batch.requests) {
-                                r.workerStart=now;r.workerQueueDepth=depth;
+                                r.workerStart=now;
+                                r.workerQueueDepth=depth;
                             }
                         }
                     }
@@ -492,15 +555,21 @@ public class AutoClickService extends AccessibilityService {
                 synchronized(lock) {
                     if(workerCurrentBatch==batch)workerCurrentBatch=null;
                 }
-                unparkScheduler();continue;
+                unparkScheduler();
+                continue;
             }
             if(waitNanos<0) {
-                LockSupport.park(this);continue;
+                LockSupport.park(this);
+                continue;
             }
             long parkStart=SystemClock.elapsedRealtimeNanos();
             if(observed!=null)for(Request r:observed.requests) {
-                r.workerParkStart=parkStart;r.workerWakeTarget=wakeTarget;
-                r.workerParkReturn=-1;r.workerWakeLateness=-1;r.workerSpinStart=-1;r.workerSpinEnd=-1;
+                r.workerParkStart=parkStart;
+                r.workerWakeTarget=wakeTarget;
+                r.workerParkReturn=-1;
+                r.workerWakeLateness=-1;
+                r.workerSpinStart=-1;
+                r.workerSpinEnd=-1;
             }
             if(waitNanos>SPIN_NS)LockSupport.parkNanos(this,waitNanos-SPIN_NS);
             long parkReturn=SystemClock.elapsedRealtimeNanos();
@@ -518,7 +587,8 @@ public class AutoClickService extends AccessibilityService {
                 long actual=spinEnd>=0?spinEnd:parkReturn;
                 for(Request r:observed.requests) {
                     r.workerWakeLateness=Math.max(0,actual-wakeTarget);
-                    r.workerSpinStart=spinStart;r.workerSpinEnd=spinEnd;
+                    r.workerSpinStart=spinStart;
+                    r.workerSpinEnd=spinEnd;
                 }
             }
             if(observed!=null&&workerQueueChanged(observed))continue;
@@ -535,10 +605,12 @@ public class AutoClickService extends AccessibilityService {
     private boolean requeueFutureRequests(PreparedBatch batch,long now) {
         ArrayList<Request> future=new ArrayList<>(),expired=new ArrayList<>();
         for(Request r:batch.requests) {
-            if(current(r)&&r.target>now)future.add(r);else expired.add(r);
+            if(current(r)&&r.target>now)future.add(r);
+            else expired.add(r);
         }
         for(Request r:expired) {
-            r.callbackResult="TARGET_MISSED_BEFORE_API";postFinish(r,false,true);
+            r.callbackResult="TARGET_MISSED_BEFORE_API";
+            postFinish(r,false,true);
         }
         if(future.isEmpty())return false;
         long base=future.get(0).target;
@@ -548,23 +620,28 @@ public class AutoClickService extends AccessibilityService {
             GestureDescription[] gestures=buildGestures(future);
             long readyTime=SystemClock.elapsedRealtimeNanos();
             for(Request r:future) {
-                r.batchBuildStart=buildStart;r.batchReady=readyTime;
+                r.batchBuildStart=buildStart;
+                r.batchReady=readyTime;
             }
             boolean queued=false;
             synchronized(lock) {
                 if(!stopping&&current(future.get(0))) {
-                    prepared.offer(new PreparedBatch(future,gestures));queued=true;
+                    prepared.offer(new PreparedBatch(future,gestures));
+                    queued=true;
                 }
             }
             recordAttempt("REBUILD",buildStart,readyTime,future,-1,-1,false,-1,queued?"REBUILT":"STALE_GENERATION");
             if(!queued) {
-                finishWithoutDispatch(future,"STALE_GENERATION",true);return false;
+                finishWithoutDispatch(future,"STALE_GENERATION",true);
+                return false;
             }
-            unparkWorker();return true;
+            unparkWorker();
+            return true;
         } catch(Exception e) {
             long end=SystemClock.elapsedRealtimeNanos();
             recordAttempt("REBUILD",buildStart,end,future,-1,-1,false,-1,"REBUILD_FAILED:"+e.getClass().getSimpleName());
-            finishWithoutDispatch(future,"REBUILD_FAILED:"+e.getClass().getSimpleName(),false);return false;
+            finishWithoutDispatch(future,"REBUILD_FAILED:"+e.getClass().getSimpleName(),false);
+            return false;
         }
     }
 
@@ -584,7 +661,8 @@ public class AutoClickService extends AccessibilityService {
             for(Request r:batch.requests)r.lockAcquired=acquired;
             if(stopping||!current(batch.requests.get(0))||dispatching)failure="SERVICE_OR_GENERATION_INVALID";
             else {
-                dispatching=true;previous=lastCallbackElapsed>0?lastCallbackElapsed:-1;
+                dispatching=true;
+                previous=lastCallbackElapsed>0?lastCallbackElapsed:-1;
                 for(Request r:batch.requests) {
                     r.previousCallbackElapsed=previous;
                     r.handoffDelay=previous<0?-1:Math.max(0,workerStart-previous);
@@ -598,7 +676,9 @@ public class AutoClickService extends AccessibilityService {
             for(Request r:batch.requests)r.callbackResult=failure;
             long end=SystemClock.elapsedRealtimeNanos();
             recordAttempt("DISPATCH",attemptStart,end,batch.requests,-1,-1,false,-1,failure);
-            finishWithoutDispatch(batch.requests,failure,true);unparkWorker();return;
+            finishWithoutDispatch(batch.requests,failure,true);
+            unparkWorker();
+            return;
         }
         boolean missed=false;
         synchronized(lock) {
@@ -613,11 +693,13 @@ public class AutoClickService extends AccessibilityService {
                     long latestStart=Long.MAX_VALUE;
                     for(Request r:batch.requests) {
                         if(!current(r)) {
-                            failure="STALE_GENERATION";break;
+                            failure="STALE_GENERATION";
+                            break;
                         }
                         long endOffset=leadMs+r.offsetMs+r.durationMs;
                         if(endOffset>MAX_DURATION_MS) {
-                            failure="GESTURE_DURATION_LIMIT";break;
+                            failure="GESTURE_DURATION_LIMIT";
+                            break;
                         }
                         long allowedStart=r.deadline-endOffset*NS_MS;
                         latestStart=Math.min(latestStart,allowedStart);
@@ -632,9 +714,11 @@ public class AutoClickService extends AccessibilityService {
                 if(target==null||stopping)failure="CALLBACK_HANDLER_UNAVAILABLE";
                 else {
                     for(Request r:batch.requests) {
-                        r.dispatchStart=apiStart;r.apiCallStart=apiStart;
+                        r.dispatchStart=apiStart;
+                        r.apiCallStart=apiStart;
                     }
-                    active.addAll(batch.requests);callbackPending.addAll(batch.requests);
+                    active.addAll(batch.requests);
+                    callbackPending.addAll(batch.requests);
                     try {
                         accepted=dispatchGesture(batch.gestures[leadMs],callback,target);
                     } catch(Exception e) {
@@ -644,7 +728,8 @@ public class AutoClickService extends AccessibilityService {
             }
             apiReturn=SystemClock.elapsedRealtimeNanos();
             for(Request r:batch.requests) {
-                r.apiCallReturn=apiReturn;r.dispatchDuration=apiReturn-apiStart;
+                r.apiCallReturn=apiReturn;
+                r.dispatchDuration=apiReturn-apiStart;
                 r.accepted=accepted;
                 if(r.dispatchStart<0)r.dispatchStart=apiStart;
                 if(r.apiCallStart<0)r.apiCallStart=apiStart;
@@ -654,13 +739,16 @@ public class AutoClickService extends AccessibilityService {
                 nextDispatchAllowedElapsedNs=Math.max(nextDispatchAllowedElapsedNs,expectedEnd);
                 for(Request r:batch.requests)r.lastStrokeEndElapsed=expectedEnd;
             } else if(!missed) {
-                active.removeAll(batch.requests);callbackPending.removeAll(batch.requests);
+                active.removeAll(batch.requests);
+                callbackPending.removeAll(batch.requests);
             }
             dispatching=false;
         }
         if(missed) {
             recordAttempt("DISPATCH",attemptStart,apiReturn,batch.requests,apiStart,apiReturn,false,leadMs,"TARGET_MISSED_BEFORE_API");
-            requeueFutureRequests(batch,apiStart);unparkWorker();return;
+            requeueFutureRequests(batch,apiStart);
+            unparkWorker();
+            return;
         }
         if(accepted) {
             recordAttempt("DISPATCH",attemptStart,apiReturn,batch.requests,apiStart,apiReturn,true,leadMs,"ACCEPTED");
@@ -677,17 +765,20 @@ public class AutoClickService extends AccessibilityService {
 
     private void finishWithoutDispatch(List<Request> requests,String reason,boolean expired) {
         for(Request r:requests) {
-            r.callbackResult=reason;postFinish(r,false,expired);
+            r.callbackResult=reason;
+            postFinish(r,false,expired);
         }
     }
 
     private void finishBatch(Batch batch,boolean success,long callbackTime) {
         synchronized(lock) {
-            active.removeAll(batch.requests);callbackPending.removeAll(batch.requests);
+            active.removeAll(batch.requests);
+            callbackPending.removeAll(batch.requests);
         }
         lastCallbackElapsed=Math.max(lastCallbackElapsed,callbackTime);
         for(Request r:batch.requests) {
-            r.completed=callbackTime;r.callbackElapsed=callbackTime;
+            r.completed=callbackTime;
+            r.callbackElapsed=callbackTime;
             r.callbackResult=success?"ON_COMPLETED":"ON_CANCELLED";
         }
         for(Request r:batch.requests)postFinish(r,success,false);
@@ -702,7 +793,8 @@ public class AutoClickService extends AccessibilityService {
         if(r==null||!r.delivered.compareAndSet(false,true))return;
         if(r.completed<0)r.completed=SystemClock.elapsedRealtimeNanos();
         record(r,success,expired);
-        GestureCompletion c=r.completion;r.completion=null;
+        GestureCompletion c=r.completion;
+        r.completion=null;
         if(c!=null)try {
             c.onFinished(success,expired);
         } catch(Exception ignored) {
@@ -719,6 +811,7 @@ public class AutoClickService extends AccessibilityService {
 
         long durationMs=toDurationMs(touchDurationNanos);
         if(durationMs>MAX_DURATION_MS)return false;
+
         final long durationNs;
         try {
             durationNs=Math.multiplyExact(durationMs,NS_MS);
@@ -732,7 +825,11 @@ public class AutoClickService extends AccessibilityService {
 
         for(int i=0;i<targets.length;i++) {
             long target=targets[i];
-            if(completions[i]==null||target<cycleStartNanos||target>=deadlineNanos||target<previousTarget||durationNs>deadlineNanos-target)return false;
+            if(completions[i]==null||
+                    target<cycleStartNanos||
+                    target>=deadlineNanos||
+                    target<previousTarget||
+                    durationNs>deadlineNanos-target)return false;
             previousTarget=target;
         }
 
@@ -740,21 +837,33 @@ public class AutoClickService extends AccessibilityService {
             if(!ready||stopping||preparer==null||preparer.isShutdown())return false;
             long gen=generation;
             for(int i=0;i<targets.length;i++) {
-                requests.add(new Request(targets[i],cycleStartNanos,deadlineNanos,durationMs,px,py,gen,completions[i]));
+                requests.add(new Request(
+                        targets[i],
+                        cycleStartNanos,
+                        deadlineNanos,
+                        touchDurationNanos,
+                        durationMs,
+                        px,
+                        py,
+                        gen,
+                        completions[i]
+                ));
             }
             enqueueAll(requests);
             try {
                 preparer.execute(()->prepareGroup(requests));
             } catch(Exception e) {
-                pending.removeAll(requests);return false;
+                pending.removeAll(requests);
+                return false;
             }
         }
-        unparkScheduler();return true;
+        unparkScheduler();
+        return true;
     }
 
     private static long toDurationMs(long nanos) {
         if(nanos<=0)return 1;
-        return Math.max(1,nanos/NS_MS+(nanos%NS_MS==0?0:1));
+        return nanos/NS_MS+(nanos%NS_MS==0?0:1);
     }
 
     private void unparkScheduler() {
@@ -777,12 +886,15 @@ public class AutoClickService extends AccessibilityService {
         synchronized(lock) {
             generation++;
             while(!pending.isEmpty())cancelled.add(pending.pollFirst());
-            cancelled.addAll(building);building.clear();
+            cancelled.addAll(building);
+            building.clear();
             while(!prepared.isEmpty())cancelled.addAll(prepared.poll().requests);
         }
-        unparkScheduler();unparkWorker();
+        unparkScheduler();
+        unparkWorker();
         for(Request r:cancelled) {
-            r.callbackResult="CANCELLED_BEFORE_DISPATCH";postFinish(r,false,true);
+            r.callbackResult="CANCELLED_BEFORE_DISPATCH";
+            postFinish(r,false,true);
         }
     }
 
@@ -797,37 +909,51 @@ public class AutoClickService extends AccessibilityService {
 
     @Override
     public void onDestroy() {
-        ready=false;stopping=true;
-        Thread st=scheduler;scheduler=null;
+        ready=false;
+        stopping=true;
+        Thread st=scheduler;
+        scheduler=null;
         if(st!=null) {
-            LockSupport.unpark(st);st.interrupt();
+            LockSupport.unpark(st);
+            st.interrupt();
         }
-        Thread wt=worker;worker=null;
+        Thread wt=worker;
+        worker=null;
         if(wt!=null) {
-            LockSupport.unpark(wt);wt.interrupt();
+            LockSupport.unpark(wt);
+            wt.interrupt();
         }
-        ExecutorService ex=preparer;preparer=null;
+        ExecutorService ex=preparer;
+        preparer=null;
         if(ex!=null)ex.shutdownNow();
         List<Request> waiting=new ArrayList<>(),running=new ArrayList<>();
         synchronized(lock) {
             generation++;
             while(!pending.isEmpty())waiting.add(pending.pollFirst());
-            waiting.addAll(building);building.clear();
+            waiting.addAll(building);
+            building.clear();
             while(!prepared.isEmpty())waiting.addAll(prepared.poll().requests);
             if(workerCurrentBatch!=null)waiting.addAll(workerCurrentBatch.requests);
             running.addAll(active);
             for(Request r:callbackPending)if(!running.contains(r))running.add(r);
-            callbackPending.clear();active.clear();dispatching=false;workerCurrentBatch=null;
+            callbackPending.clear();
+            active.clear();
+            dispatching=false;
+            workerCurrentBatch=null;
         }
         for(Request r:waiting) {
-            r.callbackResult="SERVICE_DESTROYED_PENDING";finish(r,false,true);
+            r.callbackResult="SERVICE_DESTROYED_PENDING";
+            finish(r,false,true);
         }
         for(Request r:running) {
-            r.callbackResult="SERVICE_DESTROYED_ACTIVE";finish(r,false,false);
+            r.callbackResult="SERVICE_DESTROYED_ACTIVE";
+            finish(r,false,false);
         }
         writerStopping=true;
         if(writerThread!=null)writerThread.interrupt();
-        HandlerThread cb=callbackThread;callbackThread=null;callbackHandler=null;
+        HandlerThread cb=callbackThread;
+        callbackThread=null;
+        callbackHandler=null;
         if(cb!=null)cb.quitSafely();
         if(instance==this)instance=null;
         preferences=null;
@@ -869,7 +995,8 @@ public class AutoClickService extends AccessibilityService {
         int nx=Math.max(0,newX),ny=Math.max(0,newY);
         runOnMain(()->{
             if(!ready||(x==nx&&y==ny))return;
-            x=nx;y=ny;
+            x=nx;
+            y=ny;
             SharedPreferences p=preferences;
             if(p!=null)p.edit().putInt(KEY_X,nx).putInt(KEY_Y,ny).apply();
         });
