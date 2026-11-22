@@ -279,6 +279,30 @@ public class AutoClickService extends AccessibilityService {
         });
     }
 
+    private boolean validateTouchDuration(long touchDurationNanos) {
+        if (touchDurationNanos <= 0L) {
+            lastRequestError = "مدت لمس باید بیشتر از صفر باشد";
+            return false;
+        }
+
+        if (touchDurationNanos % NANOS_PER_MS != 0L) {
+            lastRequestError =
+                    "مدت لمس باید مضرب دقیق ۱٬۰۰۰٬۰۰۰ نانوثانیه باشد؛ "
+                    + "مقدار ورودی تغییر داده نشد";
+            return false;
+        }
+
+        long durationMs = touchDurationNanos / NANOS_PER_MS;
+
+        if (durationMs > MAX_GESTURE_DURATION_MS) {
+            lastRequestError =
+                    "مدت لمس از حداکثر زمان مجاز اندروید بیشتر است";
+            return false;
+        }
+
+        return true;
+    }
+
     public boolean performClickAtTarget(
             long targetElapsedRealtimeNanos,
             long cycleStartElapsedRealtimeNanos,
@@ -296,33 +320,23 @@ public class AutoClickService extends AccessibilityService {
             return false;
         }
 
-        if (touchDurationNanos <= 0L) {
-            lastRequestError = "مدت لمس باید بیشتر از صفر باشد";
-            return false;
-        }
-
-        if (touchDurationNanos % NANOS_PER_MS != 0L) {
-            lastRequestError =
-                    "مدت لمس با دقت واردشده توسط API اندروید قابل اجرا نیست؛ "
-                    + "مدت باید مضرب دقیق ۱٬۰۰۰٬۰۰۰ نانوثانیه باشد";
+        if (!validateTouchDuration(touchDurationNanos)) {
             return false;
         }
 
         long touchDurationMs = touchDurationNanos / NANOS_PER_MS;
-
-        if (touchDurationMs > MAX_GESTURE_DURATION_MS) {
-            lastRequestError =
-                    "مدت لمس از حداکثر زمان مجاز اندروید بیشتر است";
-            return false;
-        }
 
         if (cycleDeadlineElapsedRealtimeNanos
                     <= cycleStartElapsedRealtimeNanos
                 || targetElapsedRealtimeNanos
                     < cycleStartElapsedRealtimeNanos
                 || targetElapsedRealtimeNanos
-                    >= cycleDeadlineElapsedRealtimeNanos) {
-            lastRequestError = "زمان هدف خارج از محدوده چرخه است";
+                    >= cycleDeadlineElapsedRealtimeNanos
+                || touchDurationNanos
+                    > cycleDeadlineElapsedRealtimeNanos
+                    - targetElapsedRealtimeNanos) {
+
+            lastRequestError = "زمان کلیک یا مدت لمس خارج از محدوده چرخه است";
             return false;
         }
 
@@ -346,6 +360,115 @@ public class AutoClickService extends AccessibilityService {
 
             wasEmpty = pending.isEmpty();
             pending.offerLast(request);
+        }
+
+        lastRequestError = "";
+
+        if (wasEmpty) {
+            Thread worker = schedulerThread;
+            if (worker != null) {
+                LockSupport.unpark(worker);
+            }
+        }
+
+        return true;
+    }
+
+    public boolean performClickBatchAtTargets(
+            long[] targetElapsedRealtimeNanos,
+            long cycleStartElapsedRealtimeNanos,
+            long cycleDeadlineElapsedRealtimeNanos,
+            long touchDurationNanos,
+            GestureCompletion[] completions) {
+
+        if (!serviceReady || schedulerStopping) {
+            lastRequestError = "سرویس کلیک آماده نیست";
+            return false;
+        }
+
+        if (targetElapsedRealtimeNanos == null
+                || completions == null
+                || targetElapsedRealtimeNanos.length == 0
+                || targetElapsedRealtimeNanos.length != completions.length) {
+
+            lastRequestError = "اطلاعات دسته کلیک نامعتبر است";
+            return false;
+        }
+
+        if (!validateTouchDuration(touchDurationNanos)) {
+            return false;
+        }
+
+        if (cycleDeadlineElapsedRealtimeNanos
+                <= cycleStartElapsedRealtimeNanos) {
+            lastRequestError = "مهلت چرخه نامعتبر است";
+            return false;
+        }
+
+        long touchDurationMs = touchDurationNanos / NANOS_PER_MS;
+        long previousTarget = Long.MIN_VALUE;
+
+        List<ClickRequest> requests =
+                new ArrayList<>(targetElapsedRealtimeNanos.length);
+
+        int x = targetX;
+        int y = targetY;
+
+        for (int i = 0; i < targetElapsedRealtimeNanos.length; i++) {
+            long target = targetElapsedRealtimeNanos[i];
+
+            if (completions[i] == null) {
+                lastRequestError =
+                        "تابع تکمیل یکی از کلیک‌های دسته مشخص نشده است";
+                return false;
+            }
+
+            if (target < cycleStartElapsedRealtimeNanos
+                    || target >= cycleDeadlineElapsedRealtimeNanos) {
+                lastRequestError =
+                        "زمان یکی از کلیک‌ها خارج از محدوده چرخه است";
+                return false;
+            }
+
+            if (target < previousTarget) {
+                lastRequestError =
+                        "ترتیب زمان‌های کلیک در دسته نامعتبر است";
+                return false;
+            }
+
+            if (touchDurationNanos
+                    > cycleDeadlineElapsedRealtimeNanos - target) {
+                lastRequestError =
+                        "مدت لمس یکی از کلیک‌ها از مهلت چرخه عبور می‌کند";
+                return false;
+            }
+
+            previousTarget = target;
+
+            requests.add(new ClickRequest(
+                    this,
+                    target,
+                    cycleDeadlineElapsedRealtimeNanos,
+                    touchDurationMs,
+                    x,
+                    y,
+                    completions[i]
+            ));
+        }
+
+        boolean wasEmpty;
+
+        synchronized (queueLock) {
+            if (!serviceReady || schedulerStopping) {
+                lastRequestError = "سرویس کلیک متوقف شده است";
+                return false;
+            }
+
+            wasEmpty = pending.isEmpty();
+
+            for (ClickRequest request : requests) {
+                pending.offerLast(request);
+            }
         }
 
         lastRequestError = "";
