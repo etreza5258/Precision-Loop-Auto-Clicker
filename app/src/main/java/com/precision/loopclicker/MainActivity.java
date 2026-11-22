@@ -67,10 +67,6 @@ public class MainActivity extends Activity {
     private EditText cycleDurationInput;
     private EditText cycleCountInput;
     private EditText cyclePauseInput;
-    private EditText specialLastCycleCountInput;
-    private EditText specialClickCountInput;
-    private EditText specialIntervalNanosInput;
-    private EditText specialTouchNanosInput;
 
     private TextView phoneClock;
     private TextView internetClock;
@@ -107,11 +103,13 @@ public class MainActivity extends Activity {
         public void run() {
             updateClocks();
             long nowNanos = SystemClock.elapsedRealtimeNanos();
+
             boolean retryPassed =
                     lastSyncAttemptElapsedNanos <= 0 ||
                     nowNanos < lastSyncAttemptElapsedNanos ||
                     nowNanos - lastSyncAttemptElapsedNanos >=
                             SYNC_RETRY_INTERVAL_NANOS;
+
             boolean syncDue =
                     !timeSynced ||
                     lastSyncElapsedNanos <= 0 ||
@@ -154,15 +152,6 @@ public class MainActivity extends Activity {
                 cycleDurationInput, "تعداد چرخه‌ها", "1");
         cyclePauseInput = addInputAfter(
                 cycleCountInput, "مکث بین چرخه‌ها (میلی‌ثانیه)", "0");
-
-        specialLastCycleCountInput = addInputAfter(
-                cyclePauseInput, "تعداد چرخه‌های پایانی با تنظیمات متفاوت", "0");
-        specialClickCountInput = addInputAfter(
-                specialLastCycleCountInput, "تعداد کلیک در هر چرخه پایانی", "");
-        specialIntervalNanosInput = addInputAfter(
-                specialClickCountInput, "فاصله کلیک‌های چرخه پایانی (نانوثانیه)", "");
-        specialTouchNanosInput = addInputAfter(
-                specialIntervalNanosInput, "مدت لمس چرخه پایانی (نانوثانیه)", "");
     }
 
     private EditText addInputAfter(
@@ -213,6 +202,7 @@ public class MainActivity extends Activity {
         input.setBackgroundTintList(
                 android.content.res.ColorStateList.valueOf(0xFF78909C));
         row.addView(input);
+
         container.addView(row, index + 1);
         return input;
     }
@@ -634,15 +624,6 @@ public class MainActivity extends Activity {
             long cycleCount = readNumber(cycleCountInput, 1);
             long cyclePauseMs = readNumber(cyclePauseInput, 0);
 
-            long specialLastCycles =
-                    readOptionalNumber(specialLastCycleCountInput);
-            long specialClicks =
-                    readOptionalNumber(specialClickCountInput);
-            long specialInterval =
-                    readOptionalNumber(specialIntervalNanosInput);
-            long specialTouch =
-                    readOptionalNumber(specialTouchNanosInput);
-
             if (intervalNanos < 0 ||
                     clicksPerCycle <= 0 ||
                     clicksPerCycle > Integer.MAX_VALUE ||
@@ -650,33 +631,9 @@ public class MainActivity extends Activity {
                     cycleDurationMs <= 0 ||
                     cycleCount <= 0 ||
                     cycleCount > Integer.MAX_VALUE ||
-                    cyclePauseMs < 0 ||
-                    specialLastCycles < 0) {
+                    cyclePauseMs < 0) {
                 showError("یکی از مقادیر تنظیمات معتبر نیست.");
                 return;
-            }
-
-            if (specialLastCycles > 0) {
-                if (specialLastCycles > cycleCount ||
-                        specialClicks <= 0 ||
-                        specialClicks > Integer.MAX_VALUE ||
-                        specialInterval < 0 ||
-                        specialTouch <= 0) {
-                    showError("تنظیمات چرخه‌های پایانی معتبر نیست.");
-                    return;
-                }
-
-                if (specialTouch % NANOS_PER_MILLI != 0 ||
-                        specialTouch / NANOS_PER_MILLI >
-                                GestureDescription.getMaxGestureDuration()) {
-                    showError(
-                            "مدت لمس چرخه پایانی باید مضرب دقیق یک میلی‌ثانیه و در محدوده اندروید باشد.");
-                    return;
-                }
-            } else {
-                specialClicks = 0;
-                specialInterval = 0;
-                specialTouch = 0;
             }
 
             long cycleDurationNanos =
@@ -695,19 +652,6 @@ public class MainActivity extends Activity {
                 return;
             }
 
-            if (specialLastCycles > 0) {
-                long specialLastOffset =
-                        safeMultiply(specialClicks - 1, specialInterval);
-                long specialLastEnd =
-                        safeAdd(specialLastOffset, specialTouch);
-
-                if (specialLastEnd > cycleDurationNanos) {
-                    showError(
-                            "تعداد کلیک‌ها، فاصله و مدت لمس در چرخه پایانی جا نمی‌شوند.");
-                    return;
-                }
-            }
-
             long totalCycleNanos =
                     safeMultiply(cycleCount, cycleDurationNanos);
             long totalPauseNanos =
@@ -720,13 +664,8 @@ public class MainActivity extends Activity {
                 return;
             }
 
-            long normalCycleCount = cycleCount - specialLastCycles;
-            long normalTotalClicks =
-                    safeMultiply(normalCycleCount, clicksPerCycle);
-            long specialTotalClicks =
-                    safeMultiply(specialLastCycles, specialClicks);
             long expectedTotalClicks =
-                    safeAdd(normalTotalClicks, specialTotalClicks);
+                    safeMultiply(cycleCount, clicksPerCycle);
 
             final long sourceNowEpochNanos;
             if (useInternet) {
@@ -785,17 +724,7 @@ public class MainActivity extends Activity {
             service.putExtra("cycle_pause_ns", cyclePauseNanos);
             service.putExtra("total_duration_ns", totalDurationNanos);
             service.putExtra("clock_source", source);
-
-            service.putExtra(
-                    "special_last_cycle_count", specialLastCycles);
-            service.putExtra(
-                    "special_clicks_per_cycle", specialClicks);
-            service.putExtra(
-                    "special_click_interval_ns", specialInterval);
-            service.putExtra(
-                    "special_touch_duration_ns", specialTouch);
-            service.putExtra(
-                    "expected_total_clicks", expectedTotalClicks);
+            service.putExtra("expected_total_clicks", expectedTotalClicks);
 
             if (useInternet) {
                 service.putExtra(
@@ -831,12 +760,6 @@ public class MainActivity extends Activity {
         if (input == null) return defaultValue;
         String value = input.getText().toString().trim();
         return value.isEmpty() ? defaultValue : Long.parseLong(value);
-    }
-
-    private long readOptionalNumber(EditText input) {
-        if (input == null) return 0;
-        String value = input.getText().toString().trim();
-        return value.isEmpty() ? 0 : Long.parseLong(value);
     }
 
     private long safeMultiply(long a, long b) {
