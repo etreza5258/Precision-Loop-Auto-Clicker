@@ -18,8 +18,6 @@ import java.util.concurrent.locks.LockSupport;
 public class AutoClickService extends AccessibilityService {
     private static final long NS_MS=1_000_000L,LEAD_MS=12,LEAD_NS=LEAD_MS*NS_MS,SPIN_NS=1_000_000L,MAX_DURATION_MS=GestureDescription.getMaxGestureDuration();
     private static final int MAX_STROKES=GestureDescription.getMaxStrokeCount(),MAX_PREPARED=20;
-    private static final int FAST_FIRST_COUNT=10;
-    private static final long FAST_INTERVAL_NS=NS_MS;
     private static final String PREFS="auto_click_target",KEY_X="target_x",KEY_Y="target_y",LOG_FILE="PrecisionClickTiming_v5.txt",ATTEMPT_LOG_FILE="PrecisionClickAttempts_v1.csv";
     private static final int DEFAULT_X=350,DEFAULT_Y=700;
     private static final AtomicLong ATTEMPT_IDS=new AtomicLong();
@@ -716,26 +714,8 @@ public class AutoClickService extends AccessibilityService {
         return performClickBatchAtTargets(new long[]{targetNanos},cycleStartNanos,deadlineNanos,touchDurationNanos,new GestureCompletion[]{completion});
     }
 
-    private static long[] normalizeFirstTenTargets(long[] source) {
-        long[] result=source.clone();
-        if(result.length<2)return result;
-        int count=Math.min(FAST_FIRST_COUNT,result.length);
-        long base=result[0];
-        for(int i=0;i<count;i++) {
-            try {
-                result[i]=Math.addExact(base,Math.multiplyExact((long)i,FAST_INTERVAL_NS));
-            } catch(ArithmeticException e) {
-                return null;
-            }
-        }
-        return result;
-    }
-
     public boolean performClickBatchAtTargets(long[] targets,long cycleStartNanos,long deadlineNanos,long touchDurationNanos,GestureCompletion[] completions) {
         if(!ready||stopping||targets==null||completions==null||targets.length==0||targets.length!=completions.length||touchDurationNanos<0||deadlineNanos<=cycleStartNanos)return false;
-
-        long[] scheduledTargets=normalizeFirstTenTargets(targets);
-        if(scheduledTargets==null)return false;
 
         long durationMs=toDurationMs(touchDurationNanos);
         if(durationMs>MAX_DURATION_MS)return false;
@@ -746,12 +726,12 @@ public class AutoClickService extends AccessibilityService {
             return false;
         }
 
-        ArrayList<Request> requests=new ArrayList<>(scheduledTargets.length);
+        ArrayList<Request> requests=new ArrayList<>(targets.length);
         long previousTarget=Long.MIN_VALUE;
         int px=x,py=y;
 
-        for(int i=0;i<scheduledTargets.length;i++) {
-            long target=scheduledTargets[i];
+        for(int i=0;i<targets.length;i++) {
+            long target=targets[i];
             if(completions[i]==null||target<cycleStartNanos||target>=deadlineNanos||target<previousTarget||durationNs>deadlineNanos-target)return false;
             previousTarget=target;
         }
@@ -759,8 +739,8 @@ public class AutoClickService extends AccessibilityService {
         synchronized(lock) {
             if(!ready||stopping||preparer==null||preparer.isShutdown())return false;
             long gen=generation;
-            for(int i=0;i<scheduledTargets.length;i++) {
-                requests.add(new Request(scheduledTargets[i],cycleStartNanos,deadlineNanos,durationMs,px,py,gen,completions[i]));
+            for(int i=0;i<targets.length;i++) {
+                requests.add(new Request(targets[i],cycleStartNanos,deadlineNanos,durationMs,px,py,gen,completions[i]));
             }
             enqueueAll(requests);
             try {
