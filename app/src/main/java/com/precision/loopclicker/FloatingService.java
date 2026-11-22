@@ -1,5 +1,7 @@
+
 package com.precision.loopclicker;
 
+import android.accessibilityservice.GestureDescription;
 import android.app.*;
 import android.content.*;
 import android.content.pm.ServiceInfo;
@@ -14,7 +16,9 @@ import android.widget.*;
 
 import java.lang.reflect.Field;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Calendar;
+import java.util.List;
 import java.util.Locale;
 import java.util.TimeZone;
 
@@ -51,39 +55,81 @@ public class FloatingService extends Service {
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final int[] markerLocation = new int[2];
+
     private final SimpleDateFormat clockFormat =
             new SimpleDateFormat("HH:mm:ss.SSS", Locale.US);
 
     private WindowManager wm;
     private LinearLayout panel;
-    private TextView selectedTimeView, statusView, countdownView, markerView;
-    private WindowManager.LayoutParams panelParams, markerParams;
 
-    private int targetX, targetY, markerSize;
-    private int startHour, startMinute, startSecond, startMillis;
+    private TextView selectedTimeView;
+    private TextView statusView;
+    private TextView countdownView;
+    private TextView markerView;
+
+    private WindowManager.LayoutParams panelParams;
+    private WindowManager.LayoutParams markerParams;
+
+    private int targetX;
+    private int targetY;
+    private int markerSize;
+
+    private int startHour;
+    private int startMinute;
+    private int startSecond;
+    private int startMillis;
 
     private String clockSource = PHONE;
 
-    private volatile long internetEpochNs, internetElapsedNs;
+    private volatile long internetEpochNs;
+    private volatile long internetElapsedNs;
+
     private boolean internetAnchorAvailable;
     private boolean receiverRegistered;
     private boolean floatingTimeConfigured;
 
-    private long runStartNs, runEndNs, totalClicks;
-    private long cycleDurationNs, cycleStrideNs, clickIntervalNs, touchDurationNs;
-    private long cycleStartNs, cycleEndNs, nextTargetNs;
+    private long runStartNs;
+    private long runEndNs;
+    private long totalClicks;
 
-    private long completedClicks, expiredClicks, failedClicks;
+    private long cycleDurationNs;
+    private long cycleStrideNs;
+    private long clickIntervalNs;
+    private long touchDurationNs;
 
-    private int generation, cycleIndex, clickIndex;
-    private int clicksPerCycle, cycleCount;
+    private long cycleStartNs;
+    private long cycleEndNs;
+    private long nextTargetNs;
 
-    private boolean clicking, runDisplayActive, runFinished;
+    private long completedClicks;
+    private long expiredClicks;
+    private long failedClicks;
 
-    private float panelRawX, panelRawY, markerRawX, markerRawY;
-    private int panelStartX, panelStartY, markerStartX, markerStartY;
+    private int generation;
+    private int cycleIndex;
+    private int clickIndex;
 
-    private Runnable clockRunnable, countdownRunnable, nextClickRunnable;
+    private int clicksPerCycle;
+    private int cycleCount;
+
+    private boolean clicking;
+    private boolean runDisplayActive;
+    private boolean runFinished;
+
+    private float panelRawX;
+    private float panelRawY;
+    private float markerRawX;
+    private float markerRawY;
+
+    private int panelStartX;
+    private int panelStartY;
+    private int markerStartX;
+    private int markerStartY;
+
+    private Runnable clockRunnable;
+    private Runnable countdownRunnable;
+    private Runnable nextClickRunnable;
+
     private AutoClickService configuredService;
 
     public static FloatingService getInstance() {
@@ -97,14 +143,22 @@ public class FloatingService extends Service {
                 return;
 
             String source = intent.getStringExtra("clock_source");
-            if (!PHONE.equals(source) && !INTERNET.equals(source)) return;
 
-            long epoch = intent.getLongExtra("internet_epoch_at_sync_ns", 0);
-            long elapsed = intent.getLongExtra("internet_elapsed_at_sync_ns", 0);
+            if (!PHONE.equals(source) && !INTERNET.equals(source))
+                return;
+
+            long epoch = intent.getLongExtra(
+                    "internet_epoch_at_sync_ns", 0);
+
+            long elapsed = intent.getLongExtra(
+                    "internet_elapsed_at_sync_ns", 0);
 
             if (epoch <= 0 || elapsed <= 0) {
-                long epochMs = intent.getLongExtra("internet_epoch_at_sync_ms", 0);
-                long elapsedMs = intent.getLongExtra("internet_elapsed_at_sync_ms", 0);
+                long epochMs = intent.getLongExtra(
+                        "internet_epoch_at_sync_ms", 0);
+
+                long elapsedMs = intent.getLongExtra(
+                        "internet_elapsed_at_sync_ms", 0);
 
                 try {
                     epoch = Math.multiplyExact(epochMs, NS_MS);
@@ -120,7 +174,11 @@ public class FloatingService extends Service {
             }
 
             clockSource = source;
-            getPrefs().edit().putString("clock_source", source).apply();
+
+            getPrefs().edit()
+                    .putString("clock_source", source)
+                    .apply();
+
             updateClockDisplay();
         }
     };
@@ -128,10 +186,14 @@ public class FloatingService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+
         instance = this;
         wm = (WindowManager) getSystemService(WINDOW_SERVICE);
+
         markerSize = dp(48);
-        clockFormat.setTimeZone(TimeZone.getTimeZone("Asia/Tehran"));
+
+        clockFormat.setTimeZone(
+                TimeZone.getTimeZone("Asia/Tehran"));
 
         loadClockSource();
         registerClockReceiver();
@@ -190,11 +252,16 @@ public class FloatingService extends Service {
         }
 
         final int runId = ++generation;
+
         long now = SystemClock.elapsedRealtimeNanos();
-        long start = intent.getLongExtra("start_elapsed_realtime_ns", 0);
+
+        long start = intent.getLongExtra(
+                "start_elapsed_realtime_ns", 0);
 
         if (start <= 0) {
-            long oldStart = intent.getLongExtra("start_elapsed_realtime_ms", 0);
+            long oldStart = intent.getLongExtra(
+                    "start_elapsed_realtime_ms", 0);
+
             if (oldStart > 0) {
                 try {
                     start = Math.multiplyExact(oldStart, NS_MS);
@@ -213,7 +280,8 @@ public class FloatingService extends Service {
             } else {
                 try {
                     delay = Math.multiplyExact(
-                            intent.getLongExtra("start_delay_ms", 0), NS_MS);
+                            intent.getLongExtra("start_delay_ms", 0),
+                            NS_MS);
                 } catch (ArithmeticException e) {
                     updateStatus("زمان شروع نامعتبر است");
                     return;
@@ -229,7 +297,9 @@ public class FloatingService extends Service {
         }
 
         long clicks = intent.getLongExtra(
-                "clicks_per_cycle", intent.getLongExtra("click_count", 1));
+                "clicks_per_cycle",
+                intent.getLongExtra("click_count", 1));
+
         long cycles = intent.getLongExtra("cycle_count", 1);
 
         if (clicks < 1 || clicks > Integer.MAX_VALUE ||
@@ -241,43 +311,81 @@ public class FloatingService extends Service {
         int requestedClicks = (int) clicks;
         int requestedCycles = (int) cycles;
 
-        long duration = getNanos(intent, "cycle_duration_ns",
+        long duration = getNanos(
+                intent, "cycle_duration_ns",
                 "cycle_duration_ms", 0);
-        long pause = getNanos(intent, "cycle_pause_ns",
+
+        long pause = getNanos(
+                intent, "cycle_pause_ns",
                 "cycle_pause_ms", 0);
-        long interval = getNanos(intent, "click_interval_ns",
+
+        long interval = getNanos(
+                intent, "click_interval_ns",
                 "click_interval_ms", NS_MS);
-        long touch = getNanos(intent, "touch_duration_ns",
+
+        long touch = getNanos(
+                intent, "touch_duration_ns",
                 "touch_duration_ms", NS_MS);
 
-        if (duration < 0 || pause < 0 || interval < 0 || touch < 0) {
+        if (duration < 0 || pause < 0 ||
+                interval < 0 || touch < 0) {
             updateStatus("تنظیمات زمانی نامعتبر است");
             return;
         }
 
-        long lastOffset, stride, end, total;
+        if (touch == 0) {
+            updateStatus("مدت لمس باید بیشتر از صفر باشد");
+            return;
+        }
+
+        if (touch % NS_MS != 0) {
+            updateStatus(
+                    "مدت لمس قابل اجرا نیست؛ مقدار باید مضرب دقیق "
+                            + "۱٬۰۰۰٬۰۰۰ نانوثانیه باشد");
+            return;
+        }
+
+        long touchMs = touch / NS_MS;
+
+        if (touchMs > GestureDescription.getMaxGestureDuration()) {
+            updateStatus(
+                    "مدت لمس از حداکثر زمان مجاز اندروید بیشتر است");
+            return;
+        }
+
+        long lastOffset;
+        long stride;
+        long end;
+        long total;
 
         try {
-            lastOffset = Math.multiplyExact(requestedClicks - 1L, interval);
+            lastOffset = Math.multiplyExact(
+                    requestedClicks - 1L, interval);
 
             if (duration == 0) {
-                duration = Math.max(1, Math.addExact(lastOffset, touch));
+                duration = Math.max(
+                        1, Math.addExact(lastOffset, touch));
             }
 
             if (lastOffset >= duration ||
                     Math.addExact(lastOffset, touch) > duration) {
-                updateStatus("زمان آخرین کلیک از مهلت چرخه عبور می‌کند");
+                updateStatus(
+                        "زمان آخرین کلیک از مهلت چرخه عبور می‌کند");
                 return;
             }
 
             stride = Math.addExact(duration, pause);
 
             long fullDuration = Math.addExact(
-                    Math.multiplyExact((long) requestedCycles, duration),
-                    Math.multiplyExact((long) requestedCycles - 1, pause));
+                    Math.multiplyExact(
+                            (long) requestedCycles, duration),
+                    Math.multiplyExact(
+                            (long) requestedCycles - 1, pause));
 
             end = Math.addExact(start, fullDuration);
-            total = Math.multiplyExact((long) requestedClicks, requestedCycles);
+
+            total = Math.multiplyExact(
+                    (long) requestedClicks, requestedCycles);
 
         } catch (ArithmeticException e) {
             updateStatus("مدت یا تعداد اجرا بیش از حد بزرگ است");
@@ -286,6 +394,7 @@ public class FloatingService extends Service {
 
         clicksPerCycle = requestedClicks;
         cycleCount = requestedCycles;
+
         cycleDurationNs = duration;
         cycleStrideNs = stride;
         clickIntervalNs = interval;
@@ -295,45 +404,59 @@ public class FloatingService extends Service {
         runEndNs = end;
         totalClicks = total;
 
-        cycleIndex = clickIndex = 0;
+        cycleIndex = 0;
+        clickIndex = 0;
+
         cycleStartNs = start;
         cycleEndNs = start + duration;
         nextTargetNs = start;
 
-        completedClicks = expiredClicks = failedClicks = 0;
+        completedClicks = 0;
+        expiredClicks = 0;
+        failedClicks = 0;
 
-        clicking = runDisplayActive = true;
+        clicking = true;
+        runDisplayActive = true;
         runFinished = false;
 
         updateTarget();
         setMarkerTouchable(false);
         showFloatingViews();
+
         updateStatus("زمان‌بندی کلیک‌ها آغاز شد");
         updateCountdown();
 
         scheduleNextClick(runId);
     }
 
-    private long getNanos(Intent intent, String nsKey,
-                          String msKey, long defaultValue) {
+    private long getNanos(
+            Intent intent,
+            String nsKey,
+            String msKey,
+            long defaultValue) {
+
         if (intent.hasExtra(nsKey))
             return intent.getLongExtra(nsKey, defaultValue);
 
         try {
             return Math.multiplyExact(
-                    intent.getLongExtra(msKey, defaultValue / NS_MS), NS_MS);
+                    intent.getLongExtra(
+                            msKey, defaultValue / NS_MS),
+                    NS_MS);
         } catch (ArithmeticException e) {
             return -1;
         }
     }
 
-    // هر چرخه به شکل یک مجموعه کامل ثبت می‌شود.
     private void scheduleNextClick(int runId) {
-        if (!clicking || runId != generation) return;
+        if (!clicking || runId != generation)
+            return;
 
         int scheduledClicks = 0;
 
-        while (cycleIndex < cycleCount && scheduledClicks < BATCH_SIZE) {
+        while (cycleIndex < cycleCount &&
+                scheduledClicks < BATCH_SIZE) {
+
             if (clickIndex >= clicksPerCycle) {
                 cycleIndex++;
                 clickIndex = 0;
@@ -344,9 +467,14 @@ public class FloatingService extends Service {
                 }
 
                 try {
-                    cycleStartNs = Math.addExact(cycleStartNs, cycleStrideNs);
-                    cycleEndNs = Math.addExact(cycleStartNs, cycleDurationNs);
+                    cycleStartNs = Math.addExact(
+                            cycleStartNs, cycleStrideNs);
+
+                    cycleEndNs = Math.addExact(
+                            cycleStartNs, cycleDurationNs);
+
                     nextTargetNs = cycleStartNs;
+
                 } catch (ArithmeticException e) {
                     updateStatus("خطای محاسبات زمان‌بندی");
                     stopClicking();
@@ -358,7 +486,8 @@ public class FloatingService extends Service {
             long cycleStart = cycleStartNs;
             long deadline = cycleEndNs;
 
-            if (!queueCycle(runId, cycleStart, deadline, count)) {
+            if (!queueCycle(
+                    runId, cycleStart, deadline, count)) {
                 updateStatus("ثبت دسته کلیک‌های چرخه ناموفق بود");
             }
 
@@ -374,8 +503,12 @@ public class FloatingService extends Service {
         }
     }
 
-    private boolean queueCycle(int runId, long cycleStart,
-                               long deadline, int count) {
+    private boolean queueCycle(
+            int runId,
+            long cycleStart,
+            long deadline,
+            int count) {
+
         if (!clicking || runId != generation || count <= 0)
             return false;
 
@@ -384,13 +517,15 @@ public class FloatingService extends Service {
 
         try {
             targets = new long[count];
-            completions = new AutoClickService.GestureCompletion[count];
+            completions =
+                    new AutoClickService.GestureCompletion[count];
 
             for (int i = 0; i < count; i++) {
-                long offset = Math.multiplyExact((long) i, clickIntervalNs);
+                long offset = Math.multiplyExact(
+                        (long) i, clickIntervalNs);
+
                 targets[i] = Math.addExact(cycleStart, offset);
 
-                final int clickNumber = i;
                 completions[i] = (success, expired) ->
                         recordResult(runId, success, expired);
             }
@@ -398,6 +533,7 @@ public class FloatingService extends Service {
         } catch (ArithmeticException | OutOfMemoryError e) {
             for (int i = 0; i < count; i++)
                 recordResult(runId, false, false);
+
             return false;
         }
 
@@ -406,6 +542,7 @@ public class FloatingService extends Service {
         if (service == null || !service.isServiceReady()) {
             for (int i = 0; i < count; i++)
                 recordResult(runId, false, false);
+
             return false;
         }
 
@@ -416,7 +553,12 @@ public class FloatingService extends Service {
 
         try {
             accepted = service.performClickBatchAtTargets(
-                    targets, cycleStart, deadline, touchDurationNs, completions);
+                    targets,
+                    cycleStart,
+                    deadline,
+                    touchDurationNs,
+                    completions);
+
         } catch (Exception e) {
             accepted = false;
         }
@@ -429,8 +571,13 @@ public class FloatingService extends Service {
         return accepted;
     }
 
-    private void recordResult(int runId, boolean success, boolean expired) {
-        if (runId != generation) return;
+    private void recordResult(
+            int runId,
+            boolean success,
+            boolean expired) {
+
+        if (runId != generation)
+            return;
 
         if (success) {
             completedClicks++;
@@ -444,37 +591,50 @@ public class FloatingService extends Service {
     }
 
     private void scheduleRunFinish(int runId) {
-        if (runId != generation) return;
+        if (runId != generation)
+            return;
 
-        long remaining = runEndNs - SystemClock.elapsedRealtimeNanos();
+        long remaining =
+                runEndNs - SystemClock.elapsedRealtimeNanos();
 
         if (remaining > 0) {
             long delay = remaining / NS_MS;
-            if (remaining % NS_MS != 0) delay++;
+
+            if (remaining % NS_MS != 0)
+                delay++;
 
             handler.postDelayed(
-                    () -> scheduleRunFinish(runId), Math.max(1, delay));
+                    () -> scheduleRunFinish(runId),
+                    Math.max(1, delay));
+
         } else {
             finishClicking();
         }
     }
 
     private void finishClicking() {
-        if (!clicking) return;
+        if (!clicking)
+            return;
 
         clicking = false;
+
         updateStatus("چرخه‌ها تمام شدند؛ در انتظار نتایج");
         updateRunResult();
         updateCountdown();
     }
 
     private void updateRunResult() {
-        long results = completedClicks + expiredClicks + failedClicks;
+        long results =
+                completedClicks + expiredClicks + failedClicks;
 
-        if (!clicking && totalClicks > 0 && results >= totalClicks) {
+        if (!clicking && totalClicks > 0 &&
+                results >= totalClicks) {
+
             runDisplayActive = false;
             runFinished = true;
+
             setMarkerTouchable(true);
+
             updateStatus("اجرای تمام درخواست‌ها به پایان رسید");
             updateCountdown();
         }
@@ -484,6 +644,7 @@ public class FloatingService extends Service {
         clicking = false;
         runDisplayActive = false;
         runFinished = false;
+
         generation++;
 
         if (nextClickRunnable != null) {
@@ -492,11 +653,14 @@ public class FloatingService extends Service {
         }
 
         AutoClickService service = AutoClickService.getInstance();
+
         if (service != null)
             service.cancelPendingScheduledClick();
 
         configuredService = null;
+
         setMarkerTouchable(true);
+
         updateStatus("اجرای کلیک‌ها متوقف شد");
         updateCountdown();
     }
@@ -508,18 +672,28 @@ public class FloatingService extends Service {
     private void loadClockSource() {
         SharedPreferences p = getPrefs();
 
-        clockSource = INTERNET.equals(p.getString("clock_source", PHONE))
+        clockSource = INTERNET.equals(
+                p.getString("clock_source", PHONE))
                 ? INTERNET : PHONE;
 
-        long epoch = p.getLong("internet_epoch_at_sync_ns", 0);
-        long elapsed = p.getLong("internet_elapsed_at_sync_ns", 0);
+        long epoch = p.getLong(
+                "internet_epoch_at_sync_ns", 0);
+
+        long elapsed = p.getLong(
+                "internet_elapsed_at_sync_ns", 0);
 
         if (epoch <= 0 || elapsed <= 0) {
             try {
                 epoch = Math.multiplyExact(
-                        p.getLong("internet_epoch_at_sync_ms", 0), NS_MS);
+                        p.getLong(
+                                "internet_epoch_at_sync_ms", 0),
+                        NS_MS);
+
                 elapsed = Math.multiplyExact(
-                        p.getLong("internet_elapsed_at_sync_ms", 0), NS_MS);
+                        p.getLong(
+                                "internet_elapsed_at_sync_ms", 0),
+                        NS_MS);
+
             } catch (ArithmeticException e) {
                 epoch = elapsed = 0;
             }
@@ -529,13 +703,15 @@ public class FloatingService extends Service {
                 elapsed <= SystemClock.elapsedRealtimeNanos()) {
             saveInternetAnchor(epoch, elapsed);
         } else {
-            internetEpochNs = internetElapsedNs = 0;
+            internetEpochNs = 0;
+            internetElapsedNs = 0;
             internetAnchorAvailable = false;
         }
     }
 
     private void saveInternetAnchor(long epoch, long elapsed) {
-        if (epoch <= 0 || elapsed <= 0) return;
+        if (epoch <= 0 || elapsed <= 0)
+            return;
 
         internetEpochNs = epoch;
         internetElapsedNs = elapsed;
@@ -550,13 +726,16 @@ public class FloatingService extends Service {
     }
 
     private void registerClockReceiver() {
-        if (receiverRegistered) return;
+        if (receiverRegistered)
+            return;
 
         try {
             IntentFilter filter = new IntentFilter(CLOCK_ACTION);
 
             if (Build.VERSION.SDK_INT >= 33) {
-                registerReceiver(clockReceiver, filter,
+                registerReceiver(
+                        clockReceiver,
+                        filter,
                         Context.RECEIVER_NOT_EXPORTED);
             } else {
                 registerReceiver(clockReceiver, filter);
@@ -570,7 +749,8 @@ public class FloatingService extends Service {
     }
 
     private void unregisterClockReceiver() {
-        if (!receiverRegistered) return;
+        if (!receiverRegistered)
+            return;
 
         try {
             unregisterReceiver(clockReceiver);
@@ -585,23 +765,30 @@ public class FloatingService extends Service {
             return System.currentTimeMillis();
 
         if (!internetAnchorAvailable ||
-                internetEpochNs <= 0 || internetElapsedNs <= 0)
+                internetEpochNs <= 0 ||
+                internetElapsedNs <= 0)
             return 0;
 
         long now = SystemClock.elapsedRealtimeNanos();
-        if (now < internetElapsedNs) return 0;
+
+        if (now < internetElapsedNs)
+            return 0;
 
         long diff = now - internetElapsedNs;
-        if (internetEpochNs > Long.MAX_VALUE - diff) return 0;
+
+        if (internetEpochNs > Long.MAX_VALUE - diff)
+            return 0;
 
         return (internetEpochNs + diff) / NS_MS;
     }
 
     private void createNotificationChannel() {
-        if (Build.VERSION.SDK_INT < 26) return;
+        if (Build.VERSION.SDK_INT < 26)
+            return;
 
         NotificationChannel channel = new NotificationChannel(
-                CHANNEL, "Precision Loop Auto Clicker",
+                CHANNEL,
+                "Precision Loop Auto Clicker",
                 NotificationManager.IMPORTANCE_LOW);
 
         channel.setDescription("سرویس تنظیم زمان");
@@ -617,11 +804,12 @@ public class FloatingService extends Service {
         Intent open = new Intent(this, MainActivity.class);
 
         int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+
         if (Build.VERSION.SDK_INT >= 23)
             flags |= PendingIntent.FLAG_IMMUTABLE;
 
-        PendingIntent pending =
-                PendingIntent.getActivity(this, 100, open, flags);
+        PendingIntent pending = PendingIntent.getActivity(
+                this, 100, open, flags);
 
         Notification.Builder builder = Build.VERSION.SDK_INT >= 26
                 ? new Notification.Builder(this, CHANNEL)
@@ -636,7 +824,9 @@ public class FloatingService extends Service {
                 .build();
 
         if (Build.VERSION.SDK_INT >= 34) {
-            startForeground(NOTIFICATION_ID, notification,
+            startForeground(
+                    NOTIFICATION_ID,
+                    notification,
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
         } else {
             startForeground(NOTIFICATION_ID, notification);
@@ -658,13 +848,17 @@ public class FloatingService extends Service {
         if (wm == null)
             wm = (WindowManager) getSystemService(WINDOW_SERVICE);
 
-        if (panel == null) createPanel();
-        if (markerView == null) createMarker();
+        if (panel == null)
+            createPanel();
+
+        if (markerView == null)
+            createMarker();
 
         showFloatingViews();
         updateTarget();
         updateClockDisplay();
         updateCountdown();
+
         setMarkerTouchable(!clicking);
     }
 
@@ -677,26 +871,41 @@ public class FloatingService extends Service {
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
         box.setPadding(dp(7), dp(6), dp(7), dp(6));
-        box.setBackground(background(Color.rgb(13, 25, 36), dp(8)));
 
-        TextView heading = text("تنظیم زمان", ORANGE, 13, true);
-        selectedTimeView = text("", Color.WHITE, 10, false);
-        countdownView = text("آماده", Color.rgb(255, 210, 90), 11, true);
-        statusView = text("آماده", Color.rgb(180, 190, 205), 10, false);
+        box.setBackground(background(
+                Color.rgb(13, 25, 36), dp(8)));
+
+        TextView heading = text(
+                "تنظیم زمان", ORANGE, 13, true);
+
+        selectedTimeView = text(
+                "", Color.WHITE, 10, false);
+
+        countdownView = text(
+                "آماده", Color.rgb(255, 210, 90), 11, true);
+
+        statusView = text(
+                "آماده", Color.rgb(180, 190, 205), 10, false);
 
         box.addView(heading);
         box.addView(selectedTimeView);
         box.addView(countdownView);
         box.addView(statusView);
+
         panel.addView(box);
 
         LinearLayout row = new LinearLayout(this);
         row.setGravity(Gravity.CENTER);
         row.setPadding(0, dp(5), 0, 0);
 
-        TextView main = panelButton("تنظیمات", Color.rgb(20, 125, 75));
-        TextView time = panelButton("⚙", Color.rgb(55, 85, 110));
-        TextView off = panelButton("خاموش", Color.rgb(75, 75, 85));
+        TextView main = panelButton(
+                "تنظیمات", Color.rgb(20, 125, 75));
+
+        TextView time = panelButton(
+                "⚙", Color.rgb(55, 85, 110));
+
+        TextView off = panelButton(
+                "خاموش", Color.rgb(75, 75, 85));
 
         main.setOnClickListener(v -> openMain());
         time.setOnClickListener(v -> showStartTimePicker());
@@ -705,15 +914,18 @@ public class FloatingService extends Service {
         row.addView(main);
         row.addView(time);
         row.addView(off);
+
         panel.addView(row);
 
         panel.setOnTouchListener((v, event) -> {
-            if (panelParams == null) return false;
+            if (panelParams == null)
+                return false;
 
             switch (event.getAction()) {
                 case MotionEvent.ACTION_DOWN:
                     panelRawX = event.getRawX();
                     panelRawY = event.getRawY();
+
                     panelStartX = panelParams.x;
                     panelStartY = panelParams.y;
                     return true;
@@ -721,8 +933,10 @@ public class FloatingService extends Service {
                 case MotionEvent.ACTION_MOVE:
                     panelParams.x = panelStartX +
                             (int) (event.getRawX() - panelRawX);
+
                     panelParams.y = panelStartY +
                             (int) (event.getRawY() - panelRawY);
+
                     updateView(panel, panelParams);
                     return true;
 
@@ -735,7 +949,8 @@ public class FloatingService extends Service {
         });
 
         panelParams = new WindowManager.LayoutParams(
-                -2, -2, overlayType(),
+                -2, -2,
+                overlayType(),
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
                         WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN |
                         WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
@@ -761,16 +976,19 @@ public class FloatingService extends Service {
         markerView.setTextSize(39);
         markerView.setGravity(Gravity.CENTER);
         markerView.setTextColor(Color.WHITE);
+
         markerView.setBackground(background(
                 Color.argb(220, 220, 35, 35), dp(24)));
 
         markerView.setOnTouchListener((v, event) -> {
-            if (markerParams == null || clicking) return false;
+            if (markerParams == null || clicking)
+                return false;
 
             switch (event.getAction()) {
                 case MotionEvent.ACTION_DOWN:
                     markerRawX = event.getRawX();
                     markerRawY = event.getRawY();
+
                     markerStartX = markerParams.x;
                     markerStartY = markerParams.y;
                     return true;
@@ -778,8 +996,10 @@ public class FloatingService extends Service {
                 case MotionEvent.ACTION_MOVE:
                     markerParams.x = markerStartX +
                             (int) (event.getRawX() - markerRawX);
+
                     markerParams.y = markerStartY +
                             (int) (event.getRawY() - markerRawY);
+
                     updateView(markerView, markerParams);
                     updateTarget();
                     return true;
@@ -800,7 +1020,9 @@ public class FloatingService extends Service {
         });
 
         markerParams = new WindowManager.LayoutParams(
-                markerSize, markerSize, overlayType(),
+                markerSize,
+                markerSize,
+                overlayType(),
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
                         WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT);
@@ -819,7 +1041,8 @@ public class FloatingService extends Service {
     }
 
     private void updateTarget() {
-        if (markerView == null || markerParams == null) return;
+        if (markerView == null || markerParams == null)
+            return;
 
         markerView.getLocationOnScreen(markerLocation);
 
@@ -837,22 +1060,31 @@ public class FloatingService extends Service {
     }
 
     private void setMarkerTouchable(boolean touchable) {
-        if (markerView == null || markerParams == null) return;
+        if (markerView == null || markerParams == null)
+            return;
 
-        int flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN;
+        int flags =
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
+                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN;
 
         if (!touchable)
             flags |= WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
 
-        if (markerParams.flags == flags) return;
+        if (markerParams.flags == flags)
+            return;
 
         markerParams.flags = flags;
         updateView(markerView, markerParams);
     }
 
-    private TextView text(String value, int color, int size, boolean bold) {
+    private TextView text(
+            String value,
+            int color,
+            int size,
+            boolean bold) {
+
         TextView v = new TextView(this);
+
         v.setText(value);
         v.setTextColor(color);
         v.setTextSize(size);
@@ -862,11 +1094,13 @@ public class FloatingService extends Service {
             v.setTypeface(null, Typeface.BOLD);
 
         v.setPadding(0, dp(3), 0, dp(3));
+
         return v;
     }
 
     private TextView panelButton(String value, int color) {
         TextView v = text(value, Color.WHITE, 11, true);
+
         v.setBackground(background(color, dp(7)));
         v.setClickable(true);
 
@@ -881,9 +1115,11 @@ public class FloatingService extends Service {
 
     private GradientDrawable background(int color, int radius) {
         GradientDrawable d = new GradientDrawable();
+
         d.setColor(color);
         d.setCornerRadius(radius);
         d.setStroke(dp(1), Color.argb(100, 255, 255, 255));
+
         return d;
     }
 
@@ -893,7 +1129,8 @@ public class FloatingService extends Service {
             return;
         }
 
-        if (INTERNET.equals(clockSource) && !internetAnchorAvailable) {
+        if (INTERNET.equals(clockSource) &&
+                !internetAnchorAvailable) {
             updateStatus("مرجع ساعت اینترنتی هنوز دریافت نشده است");
             return;
         }
@@ -908,6 +1145,7 @@ public class FloatingService extends Service {
 
             Calendar c = Calendar.getInstance(
                     TimeZone.getTimeZone("Asia/Tehran"));
+
             c.setTimeInMillis(epoch);
 
             startHour = c.get(Calendar.HOUR_OF_DAY);
@@ -917,14 +1155,18 @@ public class FloatingService extends Service {
         }
 
         Dialog dialog = new Dialog(
-                this, android.R.style.Theme_Material_Light_Dialog_Alert);
+                this,
+                android.R.style.Theme_Material_Light_Dialog_Alert);
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(dp(12), dp(12), dp(12), dp(10));
+
         root.setBackground(background(Color.WHITE, dp(12)));
 
-        TextView title = text("تنظیم زمان شروع", ORANGE, 16, true);
+        TextView title = text(
+                "تنظیم زمان شروع", ORANGE, 16, true);
+
         root.addView(title);
 
         LinearLayout row = new LinearLayout(this);
@@ -935,7 +1177,8 @@ public class FloatingService extends Service {
         NumberPicker second = picker(0, 59, startSecond);
         NumberPicker millis = picker(0, 999, startMillis);
 
-        millis.setFormatter(v -> String.format(Locale.US, "%03d", v));
+        millis.setFormatter(
+                v -> String.format(Locale.US, "%03d", v));
 
         addPicker(row, "ساعت", hour);
         addPicker(row, "دقیقه", minute);
@@ -947,11 +1190,15 @@ public class FloatingService extends Service {
         LinearLayout buttons = new LinearLayout(this);
         buttons.setGravity(Gravity.CENTER);
 
-        TextView cancel = panelButton("انصراف", Color.rgb(90, 90, 100));
-        TextView confirm = panelButton("تأیید", Color.rgb(20, 125, 75));
+        TextView cancel = panelButton(
+                "انصراف", Color.rgb(90, 90, 100));
+
+        TextView confirm = panelButton(
+                "تأیید", Color.rgb(20, 125, 75));
 
         buttons.addView(cancel);
         buttons.addView(confirm);
+
         root.addView(buttons);
 
         dialog.setContentView(root);
@@ -961,10 +1208,15 @@ public class FloatingService extends Service {
 
         if (window != null) {
             window.setType(overlayType());
-            window.setBackgroundDrawableResource(android.R.color.transparent);
-            window.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+
+            window.setBackgroundDrawableResource(
+                    android.R.color.transparent);
+
+            window.addFlags(
+                    WindowManager.LayoutParams.FLAG_DIM_BEHIND);
 
             WindowManager.LayoutParams p = window.getAttributes();
+
             p.width = dp(340);
             p.height = WindowManager.LayoutParams.WRAP_CONTENT;
             p.gravity = Gravity.CENTER;
@@ -985,6 +1237,7 @@ public class FloatingService extends Service {
 
             updateClockDisplay();
             updateStatus("زمان شروع انتخاب شد");
+
             dialog.dismiss();
         });
 
@@ -992,7 +1245,8 @@ public class FloatingService extends Service {
             dialog.show();
 
             if (window != null) {
-                window.setLayout(dp(340),
+                window.setLayout(
+                        dp(340),
                         WindowManager.LayoutParams.WRAP_CONTENT);
             }
 
@@ -1001,16 +1255,25 @@ public class FloatingService extends Service {
         }
     }
 
-    private NumberPicker picker(int min, int max, int value) {
+    private NumberPicker picker(
+            int min,
+            int max,
+            int value) {
+
         NumberPicker p = new NumberPicker(this);
 
         p.setMinValue(min);
         p.setMaxValue(max);
         p.setValue(Math.max(min, Math.min(max, value)));
         p.setWrapSelectorWheel(true);
-        p.setDescendantFocusability(NumberPicker.FOCUS_AFTER_DESCENDANTS);
+
+        p.setDescendantFocusability(
+                NumberPicker.FOCUS_AFTER_DESCENDANTS);
+
         p.setBackgroundColor(Color.WHITE);
-        p.setLayoutParams(new LinearLayout.LayoutParams(-1, dp(105)));
+
+        p.setLayoutParams(
+                new LinearLayout.LayoutParams(-1, dp(105)));
 
         try {
             Field f = NumberPicker.class.getDeclaredField("mInputText");
@@ -1029,14 +1292,19 @@ public class FloatingService extends Service {
         return p;
     }
 
-    private void addPicker(LinearLayout parent, String label,
-                           NumberPicker picker) {
+    private void addPicker(
+            LinearLayout parent,
+            String label,
+            NumberPicker picker) {
+
         LinearLayout column = new LinearLayout(this);
+
         column.setOrientation(LinearLayout.VERTICAL);
         column.setGravity(Gravity.CENTER);
 
         column.addView(text(label, Color.BLACK, 10, false));
         column.addView(picker);
+
         column.setLayoutParams(
                 new LinearLayout.LayoutParams(0, -2, 1));
 
@@ -1044,12 +1312,18 @@ public class FloatingService extends Service {
     }
 
     private String formatStartTime() {
-        return String.format(Locale.US, "%02d:%02d:%02d.%03d",
-                startHour, startMinute, startSecond, startMillis);
+        return String.format(
+                Locale.US,
+                "%02d:%02d:%02d.%03d",
+                startHour,
+                startMinute,
+                startSecond,
+                startMillis);
     }
 
     private void updateClockDisplay() {
-        if (selectedTimeView == null) return;
+        if (selectedTimeView == null)
+            return;
 
         long epoch = currentClockMs();
 
@@ -1059,7 +1333,8 @@ public class FloatingService extends Service {
 
         String source = INTERNET.equals(clockSource)
                 ? (internetAnchorAvailable
-                    ? "ساعت اینترنتی ایران" : "ساعت اینترنتی بدون مرجع")
+                    ? "ساعت اینترنتی ایران"
+                    : "ساعت اینترنتی بدون مرجع")
                 : "ساعت گوشی";
 
         String value = source + ": " + time;
@@ -1071,12 +1346,17 @@ public class FloatingService extends Service {
     }
 
     private void updateCountdown() {
-        if (countdownView == null) return;
+        if (countdownView == null)
+            return;
 
         if (runFinished) {
-            countdownView.setText(String.format(Locale.US,
+            countdownView.setText(String.format(
+                    Locale.US,
                     "پایان | موفق: %d | منقضی: %d | خطا: %d",
-                    completedClicks, expiredClicks, failedClicks));
+                    completedClicks,
+                    expiredClicks,
+                    failedClicks));
+
             return;
         }
 
@@ -1085,12 +1365,14 @@ public class FloatingService extends Service {
             return;
         }
 
-        long remaining = runStartNs - SystemClock.elapsedRealtimeNanos();
+        long remaining =
+                runStartNs - SystemClock.elapsedRealtimeNanos();
 
         if (remaining > 0) {
             long ms = remaining / NS_MS;
 
-            countdownView.setText(String.format(Locale.US,
+            countdownView.setText(String.format(
+                    Locale.US,
                     "شروع تا: %02d:%02d:%02d.%03d",
                     ms / 3_600_000,
                     ms % 3_600_000 / 60_000,
@@ -1098,10 +1380,14 @@ public class FloatingService extends Service {
                     ms % 1000));
 
         } else {
-            long results = completedClicks + expiredClicks + failedClicks;
+            long results =
+                    completedClicks + expiredClicks + failedClicks;
 
-            countdownView.setText(String.format(Locale.US,
-                    "در حال اجرا | نتیجه: %d/%d", results, totalClicks));
+            countdownView.setText(String.format(
+                    Locale.US,
+                    "در حال اجرا | نتیجه: %d/%d",
+                    results,
+                    totalClicks));
         }
     }
 
@@ -1112,20 +1398,24 @@ public class FloatingService extends Service {
 
     private void openMain() {
         Intent intent = new Intent(this, MainActivity.class);
+
         intent.setAction(ACTION_START_FROM_FLOATING);
         intent.putExtra("clock_source", clockSource);
 
         if (floatingTimeConfigured) {
-            intent.putExtra("floating_start_time_configured", true);
+            intent.putExtra(
+                    "floating_start_time_configured", true);
+
             intent.putExtra("floating_start_hour", startHour);
             intent.putExtra("floating_start_minute", startMinute);
             intent.putExtra("floating_start_second", startSecond);
             intent.putExtra("floating_start_millis", startMillis);
         }
 
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK |
-                Intent.FLAG_ACTIVITY_CLEAR_TOP |
-                Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        intent.addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK |
+                        Intent.FLAG_ACTIVITY_CLEAR_TOP |
+                        Intent.FLAG_ACTIVITY_SINGLE_TOP);
 
         try {
             startActivity(intent);
@@ -1136,10 +1426,14 @@ public class FloatingService extends Service {
 
     public static void setOverlaysHidden(boolean hidden) {
         FloatingService s = instance;
-        if (s == null) return;
+
+        if (s == null)
+            return;
 
         s.handler.post(() -> {
-            int visibility = hidden ? View.INVISIBLE : View.VISIBLE;
+            int visibility = hidden
+                    ? View.INVISIBLE
+                    : View.VISIBLE;
 
             if (s.panel != null)
                 s.panel.setVisibility(visibility);
@@ -1161,16 +1455,21 @@ public class FloatingService extends Service {
         }
     }
 
-    private void updateView(View view, WindowManager.LayoutParams params) {
+    private void updateView(
+            View view,
+            WindowManager.LayoutParams params) {
+
         try {
             if (view != null && view.getParent() != null)
                 wm.updateViewLayout(view, params);
+
         } catch (Exception ignored) {
         }
     }
 
     private int dp(float value) {
-        return (int) (value *
+        return (int) (
+                value *
                 getResources().getDisplayMetrics().density + 0.5f);
     }
 
@@ -1201,8 +1500,10 @@ public class FloatingService extends Service {
 
         panel = null;
         markerView = null;
+
         panelParams = null;
         markerParams = null;
+
         selectedTimeView = null;
         statusView = null;
         countdownView = null;
