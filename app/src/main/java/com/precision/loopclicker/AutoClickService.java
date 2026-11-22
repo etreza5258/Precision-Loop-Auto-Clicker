@@ -13,7 +13,6 @@ import android.view.accessibility.AccessibilityEvent;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashSet;
-import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.locks.LockSupport;
 
@@ -25,15 +24,10 @@ public class AutoClickService extends AccessibilityService {
     private static final String TARGET_Y_KEY = "target_y";
     private static final int DEFAULT_TARGET_X = 350;
     private static final int DEFAULT_TARGET_Y = 700;
-
-    private static final int INITIAL_PENDING_CAPACITY = 64;
-    private static final int INITIAL_ACTIVE_CAPACITY = 32;
     private static final long MAX_GESTURE_DURATION_MS =
             GestureDescription.getMaxGestureDuration();
 
     private static volatile AutoClickService instance;
-
-    private volatile String lastRequestError = "";
 
     public interface GestureCompletion {
         void onFinished(boolean success, boolean expired);
@@ -41,47 +35,36 @@ public class AutoClickService extends AccessibilityService {
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final Object queueLock = new Object();
-
-    private final ArrayDeque<ClickRequest> pending =
-            new ArrayDeque<>(INITIAL_PENDING_CAPACITY);
-
-    private final HashSet<ClickRequest> activeRequests =
-            new HashSet<>(INITIAL_ACTIVE_CAPACITY);
+    private final ArrayDeque<ClickRequest> pending = new ArrayDeque<>();
+    private final HashSet<ClickRequest> dispatching = new HashSet<>();
+    private final HashSet<ClickRequest> activeRequests = new HashSet<>();
 
     private volatile boolean serviceReady;
     private volatile boolean schedulerStopping;
     private volatile Thread schedulerThread;
-
     private volatile int targetX = DEFAULT_TARGET_X;
     private volatile int targetY = DEFAULT_TARGET_Y;
 
     private SharedPreferences targetPreferences;
+    private volatile String lastRequestError = "";
 
     private static final class ClickRequest
-            extends AccessibilityService.GestureResultCallback {
+            extends GestureResultCallback {
 
-        final AutoClickService owner;
         final long targetNanos;
         final long deadlineNanos;
         final long touchDurationMs;
+        final long touchDurationNanos;
         final int x;
         final int y;
-
         GestureCompletion completion;
 
-        ClickRequest(
-                AutoClickService owner,
-                long targetNanos,
-                long deadlineNanos,
-                long touchDurationMs,
-                int x,
-                int y,
-                GestureCompletion completion) {
-
-            this.owner = owner;
-            this.targetNanos = targetNanos;
-            this.deadlineNanos = deadlineNanos;
-            this.touchDurationMs = touchDurationMs;
+        ClickRequest(long target, long deadline, long durationMs,
+                     int x, int y, GestureCompletion completion) {
+            targetNanos = target;
+            deadlineNanos = deadline;
+            touchDurationMs = durationMs;
+            touchDurationNanos = durationMs * NANOS_PER_MS;
             this.x = x;
             this.y = y;
             this.completion = completion;
@@ -89,12 +72,14 @@ public class AutoClickService extends AccessibilityService {
 
         @Override
         public void onCompleted(GestureDescription gesture) {
-            owner.completeRequest(this, true);
+            AutoClickService owner = instance;
+            if (owner != null) owner.completeRequest(this, true);
         }
 
         @Override
         public void onCancelled(GestureDescription gesture) {
-            owner.completeRequest(this, false);
+            AutoClickService owner = instance;
+            if (owner != null) owner.completeRequest(this, false);
         }
     }
 
@@ -103,38 +88,26 @@ public class AutoClickService extends AccessibilityService {
         super.onServiceConnected();
 
         targetPreferences = getSharedPreferences(
-                TARGET_PREFS_NAME,
-                MODE_PRIVATE
-        );
+                TARGET_PREFS_NAME, MODE_PRIVATE);
 
         targetX = targetPreferences.getInt(
-                TARGET_X_KEY,
-                DEFAULT_TARGET_X
-        );
-
+                TARGET_X_KEY, DEFAULT_TARGET_X);
         targetY = targetPreferences.getInt(
-                TARGET_Y_KEY,
-                DEFAULT_TARGET_Y
-        );
+                TARGET_Y_KEY, DEFAULT_TARGET_Y);
 
         schedulerStopping = false;
         serviceReady = true;
         instance = this;
-
         startNanoScheduler();
     }
 
     private void startNanoScheduler() {
         Thread existing = schedulerThread;
-
-        if (existing != null && existing.isAlive()) {
-            return;
-        }
+        if (existing != null && existing.isAlive()) return;
 
         Thread worker = new Thread(
                 this::schedulerLoop,
-                "PrecisionClickNanoScheduler"
-        );
+                "PrecisionClickNanoScheduler");
 
         schedulerThread = worker;
         worker.start();
@@ -153,28 +126,29 @@ public class AutoClickService extends AccessibilityService {
                 continue;
             }
 
-            long remainingNanos =
-                    request.targetNanos - SystemClock.elapsedRealtimeNanos();
+            long remaining = request.targetNanos
+                    - SystemClock.elapsedRealtimeNanos();
 
-            if (remainingNanos > 0L) {
-                LockSupport.parkNanos(this, remainingNanos);
+            if (remaining > 0) {
+                LockSupport.parkNanos(this, remaining);
                 continue;
             }
 
             synchronized (queueLock) {
-                if (pending.peekFirst() != request) {
-                    continue;
-                }
-
+                if (pending.peekFirst() != request) continue;
                 pending.pollFirst();
+                dispatching.add(request);
             }
 
             if (schedulerStopping || !serviceReady) {
+                synchronized (queueLock) {
+                    dispatching.remove(request);
+                }
                 postCompletion(request, false, true);
                 continue;
             }
 
-            dispatchReadyRequest(request);
+            mainHandler.post(() -> dispatchReadyRequest(request));
         }
     }
 
@@ -184,7 +158,7 @@ public class AutoClickService extends AccessibilityService {
 
     @Override
     public void onInterrupt() {
-        cancelPendingInternal();
+        runOnMain(this::cancelPendingInternal);
     }
 
     @Override
@@ -200,32 +174,23 @@ public class AutoClickService extends AccessibilityService {
             worker.interrupt();
         }
 
-        List<ClickRequest> pendingToFinish = new ArrayList<>();
-        List<ClickRequest> activeToFinish = new ArrayList<>();
+        List<ClickRequest> toFinish = new ArrayList<>();
 
         synchronized (queueLock) {
-            while (!pending.isEmpty()) {
-                pendingToFinish.add(pending.pollFirst());
-            }
+            while (!pending.isEmpty())
+                toFinish.add(pending.pollFirst());
 
-            Iterator<ClickRequest> iterator = activeRequests.iterator();
-            while (iterator.hasNext()) {
-                activeToFinish.add(iterator.next());
-                iterator.remove();
-            }
+            toFinish.addAll(dispatching);
+            dispatching.clear();
+
+            toFinish.addAll(activeRequests);
+            activeRequests.clear();
         }
 
-        for (ClickRequest request : pendingToFinish) {
+        for (ClickRequest request : toFinish)
             notifyCompletion(request, false, true);
-        }
 
-        for (ClickRequest request : activeToFinish) {
-            notifyCompletion(request, false, false);
-        }
-
-        if (instance == this) {
-            instance = null;
-        }
+        if (instance == this) instance = null;
 
         targetPreferences = null;
         super.onDestroy();
@@ -258,13 +223,12 @@ public class AutoClickService extends AccessibilityService {
     }
 
     public void setTarget(int x, int y) {
-        final int newX = Math.max(0, x);
-        final int newY = Math.max(0, y);
+        int newX = Math.max(0, x);
+        int newY = Math.max(0, y);
 
         runOnMain(() -> {
-            if (!serviceReady || (targetX == newX && targetY == newY)) {
-                return;
-            }
+            if (!serviceReady ||
+                    (targetX == newX && targetY == newY)) return;
 
             targetX = newX;
             targetY = newY;
@@ -279,20 +243,19 @@ public class AutoClickService extends AccessibilityService {
         });
     }
 
-    private boolean validateTouchDuration(long touchDurationNanos) {
-        if (touchDurationNanos <= 0L) {
+    private boolean validateTouchDuration(long durationNanos) {
+        if (durationNanos <= 0) {
             lastRequestError = "مدت لمس باید بیشتر از صفر باشد";
             return false;
         }
 
-        if (touchDurationNanos % NANOS_PER_MS != 0L) {
+        if (durationNanos % NANOS_PER_MS != 0) {
             lastRequestError =
-                    "مدت لمس باید مضرب دقیق ۱٬۰۰۰٬۰۰۰ نانوثانیه باشد؛ "
-                    + "مقدار ورودی تغییر داده نشد";
+                    "مدت لمس باید مضرب دقیق ۱٬۰۰۰٬۰۰۰ نانوثانیه باشد";
             return false;
         }
 
-        long durationMs = touchDurationNanos / NANOS_PER_MS;
+        long durationMs = durationNanos / NANOS_PER_MS;
 
         if (durationMs > MAX_GESTURE_DURATION_MS) {
             lastRequestError =
@@ -320,35 +283,28 @@ public class AutoClickService extends AccessibilityService {
             return false;
         }
 
-        if (!validateTouchDuration(touchDurationNanos)) {
-            return false;
-        }
-
-        long touchDurationMs = touchDurationNanos / NANOS_PER_MS;
+        if (!validateTouchDuration(touchDurationNanos)) return false;
 
         if (cycleDeadlineElapsedRealtimeNanos
-                    <= cycleStartElapsedRealtimeNanos
+                <= cycleStartElapsedRealtimeNanos
                 || targetElapsedRealtimeNanos
-                    < cycleStartElapsedRealtimeNanos
+                < cycleStartElapsedRealtimeNanos
                 || targetElapsedRealtimeNanos
-                    >= cycleDeadlineElapsedRealtimeNanos
+                >= cycleDeadlineElapsedRealtimeNanos
                 || touchDurationNanos
-                    > cycleDeadlineElapsedRealtimeNanos
-                    - targetElapsedRealtimeNanos) {
+                > cycleDeadlineElapsedRealtimeNanos
+                - targetElapsedRealtimeNanos) {
 
-            lastRequestError = "زمان کلیک یا مدت لمس خارج از محدوده چرخه است";
+            lastRequestError =
+                    "زمان کلیک یا مدت لمس خارج از محدوده چرخه است";
             return false;
         }
 
         ClickRequest request = new ClickRequest(
-                this,
                 targetElapsedRealtimeNanos,
                 cycleDeadlineElapsedRealtimeNanos,
-                touchDurationMs,
-                targetX,
-                targetY,
-                completion
-        );
+                touchDurationNanos / NANOS_PER_MS,
+                targetX, targetY, completion);
 
         boolean wasEmpty;
 
@@ -363,21 +319,14 @@ public class AutoClickService extends AccessibilityService {
         }
 
         lastRequestError = "";
-
-        if (wasEmpty) {
-            Thread worker = schedulerThread;
-            if (worker != null) {
-                LockSupport.unpark(worker);
-            }
-        }
-
+        if (wasEmpty) wakeScheduler();
         return true;
     }
 
     public boolean performClickBatchAtTargets(
-            long[] targetElapsedRealtimeNanos,
-            long cycleStartElapsedRealtimeNanos,
-            long cycleDeadlineElapsedRealtimeNanos,
+            long[] targets,
+            long cycleStart,
+            long deadline,
             long touchDurationNanos,
             GestureCompletion[] completions) {
 
@@ -386,45 +335,38 @@ public class AutoClickService extends AccessibilityService {
             return false;
         }
 
-        if (targetElapsedRealtimeNanos == null
-                || completions == null
-                || targetElapsedRealtimeNanos.length == 0
-                || targetElapsedRealtimeNanos.length != completions.length) {
-
+        if (targets == null || completions == null
+                || targets.length == 0
+                || targets.length != completions.length) {
             lastRequestError = "اطلاعات دسته کلیک نامعتبر است";
             return false;
         }
 
-        if (!validateTouchDuration(touchDurationNanos)) {
-            return false;
-        }
+        if (!validateTouchDuration(touchDurationNanos)) return false;
 
-        if (cycleDeadlineElapsedRealtimeNanos
-                <= cycleStartElapsedRealtimeNanos) {
+        if (deadline <= cycleStart) {
             lastRequestError = "مهلت چرخه نامعتبر است";
             return false;
         }
 
-        long touchDurationMs = touchDurationNanos / NANOS_PER_MS;
+        long durationMs = touchDurationNanos / NANOS_PER_MS;
         long previousTarget = Long.MIN_VALUE;
-
-        List<ClickRequest> requests =
-                new ArrayList<>(targetElapsedRealtimeNanos.length);
-
         int x = targetX;
         int y = targetY;
 
-        for (int i = 0; i < targetElapsedRealtimeNanos.length; i++) {
-            long target = targetElapsedRealtimeNanos[i];
+        List<ClickRequest> requests =
+                new ArrayList<>(targets.length);
+
+        for (int i = 0; i < targets.length; i++) {
+            long target = targets[i];
 
             if (completions[i] == null) {
                 lastRequestError =
-                        "تابع تکمیل یکی از کلیک‌های دسته مشخص نشده است";
+                        "تابع تکمیل یکی از کلیک‌ها مشخص نشده است";
                 return false;
             }
 
-            if (target < cycleStartElapsedRealtimeNanos
-                    || target >= cycleDeadlineElapsedRealtimeNanos) {
+            if (target < cycleStart || target >= deadline) {
                 lastRequestError =
                         "زمان یکی از کلیک‌ها خارج از محدوده چرخه است";
                 return false;
@@ -436,8 +378,7 @@ public class AutoClickService extends AccessibilityService {
                 return false;
             }
 
-            if (touchDurationNanos
-                    > cycleDeadlineElapsedRealtimeNanos - target) {
+            if (touchDurationNanos > deadline - target) {
                 lastRequestError =
                         "مدت لمس یکی از کلیک‌ها از مهلت چرخه عبور می‌کند";
                 return false;
@@ -446,14 +387,8 @@ public class AutoClickService extends AccessibilityService {
             previousTarget = target;
 
             requests.add(new ClickRequest(
-                    this,
-                    target,
-                    cycleDeadlineElapsedRealtimeNanos,
-                    touchDurationMs,
-                    x,
-                    y,
-                    completions[i]
-            ));
+                    target, deadline, durationMs,
+                    x, y, completions[i]));
         }
 
         boolean wasEmpty;
@@ -465,36 +400,45 @@ public class AutoClickService extends AccessibilityService {
             }
 
             wasEmpty = pending.isEmpty();
-
-            for (ClickRequest request : requests) {
-                pending.offerLast(request);
-            }
+            pending.addAll(requests);
         }
 
         lastRequestError = "";
-
-        if (wasEmpty) {
-            Thread worker = schedulerThread;
-            if (worker != null) {
-                LockSupport.unpark(worker);
-            }
-        }
-
+        if (wasEmpty) wakeScheduler();
         return true;
     }
 
+    private void wakeScheduler() {
+        Thread worker = schedulerThread;
+        if (worker != null) LockSupport.unpark(worker);
+    }
+
     private void dispatchReadyRequest(ClickRequest request) {
-        if (SystemClock.elapsedRealtimeNanos() >= request.deadlineNanos) {
-            postCompletion(request, false, true);
+        synchronized (queueLock) {
+            if (!dispatching.remove(request)) return;
+        }
+
+        if (!serviceReady || schedulerStopping) {
+            notifyCompletion(request, false, true);
             return;
         }
 
-        if (!dispatchRequest(request)) {
-            postCompletion(request, false, false);
+        long now = SystemClock.elapsedRealtimeNanos();
+        long remaining = request.deadlineNanos - now;
+
+        if (remaining < request.touchDurationNanos) {
+            notifyCompletion(request, false, true);
+            return;
         }
+
+        if (!dispatchRequest(request))
+            notifyCompletion(request, false, false);
     }
 
     private boolean dispatchRequest(ClickRequest request) {
+        if (Looper.myLooper() != Looper.getMainLooper())
+            return false;
+
         try {
             Path path = new Path();
             path.moveTo(request.x, request.y);
@@ -503,38 +447,32 @@ public class AutoClickService extends AccessibilityService {
             GestureDescription gesture =
                     new GestureDescription.Builder()
                             .addStroke(new GestureDescription.StrokeDescription(
-                                    path,
-                                    0L,
-                                    request.touchDurationMs
-                            ))
+                                    path, 0L, request.touchDurationMs))
                             .build();
 
             synchronized (queueLock) {
-                if (!serviceReady || schedulerStopping) {
-                    return false;
-                }
-
+                if (!serviceReady || schedulerStopping) return false;
                 activeRequests.add(request);
-
-                boolean accepted;
-                try {
-                    accepted = dispatchGesture(
-                            gesture,
-                            request,
-                            mainHandler
-                    );
-                } catch (Exception ignored) {
-                    activeRequests.remove(request);
-                    return false;
-                }
-
-                if (!accepted) {
-                    activeRequests.remove(request);
-                }
-
-                return accepted;
             }
-        } catch (Exception ignored) {
+
+            boolean accepted;
+
+            try {
+                accepted = dispatchGesture(
+                        gesture, request, mainHandler);
+            } catch (Exception e) {
+                accepted = false;
+            }
+
+            if (!accepted) {
+                synchronized (queueLock) {
+                    activeRequests.remove(request);
+                }
+            }
+
+            return accepted;
+
+        } catch (Exception e) {
             synchronized (queueLock) {
                 activeRequests.remove(request);
             }
@@ -542,16 +480,17 @@ public class AutoClickService extends AccessibilityService {
         }
     }
 
-    private void completeRequest(ClickRequest request, boolean success) {
+    private void completeRequest(
+            ClickRequest request, boolean success) {
+
         boolean wasActive;
 
         synchronized (queueLock) {
             wasActive = activeRequests.remove(request);
         }
 
-        if (wasActive) {
+        if (wasActive)
             notifyCompletion(request, success, false);
-        }
     }
 
     private void postCompletion(
@@ -563,8 +502,7 @@ public class AutoClickService extends AccessibilityService {
             notifyCompletion(request, success, expired);
         } else {
             mainHandler.post(
-                    () -> notifyCompletion(request, success, expired)
-            );
+                    () -> notifyCompletion(request, success, expired));
         }
     }
 
@@ -573,9 +511,7 @@ public class AutoClickService extends AccessibilityService {
             boolean success,
             boolean expired) {
 
-        if (request == null) {
-            return;
-        }
+        if (request == null) return;
 
         GestureCompletion callback = request.completion;
         request.completion = null;
@@ -596,26 +532,23 @@ public class AutoClickService extends AccessibilityService {
         List<ClickRequest> cancelled = new ArrayList<>();
 
         synchronized (queueLock) {
-            while (!pending.isEmpty()) {
+            while (!pending.isEmpty())
                 cancelled.add(pending.pollFirst());
-            }
+
+            cancelled.addAll(dispatching);
+            dispatching.clear();
         }
 
-        Thread worker = schedulerThread;
-        if (worker != null) {
-            LockSupport.unpark(worker);
-        }
+        wakeScheduler();
 
-        for (ClickRequest request : cancelled) {
+        for (ClickRequest request : cancelled)
             notifyCompletion(request, false, true);
-        }
     }
 
     private void runOnMain(Runnable action) {
-        if (Looper.myLooper() == Looper.getMainLooper()) {
+        if (Looper.myLooper() == Looper.getMainLooper())
             action.run();
-        } else {
+        else
             mainHandler.post(action);
-        }
     }
 }
