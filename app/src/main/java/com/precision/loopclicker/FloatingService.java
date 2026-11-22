@@ -1,3 +1,4 @@
+
 package com.precision.loopclicker;
 
 import android.accessibilityservice.GestureDescription;
@@ -48,6 +49,8 @@ public class FloatingService extends Service {
     private static final String PREF_SPECIAL_CLICKS = "special_clicks_per_cycle";
     private static final String PREF_SPECIAL_INTERVAL = "special_click_interval_ns";
     private static final String PREF_SPECIAL_TOUCH = "special_touch_duration_ns";
+    private static final String PREF_PANEL_COLLAPSED = "floating_panel_collapsed";
+
     private static final long NS_MS = 1_000_000L;
     private static final long COUNTDOWN_MS = 200L;
     private static final int NOTIFICATION_ID = 4101;
@@ -58,23 +61,27 @@ public class FloatingService extends Service {
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final int[] markerLocation = new int[2];
+
     private final SimpleDateFormat clockFormat =
             new SimpleDateFormat("HH:mm:ss.SSS", Locale.US);
 
     private WindowManager wm;
     private LinearLayout panel;
     private LinearLayout panelContent;
-    private LinearLayout cyclePreview;
+    private LinearLayout panelBody;
     private ScrollView panelScroll;
     private TextView selectedTimeView;
     private TextView statusView;
     private TextView countdownView;
     private TextView markerView;
     private TextView cyclePreviewText;
+    private TextView collapseButton;
+
     private EditText specialCyclesInput;
     private EditText specialClicksInput;
     private EditText specialIntervalInput;
     private EditText specialTouchInput;
+
     private WindowManager.LayoutParams panelParams;
     private WindowManager.LayoutParams markerParams;
 
@@ -87,11 +94,14 @@ public class FloatingService extends Service {
     private int startMillis;
 
     private String clockSource = PHONE;
+
     private volatile long internetEpochNs;
     private volatile long internetElapsedNs;
+
     private boolean internetAnchorAvailable;
     private boolean receiverRegistered;
     private boolean floatingTimeConfigured;
+    private boolean panelCollapsed;
 
     private long runStartNs;
     private long runEndNs;
@@ -324,12 +334,12 @@ public class FloatingService extends Service {
 
         try {
             SharedPreferences prefs = getPrefs();
-            String cycleText = prefs.getString(PREF_SPECIAL_CYCLES, "");
+            String cycleText = getPrefString(PREF_SPECIAL_CYCLES, "");
             selectedCycles = parseCycleNumbers(cycleText, requestedCycles);
 
-            specialClicks = prefs.getLong(PREF_SPECIAL_CLICKS, 0);
-            specialInterval = prefs.getLong(PREF_SPECIAL_INTERVAL, 0);
-            specialTouch = prefs.getLong(PREF_SPECIAL_TOUCH, 0);
+            specialClicks = getPrefLong(PREF_SPECIAL_CLICKS, 0);
+            specialInterval = getPrefLong(PREF_SPECIAL_INTERVAL, 0);
+            specialTouch = getPrefLong(PREF_SPECIAL_TOUCH, 0);
 
             if (!selectedCycles.isEmpty()) {
                 if (specialClicks < 1 ||
@@ -706,20 +716,46 @@ public class FloatingService extends Service {
         return getSharedPreferences(PREF, MODE_PRIVATE);
     }
 
+    private long getPrefLong(String key, long fallback) {
+        Object value = getPrefs().getAll().get(key);
+
+        if (value instanceof Number)
+            return ((Number) value).longValue();
+
+        if (value instanceof String) {
+            try {
+                return Long.parseLong(
+                        normalizeDigits(((String) value).trim()));
+            } catch (NumberFormatException ignored) {
+            }
+        }
+
+        return fallback;
+    }
+
+    private String getPrefString(String key, String fallback) {
+        Object value = getPrefs().getAll().get(key);
+        if (value instanceof String)
+            return (String) value;
+        if (value instanceof Number)
+            return String.valueOf(value);
+        return fallback;
+    }
+
     private void loadClockSource() {
         SharedPreferences p = getPrefs();
         clockSource = INTERNET.equals(
                 p.getString("clock_source", PHONE)) ? INTERNET : PHONE;
 
-        long epoch = p.getLong("internet_epoch_at_sync_ns", 0);
-        long elapsed = p.getLong("internet_elapsed_at_sync_ns", 0);
+        long epoch = getPrefLong("internet_epoch_at_sync_ns", 0);
+        long elapsed = getPrefLong("internet_elapsed_at_sync_ns", 0);
 
         if (epoch <= 0 || elapsed <= 0) {
             try {
                 epoch = Math.multiplyExact(
-                        p.getLong("internet_epoch_at_sync_ms", 0), NS_MS);
+                        getPrefLong("internet_epoch_at_sync_ms", 0), NS_MS);
                 elapsed = Math.multiplyExact(
-                        p.getLong("internet_elapsed_at_sync_ms", 0), NS_MS);
+                        getPrefLong("internet_elapsed_at_sync_ms", 0), NS_MS);
             } catch (ArithmeticException e) {
                 epoch = elapsed = 0;
             }
@@ -855,8 +891,12 @@ public class FloatingService extends Service {
 
         if (wm == null)
             wm = (WindowManager) getSystemService(WINDOW_SERVICE);
-        if (panel == null) createPanel();
-        if (markerView == null) createMarker();
+
+        if (panel == null)
+            createPanel();
+
+        if (markerView == null)
+            createMarker();
 
         showFloatingViews();
         updateTarget();
@@ -866,6 +906,9 @@ public class FloatingService extends Service {
     }
 
     private void createPanel() {
+        panelCollapsed = getPrefs().getBoolean(
+                PREF_PANEL_COLLAPSED, false);
+
         panel = new LinearLayout(this);
         panel.setOrientation(LinearLayout.VERTICAL);
         panel.setPadding(dp(8), dp(7), dp(8), dp(7));
@@ -876,20 +919,45 @@ public class FloatingService extends Service {
         header.setPadding(dp(7), dp(6), dp(7), dp(6));
         header.setBackground(background(Color.rgb(13, 25, 36), dp(8)));
 
-        TextView heading = text("تنظیم زمان و چرخه‌ها  ⋮⋮", ORANGE, 13, true);
+        LinearLayout headerTop = new LinearLayout(this);
+        headerTop.setGravity(Gravity.CENTER_VERTICAL);
+
+        TextView heading = text(
+                "تنظیم زمان و چرخه‌ها  ⋮⋮",
+                ORANGE, 13, true);
+        heading.setGravity(Gravity.CENTER_VERTICAL | Gravity.RIGHT);
+
+        LinearLayout.LayoutParams headingParams =
+                new LinearLayout.LayoutParams(0, dp(34), 1);
+        headerTop.addView(heading, headingParams);
+
+        collapseButton = text(
+                panelCollapsed ? "+" : "−",
+                Color.WHITE, 21, true);
+        collapseButton.setBackground(background(
+                Color.rgb(55, 85, 110), dp(7)));
+        collapseButton.setClickable(true);
+        collapseButton.setFocusable(true);
+
+        LinearLayout.LayoutParams collapseParams =
+                new LinearLayout.LayoutParams(dp(38), dp(32));
+        collapseParams.setMargins(dp(4), 0, 0, 0);
+        headerTop.addView(collapseButton, collapseParams);
+
+        header.addView(headerTop);
+
         selectedTimeView = text("", Color.WHITE, 10, false);
         countdownView = text(
                 "آماده", Color.rgb(255, 210, 90), 11, true);
         statusView = text(
                 "آماده", Color.rgb(180, 190, 205), 10, false);
 
-        header.addView(heading);
         header.addView(selectedTimeView);
         header.addView(countdownView);
         header.addView(statusView);
         panel.addView(header);
 
-        header.setOnTouchListener((v, event) -> {
+        heading.setOnTouchListener((v, event) -> {
             if (panelParams == null) return false;
 
             switch (event.getAction()) {
@@ -914,6 +982,11 @@ public class FloatingService extends Service {
             }
             return false;
         });
+
+        collapseButton.setOnClickListener(v -> togglePanel());
+
+        panelBody = new LinearLayout(this);
+        panelBody.setOrientation(LinearLayout.VERTICAL);
 
         panelScroll = new ScrollView(this);
         panelScroll.setFillViewport(false);
@@ -947,7 +1020,8 @@ public class FloatingService extends Service {
         });
 
         cyclePreviewText = text(
-                "چرخه‌ای انتخاب نشده", Color.rgb(255, 210, 90), 11, true);
+                "چرخه‌ای انتخاب نشده",
+                Color.rgb(255, 210, 90), 11, true);
         cyclePreviewText.setGravity(Gravity.CENTER_VERTICAL);
         panelContent.addView(cyclePreviewText);
 
@@ -979,8 +1053,8 @@ public class FloatingService extends Service {
         panelContent.addView(help);
 
         panelScroll.addView(panelContent);
-        panel.addView(panelScroll, new LinearLayout.LayoutParams(
-                -1, dp(360)));
+        panelBody.addView(panelScroll, new LinearLayout.LayoutParams(
+                -1, dp(250)));
 
         LinearLayout row = new LinearLayout(this);
         row.setGravity(Gravity.CENTER);
@@ -1000,13 +1074,18 @@ public class FloatingService extends Service {
         row.addView(main);
         row.addView(time);
         row.addView(off);
-        panel.addView(row);
+        panelBody.addView(row);
+
+        panel.addView(panelBody);
 
         loadSpecialSettings();
         updateCyclePreview(specialCyclesInput.getText().toString());
+        applyPanelCollapsedState();
 
         panelParams = new WindowManager.LayoutParams(
-                -2, -2, overlayType(),
+                dp(310),
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                overlayType(),
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN |
                         WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
                 PixelFormat.TRANSLUCENT);
@@ -1021,8 +1100,30 @@ public class FloatingService extends Service {
             wm.addView(panel, panelParams);
         } catch (Exception e) {
             panel = null;
+            panelBody = null;
             panelParams = null;
         }
+    }
+
+    private void togglePanel() {
+        panelCollapsed = !panelCollapsed;
+        applyPanelCollapsedState();
+
+        getPrefs().edit()
+                .putBoolean(PREF_PANEL_COLLAPSED, panelCollapsed)
+                .apply();
+
+        if (panel != null && panelParams != null)
+            updateView(panel, panelParams);
+    }
+
+    private void applyPanelCollapsedState() {
+        if (panelBody != null)
+            panelBody.setVisibility(
+                    panelCollapsed ? View.GONE : View.VISIBLE);
+
+        if (collapseButton != null)
+            collapseButton.setText(panelCollapsed ? "+" : "−");
     }
 
     private void addPanelSection(String title) {
@@ -1033,8 +1134,7 @@ public class FloatingService extends Service {
     }
 
     private void addPanelLabel(String value) {
-        TextView label = text(
-                value, Color.WHITE, 11, true);
+        TextView label = text(value, Color.WHITE, 11, true);
         label.setGravity(Gravity.RIGHT | Gravity.CENTER_VERTICAL);
         label.setPadding(dp(2), dp(5), dp(2), dp(2));
         panelContent.addView(label);
@@ -1050,8 +1150,16 @@ public class FloatingService extends Service {
         input.setInputType(inputType);
         input.setPadding(dp(8), dp(4), dp(8), dp(4));
         input.setBackground(background(Color.rgb(32, 45, 58), dp(6)));
-        input.setText(getPrefs().getString(
-                key, defaultValue));
+
+        String value;
+        if (PREF_SPECIAL_CYCLES.equals(key))
+            value = getPrefString(key, defaultValue);
+        else
+            value = String.valueOf(
+                    getPrefLong(key, parseDefault(defaultValue)));
+
+        input.setText(value);
+
         LinearLayout.LayoutParams params =
                 new LinearLayout.LayoutParams(-1, dp(42));
         params.setMargins(0, dp(2), 0, dp(3));
@@ -1059,16 +1167,23 @@ public class FloatingService extends Service {
         return input;
     }
 
+    private long parseDefault(String value) {
+        try {
+            return Long.parseLong(value);
+        } catch (Exception ignored) {
+            return 0;
+        }
+    }
+
     private void loadSpecialSettings() {
-        SharedPreferences p = getPrefs();
         specialCyclesInput.setText(
-                p.getString(PREF_SPECIAL_CYCLES, ""));
+                getPrefString(PREF_SPECIAL_CYCLES, ""));
         specialClicksInput.setText(
-                p.getString(PREF_SPECIAL_CLICKS, "0"));
+                String.valueOf(getPrefLong(PREF_SPECIAL_CLICKS, 0)));
         specialIntervalInput.setText(
-                p.getString(PREF_SPECIAL_INTERVAL, "0"));
+                String.valueOf(getPrefLong(PREF_SPECIAL_INTERVAL, 0)));
         specialTouchInput.setText(
-                p.getString(PREF_SPECIAL_TOUCH, "1000000"));
+                String.valueOf(getPrefLong(PREF_SPECIAL_TOUCH, 1_000_000L)));
     }
 
     private void saveSpecialSettings() {
@@ -1603,14 +1718,15 @@ public class FloatingService extends Service {
 
         panel = null;
         panelContent = null;
+        panelBody = null;
         panelScroll = null;
-        cyclePreview = null;
         markerView = null;
         panelParams = null;
         markerParams = null;
         selectedTimeView = null;
         statusView = null;
         countdownView = null;
+        collapseButton = null;
         specialCyclesInput = null;
         specialClicksInput = null;
         specialIntervalInput = null;
