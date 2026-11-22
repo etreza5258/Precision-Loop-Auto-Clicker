@@ -11,13 +11,19 @@ import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.os.*;
 import android.provider.Settings;
+import android.text.InputType;
+import android.text.TextWatcher;
+import android.text.Editable;
 import android.view.*;
+import android.view.inputmethod.InputMethodManager;
 import android.widget.*;
 
 import java.lang.reflect.Field;
 import java.text.SimpleDateFormat;
 import java.util.Calendar;
+import java.util.HashSet;
 import java.util.Locale;
+import java.util.Set;
 import java.util.TimeZone;
 
 public class FloatingService extends Service {
@@ -38,6 +44,10 @@ public class FloatingService extends Service {
             "com.precision.loopclicker.ACTION_CLOCK_SOURCE_CHANGED";
     private static final String PHONE = "phone";
     private static final String INTERNET = "internet";
+    private static final String PREF_SPECIAL_CYCLES = "special_cycle_numbers";
+    private static final String PREF_SPECIAL_CLICKS = "special_clicks_per_cycle";
+    private static final String PREF_SPECIAL_INTERVAL = "special_click_interval_ns";
+    private static final String PREF_SPECIAL_TOUCH = "special_touch_duration_ns";
     private static final long NS_MS = 1_000_000L;
     private static final long COUNTDOWN_MS = 200L;
     private static final int NOTIFICATION_ID = 4101;
@@ -53,10 +63,18 @@ public class FloatingService extends Service {
 
     private WindowManager wm;
     private LinearLayout panel;
+    private LinearLayout panelContent;
+    private LinearLayout cyclePreview;
+    private ScrollView panelScroll;
     private TextView selectedTimeView;
     private TextView statusView;
     private TextView countdownView;
     private TextView markerView;
+    private TextView cyclePreviewText;
+    private EditText specialCyclesInput;
+    private EditText specialClicksInput;
+    private EditText specialIntervalInput;
+    private EditText specialTouchInput;
     private WindowManager.LayoutParams panelParams;
     private WindowManager.LayoutParams markerParams;
 
@@ -95,8 +113,9 @@ public class FloatingService extends Service {
     private int cycleIndex;
     private int clicksPerCycle;
     private int cycleCount;
-    private int specialLastCycleCount;
     private int specialClicksPerCycle;
+
+    private Set<Integer> specialCycleNumbers = new HashSet<>();
 
     private boolean clicking;
     private boolean runDisplayActive;
@@ -287,18 +306,8 @@ public class FloatingService extends Service {
         long touch = getNanos(
                 intent, "touch_duration_ns", "touch_duration_ms", NS_MS);
 
-        long specialCycles = intent.getLongExtra(
-                "special_last_cycle_count", 0);
-        long specialClicks = intent.getLongExtra(
-                "special_clicks_per_cycle", 0);
-        long specialInterval = intent.getLongExtra(
-                "special_click_interval_ns", 0);
-        long specialTouch = intent.getLongExtra(
-                "special_touch_duration_ns", 0);
-
         if (duration < 0 || pause < 0 ||
-                interval < 0 || touch <= 0 ||
-                specialCycles < 0) {
+                interval < 0 || touch <= 0) {
             updateStatus("تنظیمات زمانی نامعتبر است");
             return;
         }
@@ -308,26 +317,42 @@ public class FloatingService extends Service {
             return;
         }
 
-        if (specialCycles > 0) {
-            if (specialCycles > requestedCycles ||
-                    specialClicks < 1 ||
-                    specialClicks > Integer.MAX_VALUE ||
-                    specialInterval < 0 ||
-                    specialTouch <= 0) {
-                updateStatus("تنظیمات چرخه‌های پایانی نامعتبر است");
-                return;
-            }
+        Set<Integer> selectedCycles;
+        long specialClicks;
+        long specialInterval;
+        long specialTouch;
 
-            if (!validTouchDuration(specialTouch)) {
-                updateStatus(
-                        "مدت لمس چرخه پایانی خارج از محدوده مجاز اندروید است");
-                return;
+        try {
+            SharedPreferences prefs = getPrefs();
+            String cycleText = prefs.getString(PREF_SPECIAL_CYCLES, "");
+            selectedCycles = parseCycleNumbers(cycleText, requestedCycles);
+
+            specialClicks = prefs.getLong(PREF_SPECIAL_CLICKS, 0);
+            specialInterval = prefs.getLong(PREF_SPECIAL_INTERVAL, 0);
+            specialTouch = prefs.getLong(PREF_SPECIAL_TOUCH, 0);
+
+            if (!selectedCycles.isEmpty()) {
+                if (specialClicks < 1 ||
+                        specialClicks > Integer.MAX_VALUE ||
+                        specialInterval < 0 ||
+                        specialTouch <= 0) {
+                    updateStatus("تنظیمات چرخه‌های انتخاب‌شده معتبر نیست");
+                    return;
+                }
+
+                if (!validTouchDuration(specialTouch)) {
+                    updateStatus(
+                            "مدت لمس اختصاصی خارج از محدوده مجاز اندروید است");
+                    return;
+                }
+            } else {
+                specialClicks = 0;
+                specialInterval = 0;
+                specialTouch = 0;
             }
-        } else {
-            specialCycles = 0;
-            specialClicks = 0;
-            specialInterval = 0;
-            specialTouch = 0;
+        } catch (IllegalArgumentException e) {
+            updateStatus(e.getMessage());
+            return;
         }
 
         long normalLastOffset;
@@ -340,7 +365,7 @@ public class FloatingService extends Service {
             normalLastOffset = Math.multiplyExact(
                     requestedClicks - 1L, interval);
 
-            if (specialCycles > 0) {
+            if (!selectedCycles.isEmpty()) {
                 specialLastOffset = Math.multiplyExact(
                         specialClicks - 1, specialInterval);
             }
@@ -348,9 +373,9 @@ public class FloatingService extends Service {
             if (duration == 0) {
                 long normalRequired = Math.addExact(
                         normalLastOffset, touch);
-                long specialRequired = specialCycles > 0
-                        ? Math.addExact(specialLastOffset, specialTouch)
-                        : 0;
+                long specialRequired = selectedCycles.isEmpty()
+                        ? 0
+                        : Math.addExact(specialLastOffset, specialTouch);
                 duration = Math.max(
                         1, Math.max(normalRequired, specialRequired));
             }
@@ -361,10 +386,10 @@ public class FloatingService extends Service {
                 return;
             }
 
-            if (specialCycles > 0 &&
+            if (!selectedCycles.isEmpty() &&
                     Math.addExact(specialLastOffset, specialTouch) > duration) {
                 updateStatus(
-                        "آخرین لمس چرخه پایانی از مهلت چرخه عبور می‌کند");
+                        "آخرین لمس چرخه اختصاصی از مهلت چرخه عبور می‌کند");
                 return;
             }
 
@@ -379,10 +404,10 @@ public class FloatingService extends Service {
             end = Math.addExact(start, fullDuration);
 
             long normalTotal = Math.multiplyExact(
-                    (long) requestedCycles - specialCycles,
+                    (long) requestedCycles - selectedCycles.size(),
                     requestedClicks);
             long specialTotal = Math.multiplyExact(
-                    specialCycles, specialClicks);
+                    (long) selectedCycles.size(), specialClicks);
             total = Math.addExact(normalTotal, specialTotal);
 
         } catch (ArithmeticException e) {
@@ -392,7 +417,7 @@ public class FloatingService extends Service {
 
         clicksPerCycle = requestedClicks;
         cycleCount = requestedCycles;
-        specialLastCycleCount = (int) specialCycles;
+        specialCycleNumbers = selectedCycles;
         specialClicksPerCycle = (int) specialClicks;
 
         cycleDurationNs = duration;
@@ -426,6 +451,54 @@ public class FloatingService extends Service {
         scheduleNextClick(runId);
     }
 
+    private Set<Integer> parseCycleNumbers(
+            String input, int maxCycle) {
+        Set<Integer> result = new HashSet<>();
+        if (input == null || input.trim().isEmpty())
+            return result;
+
+        String normalized = input
+                .replace('،', ',')
+                .replace(';', ',')
+                .replace('؛', ',');
+
+        String[] values = normalized.split(",", -1);
+
+        for (String item : values) {
+            String value = item.trim();
+            if (value.isEmpty())
+                throw new IllegalArgumentException(
+                        "بین شماره چرخه‌ها مقدار خالی وجود دارد");
+
+            StringBuilder digits = new StringBuilder();
+            for (int i = 0; i < value.length(); i++) {
+                char c = value.charAt(i);
+                int digit = Character.digit(c, 10);
+                if (digit < 0)
+                    throw new IllegalArgumentException(
+                            "شماره چرخه نامعتبر است: " + value);
+                digits.append(digit);
+            }
+
+            final int number;
+            try {
+                number = Integer.parseInt(digits.toString());
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException(
+                        "شماره چرخه بیش از حد بزرگ است");
+            }
+
+            if (number < 1 || number > maxCycle)
+                throw new IllegalArgumentException(
+                        "شماره چرخه " + number +
+                        " خارج از محدوده ۱ تا " + maxCycle + " است");
+
+            result.add(number);
+        }
+
+        return result;
+    }
+
     private boolean validTouchDuration(long touchNs) {
         if (touchNs <= 0 || touchNs % NS_MS != 0)
             return false;
@@ -457,7 +530,7 @@ public class FloatingService extends Service {
         }
 
         boolean specialCycle =
-                cycleIndex >= cycleCount - specialLastCycleCount;
+                specialCycleNumbers.contains(cycleIndex + 1);
 
         int count = specialCycle
                 ? specialClicksPerCycle
@@ -798,45 +871,25 @@ public class FloatingService extends Service {
         panel.setPadding(dp(8), dp(7), dp(8), dp(7));
         panel.setBackground(background(BG, dp(11)));
 
-        LinearLayout box = new LinearLayout(this);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(dp(7), dp(6), dp(7), dp(6));
-        box.setBackground(background(Color.rgb(13, 25, 36), dp(8)));
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.VERTICAL);
+        header.setPadding(dp(7), dp(6), dp(7), dp(6));
+        header.setBackground(background(Color.rgb(13, 25, 36), dp(8)));
 
-        TextView heading = text("تنظیم زمان", ORANGE, 13, true);
+        TextView heading = text("تنظیم زمان و چرخه‌ها  ⋮⋮", ORANGE, 13, true);
         selectedTimeView = text("", Color.WHITE, 10, false);
         countdownView = text(
                 "آماده", Color.rgb(255, 210, 90), 11, true);
         statusView = text(
                 "آماده", Color.rgb(180, 190, 205), 10, false);
 
-        box.addView(heading);
-        box.addView(selectedTimeView);
-        box.addView(countdownView);
-        box.addView(statusView);
-        panel.addView(box);
+        header.addView(heading);
+        header.addView(selectedTimeView);
+        header.addView(countdownView);
+        header.addView(statusView);
+        panel.addView(header);
 
-        LinearLayout row = new LinearLayout(this);
-        row.setGravity(Gravity.CENTER);
-        row.setPadding(0, dp(5), 0, 0);
-
-        TextView main = panelButton(
-                "تنظیمات", Color.rgb(20, 125, 75));
-        TextView time = panelButton(
-                "⚙", Color.rgb(55, 85, 110));
-        TextView off = panelButton(
-                "خاموش", Color.rgb(75, 75, 85));
-
-        main.setOnClickListener(v -> openMain());
-        time.setOnClickListener(v -> showStartTimePicker());
-        off.setOnClickListener(v -> shutdown());
-
-        row.addView(main);
-        row.addView(time);
-        row.addView(off);
-        panel.addView(row);
-
-        panel.setOnTouchListener((v, event) -> {
+        header.setOnTouchListener((v, event) -> {
             if (panelParams == null) return false;
 
             switch (event.getAction()) {
@@ -862,22 +915,261 @@ public class FloatingService extends Service {
             return false;
         });
 
+        panelScroll = new ScrollView(this);
+        panelScroll.setFillViewport(false);
+        panelScroll.setVerticalScrollBarEnabled(true);
+
+        panelContent = new LinearLayout(this);
+        panelContent.setOrientation(LinearLayout.VERTICAL);
+        panelContent.setPadding(dp(5), dp(5), dp(5), dp(5));
+
+        addPanelSection("تنظیم چرخه‌های متفاوت");
+
+        addPanelLabel("شماره چرخه‌ها");
+        specialCyclesInput = panelInput(
+                PREF_SPECIAL_CYCLES, "", InputType.TYPE_CLASS_TEXT);
+        specialCyclesInput.setHint("مثلاً 2, 5, 8, 9");
+        specialCyclesInput.addTextChangedListener(new TextWatcher() {
+            @Override
+            public void beforeTextChanged(
+                    CharSequence s, int start, int count, int after) {
+            }
+
+            @Override
+            public void onTextChanged(
+                    CharSequence s, int start, int before, int count) {
+                updateCyclePreview(s.toString());
+            }
+
+            @Override
+            public void afterTextChanged(Editable s) {
+            }
+        });
+
+        cyclePreviewText = text(
+                "چرخه‌ای انتخاب نشده", Color.rgb(255, 210, 90), 11, true);
+        cyclePreviewText.setGravity(Gravity.CENTER_VERTICAL);
+        panelContent.addView(cyclePreviewText);
+
+        addPanelLabel("تعداد کلیک در هر چرخه انتخاب‌شده");
+        specialClicksInput = panelInput(
+                PREF_SPECIAL_CLICKS, "0", InputType.TYPE_CLASS_NUMBER);
+
+        addPanelLabel("فاصله کلیک‌ها (نانوثانیه)");
+        specialIntervalInput = panelInput(
+                PREF_SPECIAL_INTERVAL, "0", InputType.TYPE_CLASS_NUMBER);
+
+        addPanelLabel("مدت لمس (نانوثانیه)");
+        specialTouchInput = panelInput(
+                PREF_SPECIAL_TOUCH, "1000000", InputType.TYPE_CLASS_NUMBER);
+
+        TextView save = panelButton(
+                "ذخیره تنظیمات چرخه‌های متفاوت",
+                Color.rgb(20, 125, 75));
+        LinearLayout.LayoutParams saveParams =
+                new LinearLayout.LayoutParams(-1, dp(38));
+        saveParams.setMargins(dp(2), dp(7), dp(2), dp(5));
+        panelContent.addView(save, saveParams);
+        save.setOnClickListener(v -> saveSpecialSettings());
+
+        TextView help = text(
+                "شماره‌ها را با ویرگول جدا کن. چرخه‌های انتخاب‌نشده از تنظیمات عادی صفحه اصلی استفاده می‌کنند.",
+                Color.LTGRAY, 10, false);
+        help.setGravity(Gravity.CENTER);
+        panelContent.addView(help);
+
+        panelScroll.addView(panelContent);
+        panel.addView(panelScroll, new LinearLayout.LayoutParams(
+                -1, dp(360)));
+
+        LinearLayout row = new LinearLayout(this);
+        row.setGravity(Gravity.CENTER);
+        row.setPadding(0, dp(5), 0, 0);
+
+        TextView main = panelButton(
+                "تنظیمات اصلی", Color.rgb(20, 125, 75));
+        TextView time = panelButton(
+                "زمان شروع ⚙", Color.rgb(55, 85, 110));
+        TextView off = panelButton(
+                "خاموش", Color.rgb(75, 75, 85));
+
+        main.setOnClickListener(v -> openMain());
+        time.setOnClickListener(v -> showStartTimePicker());
+        off.setOnClickListener(v -> shutdown());
+
+        row.addView(main);
+        row.addView(time);
+        row.addView(off);
+        panel.addView(row);
+
+        loadSpecialSettings();
+        updateCyclePreview(specialCyclesInput.getText().toString());
+
         panelParams = new WindowManager.LayoutParams(
                 -2, -2, overlayType(),
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
-                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN |
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN |
                         WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
                 PixelFormat.TRANSLUCENT);
 
         panelParams.gravity = Gravity.TOP | Gravity.START;
         panelParams.x = dp(12);
         panelParams.y = dp(120);
+        panelParams.softInputMode =
+                WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE;
 
         try {
             wm.addView(panel, panelParams);
         } catch (Exception e) {
             panel = null;
             panelParams = null;
+        }
+    }
+
+    private void addPanelSection(String title) {
+        TextView label = text(title, ORANGE, 13, true);
+        label.setGravity(Gravity.CENTER);
+        label.setPadding(0, dp(5), 0, dp(7));
+        panelContent.addView(label);
+    }
+
+    private void addPanelLabel(String value) {
+        TextView label = text(
+                value, Color.WHITE, 11, true);
+        label.setGravity(Gravity.RIGHT | Gravity.CENTER_VERTICAL);
+        label.setPadding(dp(2), dp(5), dp(2), dp(2));
+        panelContent.addView(label);
+    }
+
+    private EditText panelInput(
+            String key, String defaultValue, int inputType) {
+        EditText input = new EditText(this);
+        input.setSingleLine(true);
+        input.setTextSize(13);
+        input.setTextColor(Color.WHITE);
+        input.setHintTextColor(Color.GRAY);
+        input.setInputType(inputType);
+        input.setPadding(dp(8), dp(4), dp(8), dp(4));
+        input.setBackground(background(Color.rgb(32, 45, 58), dp(6)));
+        input.setText(getPrefs().getString(
+                key, defaultValue));
+        LinearLayout.LayoutParams params =
+                new LinearLayout.LayoutParams(-1, dp(42));
+        params.setMargins(0, dp(2), 0, dp(3));
+        panelContent.addView(input, params);
+        return input;
+    }
+
+    private void loadSpecialSettings() {
+        SharedPreferences p = getPrefs();
+        specialCyclesInput.setText(
+                p.getString(PREF_SPECIAL_CYCLES, ""));
+        specialClicksInput.setText(
+                p.getString(PREF_SPECIAL_CLICKS, "0"));
+        specialIntervalInput.setText(
+                p.getString(PREF_SPECIAL_INTERVAL, "0"));
+        specialTouchInput.setText(
+                p.getString(PREF_SPECIAL_TOUCH, "1000000"));
+    }
+
+    private void saveSpecialSettings() {
+        String cycles = specialCyclesInput.getText().toString().trim();
+        String clicksText = specialClicksInput.getText().toString().trim();
+        String intervalText = specialIntervalInput.getText().toString().trim();
+        String touchText = specialTouchInput.getText().toString().trim();
+
+        try {
+            if (!cycles.isEmpty())
+                parseCycleNumbers(cycles, Integer.MAX_VALUE);
+
+            long clicks = parseNonNegative(clicksText, 0);
+            long interval = parseNonNegative(intervalText, 0);
+            long touch = parseNonNegative(touchText, 1_000_000L);
+
+            if (!cycles.isEmpty()) {
+                if (clicks <= 0 || clicks > Integer.MAX_VALUE ||
+                        touch <= 0 || interval < 0) {
+                    updateStatus("مقادیر تنظیمات چرخه‌های متفاوت معتبر نیست");
+                    return;
+                }
+
+                if (!validTouchDuration(touch)) {
+                    updateStatus(
+                            "مدت لمس باید مضرب دقیق یک میلی‌ثانیه و در محدوده اندروید باشد");
+                    return;
+                }
+            }
+
+            getPrefs().edit()
+                    .putString(PREF_SPECIAL_CYCLES, cycles)
+                    .putLong(PREF_SPECIAL_CLICKS, clicks)
+                    .putLong(PREF_SPECIAL_INTERVAL, interval)
+                    .putLong(PREF_SPECIAL_TOUCH, touch)
+                    .apply();
+
+            updateCyclePreview(cycles);
+            updateStatus("تنظیمات چرخه‌های متفاوت ذخیره شد");
+
+            InputMethodManager imm = (InputMethodManager)
+                    getSystemService(INPUT_METHOD_SERVICE);
+            if (imm != null)
+                imm.hideSoftInputFromWindow(
+                        specialCyclesInput.getWindowToken(), 0);
+
+            panel.clearFocus();
+
+        } catch (NumberFormatException e) {
+            updateStatus("مقادیر عددی تنظیمات را بررسی کن");
+        } catch (IllegalArgumentException e) {
+            updateStatus(e.getMessage());
+        }
+    }
+
+    private long parseNonNegative(String value, long defaultValue) {
+        if (value == null || value.trim().isEmpty())
+            return defaultValue;
+
+        String normalized = normalizeDigits(value.trim());
+        long result = Long.parseLong(normalized);
+        if (result < 0)
+            throw new NumberFormatException();
+        return result;
+    }
+
+    private String normalizeDigits(String value) {
+        StringBuilder result = new StringBuilder();
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            int digit = Character.digit(c, 10);
+            if (digit >= 0)
+                result.append(digit);
+            else
+                result.append(c);
+        }
+        return result.toString();
+    }
+
+    private void updateCyclePreview(String value) {
+        if (cyclePreviewText == null) return;
+
+        try {
+            Set<Integer> numbers = parseCycleNumbers(
+                    value, Integer.MAX_VALUE);
+
+            if (numbers.isEmpty()) {
+                cyclePreviewText.setText("چرخه‌ای انتخاب نشده");
+                return;
+            }
+
+            StringBuilder display = new StringBuilder();
+            for (Integer number : numbers) {
+                if (display.length() > 0)
+                    display.append("     |     ");
+                display.append("چرخه ").append(number);
+            }
+
+            cyclePreviewText.setText(display.toString());
+        } catch (IllegalArgumentException e) {
+            cyclePreviewText.setText("شماره چرخه‌ها را بررسی کن");
         }
     }
 
@@ -1310,12 +1602,20 @@ public class FloatingService extends Service {
         }
 
         panel = null;
+        panelContent = null;
+        panelScroll = null;
+        cyclePreview = null;
         markerView = null;
         panelParams = null;
         markerParams = null;
         selectedTimeView = null;
         statusView = null;
         countdownView = null;
+        specialCyclesInput = null;
+        specialClicksInput = null;
+        specialIntervalInput = null;
+        specialTouchInput = null;
+        cyclePreviewText = null;
     }
 
     @Override
