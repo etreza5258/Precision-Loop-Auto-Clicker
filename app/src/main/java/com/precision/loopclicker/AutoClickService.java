@@ -53,8 +53,7 @@ public class AutoClickService extends AccessibilityService {
     private SharedPreferences targetPreferences;
     private volatile String lastRequestError = "";
 
-    private final class ClickRequest extends GestureDescription.GestureResultCallback {
-
+  private final class ClickRequest extends AccessibilityService.GestureResultCallback {
         final long targetNanos;
         final long deadlineNanos;
         final long touchDurationMs;
