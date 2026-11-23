@@ -179,7 +179,7 @@ public class AutoClickService extends AccessibilityService {
         schedulerThread = worker;
         worker.start();
     }
-    }
+    
 
     private void schedulerLoop() {
         try {
