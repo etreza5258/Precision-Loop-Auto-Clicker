@@ -1,4 +1,3 @@
-
 package com.precision.loopclicker;
 
 import android.accessibilityservice.AccessibilityService;
@@ -36,7 +35,7 @@ public class AutoClickService extends AccessibilityService {
     private static final int DEFAULT_TARGET_Y = 700;
     private static final long MAX_GESTURE_DURATION_MS =
             GestureDescription.getMaxGestureDuration();
-    private static final long FINAL_SPIN_WINDOW_NS = 250_000L;
+    private static final long FINAL_SPIN_WINDOW_NS = 1_000_000L;
     private static final String BENCHMARK_FILE_NAME = "click_benchmark.csv";
 
     private static volatile AutoClickService instance;
@@ -507,16 +506,11 @@ public class AutoClickService extends AccessibilityService {
         if (worker != null) {
             LockSupport.unpark(worker);
         }
-    }
-
-    private void dispatchReadyRequest(ClickRequest request) {
+    }    private void dispatchReadyRequest(ClickRequest request) {
         boolean expired = false;
         boolean unavailable = false;
-        boolean accepted = false;
-
         synchronized (queueLock) {
             if (!dispatching.remove(request)) return;
-
             if (!serviceReady || schedulerStopping) {
                 unavailable = true;
             } else {
@@ -526,26 +520,35 @@ public class AutoClickService extends AccessibilityService {
                     expired = true;
                 } else {
                     activeRequests.add(request);
-                    request.dispatchNanos = SystemClock.elapsedRealtimeNanos();
-                    try {
-                        accepted = dispatchGesture(
-                                request.gesture,
-                                request,
-                                mainHandler);
-                        request.dispatchAccepted = accepted;
-                    } catch (Exception ignored) {
-                        accepted = false;
-                        request.dispatchAccepted = false;
-                    }
-
-                    if (!accepted) activeRequests.remove(request);
                 }
             }
         }
-
         if (unavailable || expired) {
             postCompletion(request, false, true);
-        } else if (!accepted) {
+            return;
+        }
+        if (!serviceReady || schedulerStopping) {
+            synchronized (queueLock) {
+                activeRequests.remove(request);
+            }
+            postCompletion(request, false, true);
+            return;
+        }
+        boolean accepted = false;
+        request.dispatchNanos = SystemClock.elapsedRealtimeNanos();
+        try {
+            accepted = dispatchGesture(
+                    request.gesture,
+                    request,
+                    mainHandler);
+        } catch (Exception ignored) {
+            accepted = false;
+        }
+        request.dispatchAccepted = accepted;
+        if (!accepted) {
+            synchronized (queueLock) {
+                activeRequests.remove(request);
+            }
             postCompletion(request, false, false);
         }
     }
