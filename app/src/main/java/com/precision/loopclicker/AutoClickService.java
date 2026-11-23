@@ -33,9 +33,11 @@ public class AutoClickService extends AccessibilityService {
     private static final long MAX_GESTURE_DURATION_MS =
             GestureDescription.getMaxGestureDuration();
     private static final long FINAL_SPIN_WINDOW_NS = 2_000_000L;
-    private static final long DISPATCH_LEAD_MS = 2L;
-    private static final long DISPATCH_LEAD_NS = DISPATCH_LEAD_MS * NANOS_PER_MS;
-    private static final String BENCHMARK_FILE_NAME = "click_benchmark_v5.csv";
+    private static final long STROKE_START_OFFSET_MS = 2L;
+    private static final long STROKE_START_OFFSET_NS = STROKE_START_OFFSET_MS * NANOS_PER_MS;
+    private static final long MAX_ADAPTIVE_COMPENSATION_NS = 1_500_000L;
+    private static final long ADAPTIVE_FILTER_DIVISOR = 4L;
+    private static final String BENCHMARK_FILE_NAME = "click_benchmark_v6.csv";
     private static volatile AutoClickService instance;
     public interface GestureCompletion {
         void onFinished(boolean success, boolean expired);
@@ -45,9 +47,10 @@ public class AutoClickService extends AccessibilityService {
     private volatile Handler callbackHandler;
     private final Object queueLock = new Object();
     private volatile long queueVersion;
+    private volatile long adaptiveDispatchCompensationNs = 290_000L;
     private final PriorityQueue<ClickRequest> pending =
             new PriorityQueue<>(
-                    Comparator.comparingLong(request -> request.dispatchTargetNanos));
+                    Comparator.comparingLong(request -> request.targetNanos));
     private final HashSet<ClickRequest> activeRequests = new HashSet<>();
     private volatile boolean serviceReady;
     private volatile boolean schedulerStopping;
@@ -64,7 +67,10 @@ public class AutoClickService extends AccessibilityService {
         final long requestId;
         final long cycleStartNanos;
         final long targetNanos;
-        final long dispatchTargetNanos;
+        volatile long dispatchTargetNanos;
+        volatile long dispatchLeadNanos;
+        volatile long adaptiveCompensationNanos;
+        volatile boolean timingPrepared;
         final long deadlineNanos;
         final long touchDurationNanos;
         final long enqueueNanos;
@@ -89,7 +95,9 @@ public class AutoClickService extends AccessibilityService {
             requestId = benchmarkRequestIds.incrementAndGet();
             cycleStartNanos = cycleStart;
             targetNanos = target;
-            dispatchTargetNanos = target - DISPATCH_LEAD_NS;
+            adaptiveCompensationNanos = adaptiveDispatchCompensationNs;
+            dispatchLeadNanos = STROKE_START_OFFSET_NS + adaptiveCompensationNanos;
+            dispatchTargetNanos = target - dispatchLeadNanos;
             deadlineNanos = deadline;
             this.touchDurationNanos = touchDurationNanos;
             this.enqueueNanos = SystemClock.elapsedRealtimeNanos();
@@ -156,6 +164,14 @@ public class AutoClickService extends AccessibilityService {
             long observedQueueVersion;
             synchronized (queueLock) {
                 request = pending.peek();
+                if (request != null && !request.timingPrepared) {
+                    request.adaptiveCompensationNanos = adaptiveDispatchCompensationNs;
+                    request.dispatchLeadNanos = STROKE_START_OFFSET_NS
+                            + request.adaptiveCompensationNanos;
+                    request.dispatchTargetNanos = request.targetNanos
+                            - request.dispatchLeadNanos;
+                    request.timingPrepared = true;
+                }
                 observedQueueVersion = queueVersion;
             }
             if (request == null) {
@@ -268,7 +284,7 @@ public class AutoClickService extends AccessibilityService {
             return false;
         }
         long durationMs = durationNanos / NANOS_PER_MS;
-        if (durationMs + DISPATCH_LEAD_MS > MAX_GESTURE_DURATION_MS) {
+        if (durationMs + STROKE_START_OFFSET_MS > MAX_GESTURE_DURATION_MS) {
             lastRequestError =
                     "مدت لمس از حداکثر زمان مجاز اندروید بیشتر است";
             return false;
@@ -318,7 +334,7 @@ public class AutoClickService extends AccessibilityService {
         GestureDescription gesture;
         try {
             gesture = createTapGesture(
-                    targetX, targetY, DISPATCH_LEAD_MS,
+                    targetX, targetY, STROKE_START_OFFSET_MS,
                     touchDurationNanos / NANOS_PER_MS);
         } catch (Exception e) {
             lastRequestError = "آماده‌سازی ژست کلیک ناموفق بود";
@@ -374,7 +390,7 @@ public class AutoClickService extends AccessibilityService {
         int y = targetY;
         GestureDescription gesture;
         try {
-            gesture = createTapGesture(x, y, DISPATCH_LEAD_MS, durationMs);
+            gesture = createTapGesture(x, y, STROKE_START_OFFSET_MS, durationMs);
         } catch (Exception e) {
             lastRequestError = "آماده‌سازی ژست کلیک ناموفق بود";
             return false;
@@ -443,7 +459,7 @@ public class AutoClickService extends AccessibilityService {
             } else {
                 long now = SystemClock.elapsedRealtimeNanos();
                 if (request.deadlineNanos - now
-                        < DISPATCH_LEAD_NS + request.touchDurationNanos) {
+                        < request.dispatchLeadNanos + request.touchDurationNanos) {
                     expired = true;
                 } else {
                     activeRequests.add(request);
@@ -457,9 +473,11 @@ public class AutoClickService extends AccessibilityService {
 
         boolean accepted = false;
         request.dispatchNanos = SystemClock.elapsedRealtimeNanos();
+        updateAdaptiveCompensation(
+                request.dispatchNanos - request.dispatchTargetNanos);
         if (!serviceReady || schedulerStopping
                 || request.deadlineNanos - request.dispatchNanos
-                < DISPATCH_LEAD_NS + request.touchDurationNanos) {
+                < request.dispatchLeadNanos + request.touchDurationNanos) {
             synchronized (queueLock) {
                 activeRequests.remove(request);
             }
@@ -480,6 +498,14 @@ public class AutoClickService extends AccessibilityService {
             }
             postCompletion(request, false, false);
         }
+    }
+    private void updateAdaptiveCompensation(long observedScheduleLateNanos) {
+        long sample = Math.max(0L, Math.min(
+                MAX_ADAPTIVE_COMPENSATION_NS, observedScheduleLateNanos));
+        long previous = adaptiveDispatchCompensationNs;
+        long updated = previous + (sample - previous) / ADAPTIVE_FILTER_DIVISOR;
+        adaptiveDispatchCompensationNs = Math.max(0L, Math.min(
+                MAX_ADAPTIVE_COMPENSATION_NS, updated));
     }
     private void completeRequest(
             ClickRequest request,
@@ -557,7 +583,7 @@ public class AutoClickService extends AccessibilityService {
         benchmarkWriter.execute(() -> {
             if (output.length() == 0) {
                 try (FileWriter writer = new FileWriter(output, true)) {
-                    writer.write("session_start_epoch_ms,request_id,cycle_start_elapsed_ns,target_elapsed_ns,dispatch_target_elapsed_ns,deadline_elapsed_ns,enqueue_elapsed_ns,scheduler_ready_elapsed_ns,dispatch_elapsed_ns,dispatch_pipeline_ns,dispatch_late_ns,dispatch_schedule_late_ns,dispatch_accepted,callback_elapsed_ns,callback_delay_ns,click_index,batch_size,dispatch_lead_ms,result\n");
+                    writer.write("session_start_epoch_ms,request_id,cycle_start_elapsed_ns,target_elapsed_ns,dispatch_target_elapsed_ns,deadline_elapsed_ns,enqueue_elapsed_ns,scheduler_ready_elapsed_ns,dispatch_elapsed_ns,dispatch_pipeline_ns,scheduler_ready_late_ns,dispatch_late_ns,dispatch_schedule_late_ns,estimated_stroke_start_error_ns,adaptive_compensation_ns,dispatch_lead_ns,dispatch_accepted,callback_elapsed_ns,callback_delay_ns,click_index,batch_size,stroke_start_offset_ms,result\n");
                     writer.flush();
                 } catch (IOException ignored) {
                 }
@@ -574,13 +600,17 @@ public class AutoClickService extends AccessibilityService {
         long late = dispatch == 0 ? 0 : dispatch - request.targetNanos;
         long scheduleLate = dispatch == 0 ? 0 : dispatch - request.dispatchTargetNanos;
         long pipeline = dispatch == 0 || ready == 0 ? 0 : dispatch - ready;
+        long readyLate = ready == 0 ? 0 : ready - request.dispatchTargetNanos;
+        long estimatedStrokeError = dispatch == 0 ? 0
+                : dispatch + STROKE_START_OFFSET_NS - request.targetNanos;
         long callbackDelay = dispatch == 0 || callback == 0 ? 0 : callback - dispatch;
         String row = benchmarkSessionId + "," + request.requestId + "," + request.cycleStartNanos + ","
                 + request.targetNanos + "," + request.dispatchTargetNanos + "," + request.deadlineNanos + ","
                 + request.enqueueNanos + "," + ready + "," + dispatch + "," + pipeline + ","
-                + late + "," + scheduleLate + "," + request.dispatchAccepted + ","
-                + callback + "," + callbackDelay + "," + request.clickIndex + ","
-                + request.batchSize + "," + DISPATCH_LEAD_MS + "," + result + "\n";
+                + readyLate + "," + late + "," + scheduleLate + "," + estimatedStrokeError + ","
+                + request.adaptiveCompensationNanos + "," + request.dispatchLeadNanos + ","
+                + request.dispatchAccepted + "," + callback + "," + callbackDelay + ","
+                + request.clickIndex + "," + request.batchSize + "," + STROKE_START_OFFSET_MS + "," + result + "\n";
         try {
             writer.execute(() -> {
                 try (BufferedWriter out = new BufferedWriter(new FileWriter(output, true))) {
