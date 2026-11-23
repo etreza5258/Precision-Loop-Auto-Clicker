@@ -16,6 +16,14 @@ import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.PriorityQueue;
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
 
 public class AutoClickService extends AccessibilityService {
@@ -29,6 +37,7 @@ public class AutoClickService extends AccessibilityService {
     private static final long MAX_GESTURE_DURATION_MS =
             GestureDescription.getMaxGestureDuration();
     private static final long FINAL_SPIN_WINDOW_NS = 250_000L;
+    private static final String BENCHMARK_FILE_NAME = "click_benchmark.csv";
 
     private static volatile AutoClickService instance;
 
@@ -54,41 +63,48 @@ public class AutoClickService extends AccessibilityService {
 
     private SharedPreferences targetPreferences;
     private volatile String lastRequestError = "";
+    private final AtomicLong benchmarkRequestIds = new AtomicLong();
+    private volatile long benchmarkSessionId;
+    private volatile ExecutorService benchmarkWriter;
+    private volatile File benchmarkFile;
 
     private final class ClickRequest extends AccessibilityService.GestureResultCallback {
+        final long requestId;
+        final long cycleStartNanos;
         final long targetNanos;
         final long deadlineNanos;
-        final long touchDurationMs;
         final long touchDurationNanos;
-        final int x;
-        final int y;
+        final long enqueueNanos;
+        final int clickIndex;
+        final int batchSize;
+        volatile long dispatchNanos;
+        volatile long callbackNanos;
+        volatile boolean dispatchAccepted;
         final GestureDescription gesture;
 
         GestureCompletion completion;
+        final AtomicBoolean completionDelivered = new AtomicBoolean();
 
         ClickRequest(
+                long cycleStart,
                 long target,
                 long deadline,
-                long durationMs,
-                int x,
-                int y,
-                GestureCompletion completion) {
+                long touchDurationNanos,
+                GestureDescription gesture,
+                GestureCompletion completion,
+                int clickIndex,
+                int batchSize) {
 
+            requestId = benchmarkRequestIds.incrementAndGet();
+            cycleStartNanos = cycleStart;
             targetNanos = target;
             deadlineNanos = deadline;
-            touchDurationMs = durationMs;
-            touchDurationNanos = durationMs * NANOS_PER_MS;
-            this.x = x;
-            this.y = y;
+            this.touchDurationNanos = touchDurationNanos;
+            this.enqueueNanos = SystemClock.elapsedRealtimeNanos();
+            this.clickIndex = clickIndex;
+            this.batchSize = batchSize;
+            this.gesture = gesture;
             this.completion = completion;
-
-            Path path = new Path();
-            path.moveTo(x, y);
-            path.lineTo(x, y);
-            gesture = new GestureDescription.Builder()
-                    .addStroke(new GestureDescription.StrokeDescription(
-                            path, 0L, durationMs))
-                    .build();
         }
 
         @Override
@@ -105,6 +121,8 @@ public class AutoClickService extends AccessibilityService {
     @Override
     protected void onServiceConnected() {
         super.onServiceConnected();
+
+        startBenchmarkWriter();
 
         targetPreferences = getSharedPreferences(
                 TARGET_PREFS_NAME, MODE_PRIVATE);
@@ -176,19 +194,7 @@ public class AutoClickService extends AccessibilityService {
                 dispatching.add(request);
             }
 
-            if (schedulerStopping || !serviceReady) {
-                removeDispatching(request);
-                postCompletion(request, false, true);
-                continue;
-            }
-
-            boolean posted = mainHandler.post(
-                    () -> dispatchReadyRequest(request));
-
-            if (!posted) {
-                removeDispatching(request);
-                notifyCompletion(request, false, true);
-            }
+            dispatchReadyRequest(request);
         }
     }
 
@@ -235,6 +241,7 @@ public class AutoClickService extends AccessibilityService {
         if (instance == this) instance = null;
 
         targetPreferences = null;
+        stopBenchmarkWriter();
 
         super.onDestroy();
     }
@@ -312,6 +319,17 @@ public class AutoClickService extends AccessibilityService {
         return true;
     }
 
+    private GestureDescription createTapGesture(
+            int x, int y, long durationMs) {
+        Path path = new Path();
+        path.moveTo(x, y);
+        path.lineTo(x, y);
+        return new GestureDescription.Builder()
+                .addStroke(new GestureDescription.StrokeDescription(
+                        path, 0L, durationMs))
+                .build();
+    }
+
     public boolean performClickAtTarget(
             long targetElapsedRealtimeNanos,
             long cycleStartElapsedRealtimeNanos,
@@ -348,13 +366,25 @@ public class AutoClickService extends AccessibilityService {
             return false;
         }
 
+        GestureDescription gesture;
+        try {
+            gesture = createTapGesture(
+                    targetX, targetY,
+                    touchDurationNanos / NANOS_PER_MS);
+        } catch (Exception e) {
+            lastRequestError = "آماده‌سازی ژست کلیک ناموفق بود";
+            return false;
+        }
+
         ClickRequest request = new ClickRequest(
+                cycleStartElapsedRealtimeNanos,
                 targetElapsedRealtimeNanos,
                 cycleDeadlineElapsedRealtimeNanos,
-                touchDurationNanos / NANOS_PER_MS,
-                targetX,
-                targetY,
-                completion);
+                touchDurationNanos,
+                gesture,
+                completion,
+                1,
+                1);
 
         synchronized (queueLock) {
             if (!serviceReady || schedulerStopping) {
@@ -405,6 +435,13 @@ public class AutoClickService extends AccessibilityService {
 
         int x = targetX;
         int y = targetY;
+        GestureDescription gesture;
+        try {
+            gesture = createTapGesture(x, y, durationMs);
+        } catch (Exception e) {
+            lastRequestError = "آماده‌سازی ژست کلیک ناموفق بود";
+            return false;
+        }
 
         List<ClickRequest> requests =
                 new ArrayList<>(targets.length);
@@ -439,12 +476,14 @@ public class AutoClickService extends AccessibilityService {
             previousTarget = target;
 
             requests.add(new ClickRequest(
+                    cycleStart,
                     target,
                     deadline,
-                    durationMs,
-                    x,
-                    y,
-                    completions[i]));
+                    touchDurationNanos,
+                    gesture,
+                    completions[i],
+                    i + 1,
+                    targets.length));
         }
 
         synchronized (queueLock) {
@@ -470,82 +509,44 @@ public class AutoClickService extends AccessibilityService {
         }
     }
 
-    private void removeDispatching(ClickRequest request) {
-        synchronized (queueLock) {
-            dispatching.remove(request);
-        }
-    }
-
     private void dispatchReadyRequest(ClickRequest request) {
+        boolean expired = false;
+        boolean unavailable = false;
+        boolean accepted = false;
+
         synchronized (queueLock) {
             if (!dispatching.remove(request)) return;
-        }
 
-        if (!serviceReady || schedulerStopping) {
-            notifyCompletion(request, false, true);
-            return;
-        }
+            if (!serviceReady || schedulerStopping) {
+                unavailable = true;
+            } else {
+                long now = SystemClock.elapsedRealtimeNanos();
+                if (request.deadlineNanos - now
+                        < request.touchDurationNanos) {
+                    expired = true;
+                } else {
+                    activeRequests.add(request);
+                    request.dispatchNanos = SystemClock.elapsedRealtimeNanos();
+                    try {
+                        accepted = dispatchGesture(
+                                request.gesture,
+                                request,
+                                mainHandler);
+                        request.dispatchAccepted = accepted;
+                    } catch (Exception ignored) {
+                        accepted = false;
+                        request.dispatchAccepted = false;
+                    }
 
-        long now = SystemClock.elapsedRealtimeNanos();
-        long remaining = request.deadlineNanos - now;
-
-        if (remaining < request.touchDurationNanos) {
-            notifyCompletion(request, false, true);
-            return;
-        }
-
-        if (!dispatchRequest(request)) {
-            notifyCompletion(request, false, false);
-        }
-    }
-
-    private boolean dispatchRequest(ClickRequest request) {
-        if (Looper.myLooper() != Looper.getMainLooper()) {
-            return false;
-        }
-
-        try {
-            long now = SystemClock.elapsedRealtimeNanos();
-
-            if (request.deadlineNanos - now
-                    < request.touchDurationNanos) {
-                notifyCompletion(request, false, true);
-                return true;
-            }
-
-            synchronized (queueLock) {
-                if (!serviceReady || schedulerStopping) {
-                    return false;
-                }
-
-                activeRequests.add(request);
-            }
-
-            boolean accepted;
-
-            try {
-                accepted = dispatchGesture(
-                        request.gesture,
-                        request,
-                        mainHandler);
-            } catch (Exception e) {
-                accepted = false;
-            }
-
-            if (!accepted) {
-                synchronized (queueLock) {
-                    activeRequests.remove(request);
+                    if (!accepted) activeRequests.remove(request);
                 }
             }
+        }
 
-            return accepted;
-
-        } catch (Exception e) {
-            synchronized (queueLock) {
-                activeRequests.remove(request);
-            }
-
-            return false;
+        if (unavailable || expired) {
+            postCompletion(request, false, true);
+        } else if (!accepted) {
+            postCompletion(request, false, false);
         }
     }
 
@@ -587,6 +588,13 @@ public class AutoClickService extends AccessibilityService {
 
         if (request == null) return;
 
+        if (!request.completionDelivered.compareAndSet(false, true))
+            return;
+
+        request.callbackNanos = SystemClock.elapsedRealtimeNanos();
+        String result = success ? "SUCCESS" : (expired ? "EXPIRED_OR_CANCELLED" : "FAILED");
+        writeBenchmarkRow(request, result);
+
         GestureCompletion callback = request.completion;
         request.completion = null;
 
@@ -619,6 +627,64 @@ public class AutoClickService extends AccessibilityService {
         for (ClickRequest request : cancelled) {
             notifyCompletion(request, false, true);
         }
+    }
+
+    private void startBenchmarkWriter() {
+        benchmarkSessionId = System.currentTimeMillis();
+        File directory = getExternalFilesDir("benchmark");
+        if (directory == null) directory = getFilesDir();
+        if (!directory.exists() && !directory.mkdirs()) return;
+
+        benchmarkFile = new File(directory, BENCHMARK_FILE_NAME);
+        benchmarkWriter = Executors.newSingleThreadExecutor(r -> {
+            Thread thread = new Thread(r, "ClickBenchmarkWriter");
+            thread.setPriority(Thread.NORM_PRIORITY - 1);
+            return thread;
+        });
+
+        final File output = benchmarkFile;
+        benchmarkWriter.execute(() -> {
+            if (output.length() == 0) {
+                try (FileWriter writer = new FileWriter(output, true)) {
+                    writer.write("session_start_epoch_ms,request_id,cycle_start_elapsed_ns,target_elapsed_ns,deadline_elapsed_ns,enqueue_elapsed_ns,dispatch_elapsed_ns,dispatch_late_ns,dispatch_accepted,callback_elapsed_ns,callback_delay_ns,click_index,batch_size,result\n");
+                    writer.flush();
+                } catch (IOException ignored) {
+                }
+            }
+        });
+    }
+
+    private void writeBenchmarkRow(ClickRequest request, String result) {
+        ExecutorService writer = benchmarkWriter;
+        File output = benchmarkFile;
+        if (writer == null || output == null || request == null) return;
+
+        long dispatch = request.dispatchNanos;
+        long callback = request.callbackNanos;
+        long late = dispatch == 0 ? 0 : dispatch - request.targetNanos;
+        long callbackDelay = dispatch == 0 ? 0 : callback - dispatch;
+        String row = benchmarkSessionId + "," + request.requestId + "," + request.cycleStartNanos + ","
+                + request.targetNanos + "," + request.deadlineNanos + ","
+                + request.enqueueNanos + "," + dispatch + "," + late + ","
+                + request.dispatchAccepted + "," + callback + "," + callbackDelay + ","
+                + request.clickIndex + "," + request.batchSize + "," + result + "\n";
+
+        try {
+            writer.execute(() -> {
+                try (BufferedWriter out = new BufferedWriter(new FileWriter(output, true))) {
+                    out.write(row);
+                    out.flush();
+                } catch (IOException ignored) {
+                }
+            });
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void stopBenchmarkWriter() {
+        ExecutorService writer = benchmarkWriter;
+        benchmarkWriter = null;
+        if (writer != null) writer.shutdown();
     }
 
     private void runOnMain(Runnable action) {
