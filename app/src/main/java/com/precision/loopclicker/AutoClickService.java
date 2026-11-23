@@ -7,6 +7,7 @@ import android.content.SharedPreferences;
 import android.graphics.Path;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.Process;
 import android.os.SystemClock;
 import android.view.accessibility.AccessibilityEvent;
 
@@ -27,6 +28,7 @@ public class AutoClickService extends AccessibilityService {
     private static final int DEFAULT_TARGET_Y = 700;
     private static final long MAX_GESTURE_DURATION_MS =
             GestureDescription.getMaxGestureDuration();
+    private static final long FINAL_SPIN_WINDOW_NS = 250_000L;
 
     private static volatile AutoClickService instance;
 
@@ -53,13 +55,14 @@ public class AutoClickService extends AccessibilityService {
     private SharedPreferences targetPreferences;
     private volatile String lastRequestError = "";
 
-  private final class ClickRequest extends AccessibilityService.GestureResultCallback {
+    private final class ClickRequest extends AccessibilityService.GestureResultCallback {
         final long targetNanos;
         final long deadlineNanos;
         final long touchDurationMs;
         final long touchDurationNanos;
         final int x;
         final int y;
+        final GestureDescription gesture;
 
         GestureCompletion completion;
 
@@ -78,6 +81,14 @@ public class AutoClickService extends AccessibilityService {
             this.x = x;
             this.y = y;
             this.completion = completion;
+
+            Path path = new Path();
+            path.moveTo(x, y);
+            path.lineTo(x, y);
+            gesture = new GestureDescription.Builder()
+                    .addStroke(new GestureDescription.StrokeDescription(
+                            path, 0L, durationMs))
+                    .build();
         }
 
         @Override
@@ -125,6 +136,11 @@ public class AutoClickService extends AccessibilityService {
     }
 
     private void schedulerLoop() {
+        try {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY);
+        } catch (Exception ignored) {
+        }
+
         while (!schedulerStopping) {
             ClickRequest request;
 
@@ -140,9 +156,17 @@ public class AutoClickService extends AccessibilityService {
             long now = SystemClock.elapsedRealtimeNanos();
             long remaining = request.targetNanos - now;
 
-            if (remaining > 0) {
-                LockSupport.parkNanos(this, remaining);
+            if (remaining > FINAL_SPIN_WINDOW_NS) {
+                LockSupport.parkNanos(
+                        this, remaining - FINAL_SPIN_WINDOW_NS);
                 continue;
+            }
+
+            if (remaining > 0) {
+                do {
+                    now = SystemClock.elapsedRealtimeNanos();
+                } while (now < request.targetNanos && !schedulerStopping);
+                if (schedulerStopping) break;
             }
 
             synchronized (queueLock) {
@@ -489,19 +513,6 @@ public class AutoClickService extends AccessibilityService {
                 return true;
             }
 
-            Path path = new Path();
-            path.moveTo(request.x, request.y);
-            path.lineTo(request.x, request.y);
-
-            GestureDescription gesture =
-                    new GestureDescription.Builder()
-                            .addStroke(
-                                    new GestureDescription.StrokeDescription(
-                                            path,
-                                            0L,
-                                            request.touchDurationMs))
-                            .build();
-
             synchronized (queueLock) {
                 if (!serviceReady || schedulerStopping) {
                     return false;
@@ -514,7 +525,7 @@ public class AutoClickService extends AccessibilityService {
 
             try {
                 accepted = dispatchGesture(
-                        gesture,
+                        request.gesture,
                         request,
                         mainHandler);
             } catch (Exception e) {
