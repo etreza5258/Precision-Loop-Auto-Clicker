@@ -454,11 +454,11 @@ public class FloatingService extends Service {
         runFinished = false;
 
         updateTarget();
+        scheduleNextClick(runId);
         setMarkerTouchable(false);
         showFloatingViews();
         updateStatus("زمان‌بندی کلیک‌ها آغاز شد");
         updateCountdown();
-        scheduleNextClick(runId);
     }
 
     private Set<Integer> parseCycleNumbers(
