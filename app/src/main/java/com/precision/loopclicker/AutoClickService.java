@@ -48,15 +48,15 @@ public class AutoClickService extends AccessibilityService {
     private static final long STROKE_OFFSET_NS =
             STROKE_OFFSET_MS * NS_PER_MS;
 
-    private static final long PRESELECT_LEAD_NS = 20_000_000L;
-    private static final long FINAL_SPIN_NS = 5_000_000L;
+    private static final long PRESELECT_LEAD_NS = 250_000_000L;
+    private static final long FINAL_SPIN_NS = 8_000_000L;
 
     private static final long MIN_COMPENSATION_NS = -1_500_000L;
     private static final long MAX_COMPENSATION_NS = 1_500_000L;
     private static final long MAX_COMPENSATION_STEP_NS = 250_000L;
     private static final int ADAPTIVE_WINDOW = 9;
 
-    private static final String CSV_NAME = "click_benchmark_v18.csv";
+    private static final String CSV_NAME = "click_benchmark_v19.csv";
 
     private static final int QUEUED = 0;
     private static final int ACTIVE = 1;
@@ -110,7 +110,6 @@ public class AutoClickService extends AccessibilityService {
     private volatile boolean serviceReady;
     private volatile boolean schedulerStopping;
     private volatile Thread schedulerThread;
-
     private volatile ClickRequest armedRequest;
 
     private volatile int targetX = DEFAULT_X;
@@ -274,8 +273,11 @@ public class AutoClickService extends AccessibilityService {
             long wakeNanos = SystemClock.elapsedRealtimeNanos();
 
             ClickRequest selected = null;
+            ClickRequest armedForSpin = null;
+
             long waitUntilNanos = Long.MAX_VALUE;
             long lockWaitNanos = 0L;
+            long selectedNanos = 0L;
 
             long lockStart = SystemClock.elapsedRealtimeNanos();
 
@@ -301,7 +303,6 @@ public class AutoClickService extends AccessibilityService {
                 }
 
                 if (armed == null) {
-
                     head = ready.peek();
 
                     if (head != null
@@ -311,7 +312,8 @@ public class AutoClickService extends AccessibilityService {
                         armed = ready.poll();
                         armedRequest = armed;
 
-                        if (armed != null) {
+                        if (armed != null
+                                && armed.preselectedNanos == 0L) {
                             armed.preselectedNanos = now;
                         }
                     }
@@ -320,16 +322,16 @@ public class AutoClickService extends AccessibilityService {
                 armed = armedRequest;
 
                 if (armed != null) {
-
                     if (armed.dispatchTargetNanos <= now) {
                         selected = armed;
+                        selectedNanos = now;
                     } else {
+                        armedForSpin = armed;
                         waitUntilNanos =
                                 armed.dispatchTargetNanos - FINAL_SPIN_NS;
                     }
 
                 } else {
-
                     head = ready.peek();
 
                     if (head != null) {
@@ -344,6 +346,7 @@ public class AutoClickService extends AccessibilityService {
                 dispatchReadyRequest(
                         selected,
                         wakeNanos,
+                        selectedNanos,
                         lockWaitNanos);
                 continue;
             }
@@ -362,19 +365,38 @@ public class AutoClickService extends AccessibilityService {
 
             if (remaining > 0L) {
                 LockSupport.parkNanos(this, remaining);
-                continue;
             }
 
-            ClickRequest armed = armedRequest;
+            if (schedulerStopping) break;
 
-            if (armed != null) {
-                long target = armed.dispatchTargetNanos;
+            if (queueVersion.get() != observedVersion) continue;
 
-                while (!schedulerStopping
-                        && queueVersion.get() == observedVersion
-                        && SystemClock.elapsedRealtimeNanos() < target) {
-                    // انتظار فعال فقط در پنجره پایانی ۵ میلی‌ثانیه
+            if (armedForSpin == null) continue;
+
+            long target = armedForSpin.dispatchTargetNanos;
+            long finalWakeNanos = SystemClock.elapsedRealtimeNanos();
+
+            while (!schedulerStopping
+                    && queueVersion.get() == observedVersion) {
+
+                long spinNow = SystemClock.elapsedRealtimeNanos();
+
+                if (spinNow >= target) {
+                    selectedNanos = spinNow;
+                    break;
                 }
+            }
+
+            if (schedulerStopping) break;
+
+            if (queueVersion.get() != observedVersion) continue;
+
+            if (selectedNanos >= target) {
+                dispatchReadyRequest(
+                        armedForSpin,
+                        finalWakeNanos,
+                        selectedNanos,
+                        lockWaitNanos);
             }
         }
     }
@@ -382,6 +404,7 @@ public class AutoClickService extends AccessibilityService {
     private void dispatchReadyRequest(
             ClickRequest request,
             long wakeNanos,
+            long selectNanos,
             long schedulerLockWaitNanos) {
 
         boolean accepted = false;
@@ -389,9 +412,11 @@ public class AutoClickService extends AccessibilityService {
         boolean expired = false;
         String finishReason = REASON_DISPATCH_REJECTED;
 
+        long lockEntered = SystemClock.elapsedRealtimeNanos();
+
         synchronized (dispatchLock) {
 
-            long lockEntered = SystemClock.elapsedRealtimeNanos();
+            long lockAcquired = SystemClock.elapsedRealtimeNanos();
 
             if (armedRequest != request) return;
 
@@ -405,14 +430,13 @@ public class AutoClickService extends AccessibilityService {
             activeRequests.add(request);
 
             request.schedulerWakeNanos = wakeNanos;
-            request.schedulerSelectNanos = request.preselectedNanos;
+            request.schedulerSelectNanos = selectNanos;
             request.schedulerQueueLockWaitNanos =
                     schedulerLockWaitNanos;
             request.dispatchLockWaitNanos =
-                    SystemClock.elapsedRealtimeNanos() - lockEntered;
+                    lockAcquired - lockEntered;
 
-            request.schedulerReadyNanos =
-                    SystemClock.elapsedRealtimeNanos();
+            request.schedulerReadyNanos = lockAcquired;
 
             queueVersion.incrementAndGet();
 
@@ -444,7 +468,8 @@ public class AutoClickService extends AccessibilityService {
                             STROKE_OFFSET_NS
                                     + request.touchDurationNanos;
 
-                    if (request.deadlineNanos - now
+                    if (now >= request.deadlineNanos
+                            || request.deadlineNanos - now
                             < minimumTimeNeeded) {
 
                         shouldFinish = true;
@@ -1036,6 +1061,22 @@ public class AutoClickService extends AccessibilityService {
                 lastRequestError =
                         "درخواست هنگام ثبت لغو شده است";
                 return false;
+            }
+
+            ClickRequest armed = armedRequest;
+            long earliestNewTarget = Long.MAX_VALUE;
+
+            for (ClickRequest request : requests) {
+                if (request.dispatchTargetNanos < earliestNewTarget) {
+                    earliestNewTarget = request.dispatchTargetNanos;
+                }
+            }
+
+            if (armed != null
+                    && earliestNewTarget < armed.dispatchTargetNanos) {
+
+                armedRequest = null;
+                ready.offer(armed);
             }
 
             ready.addAll(requests);
