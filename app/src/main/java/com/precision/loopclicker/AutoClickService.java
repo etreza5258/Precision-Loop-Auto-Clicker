@@ -20,9 +20,9 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.PriorityQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -48,20 +48,19 @@ public class AutoClickService extends AccessibilityService {
     private static final long STROKE_OFFSET_NS =
             STROKE_OFFSET_MS * NS_PER_MS;
 
+    private static final long PRESELECT_LEAD_NS = 20_000_000L;
     private static final long FINAL_SPIN_NS = 5_000_000L;
-    private static final long ARM_LOOKAHEAD_NS = 2_000_000L;
 
     private static final long MIN_COMPENSATION_NS = -1_500_000L;
     private static final long MAX_COMPENSATION_NS = 1_500_000L;
     private static final long MAX_COMPENSATION_STEP_NS = 250_000L;
     private static final int ADAPTIVE_WINDOW = 9;
 
-    private static final String CSV_NAME = "click_benchmark_v17.csv";
+    private static final String CSV_NAME = "click_benchmark_v18.csv";
 
     private static final int QUEUED = 0;
-    private static final int DISPATCHING = 1;
-    private static final int ACTIVE = 2;
-    private static final int FINISHED = 3;
+    private static final int ACTIVE = 1;
+    private static final int FINISHED = 2;
 
     private static final String REASON_SUCCESS = "SUCCESS";
     private static final String REASON_CANCELLED = "CANCELLED";
@@ -89,14 +88,8 @@ public class AutoClickService extends AccessibilityService {
     private final AtomicLong requestIds = new AtomicLong();
     private final AtomicLong cancellationGeneration = new AtomicLong();
 
-    private final AtomicLong adaptiveCompensationNs = new AtomicLong(0L);
-    private final AtomicLong adaptiveDeviationNs = new AtomicLong(0L);
-
-    private final PriorityQueue<ClickRequest> pending =
-            new PriorityQueue<>(16,
-                    Comparator.comparingLong(
-                            (ClickRequest r) -> r.targetNanos)
-                            .thenComparingLong(r -> r.requestId));
+    private final AtomicLong adaptiveCompensationNs = new AtomicLong();
+    private final AtomicLong adaptiveDeviationNs = new AtomicLong();
 
     private final PriorityQueue<ClickRequest> ready =
             new PriorityQueue<>(16,
@@ -116,8 +109,9 @@ public class AutoClickService extends AccessibilityService {
 
     private volatile boolean serviceReady;
     private volatile boolean schedulerStopping;
-
     private volatile Thread schedulerThread;
+
+    private volatile ClickRequest armedRequest;
 
     private volatile int targetX = DEFAULT_X;
     private volatile int targetY = DEFAULT_Y;
@@ -128,18 +122,6 @@ public class AutoClickService extends AccessibilityService {
     private volatile long benchmarkSessionId;
     private volatile ExecutorService benchmarkWriter;
     private volatile File benchmarkFile;
-
-    private final class TimingGroup {
-        final long firstTargetNanos;
-        final long cancelGeneration;
-        final List<ClickRequest> requests = new ArrayList<>();
-        volatile boolean armed;
-
-        TimingGroup(long firstTarget, long generation) {
-            firstTargetNanos = firstTarget;
-            cancelGeneration = generation;
-        }
-    }
 
     private final class ClickRequest extends GestureResultCallback {
 
@@ -153,7 +135,6 @@ public class AutoClickService extends AccessibilityService {
         final int clickIndex;
         final int batchSize;
         final GestureDescription gesture;
-        final TimingGroup timingGroup;
 
         final AtomicInteger state = new AtomicInteger(QUEUED);
         final AtomicBoolean completionDelivered = new AtomicBoolean();
@@ -164,14 +145,13 @@ public class AutoClickService extends AccessibilityService {
         volatile long compensationNanos;
         volatile long deviationNanos;
 
+        volatile long preselectedNanos;
         volatile long schedulerWakeNanos;
         volatile long schedulerSelectNanos;
         volatile long schedulerQueueLockWaitNanos;
-        volatile long dispatchQueueLockWaitNanos;
         volatile long dispatchLockWaitNanos;
-        volatile long dispatchPrepareNanos;
-
         volatile long schedulerReadyNanos;
+        volatile long dispatchPrepareNanos;
         volatile long dispatchNanos;
         volatile long dispatchReturnNanos;
         volatile long callbackNanos;
@@ -194,8 +174,7 @@ public class AutoClickService extends AccessibilityService {
                 GestureCompletion completion,
                 int clickIndex,
                 int batchSize,
-                long generation,
-                TimingGroup group) {
+                long generation) {
 
             cycleStartNanos = cycleStart;
             targetNanos = target;
@@ -206,7 +185,6 @@ public class AutoClickService extends AccessibilityService {
             this.clickIndex = clickIndex;
             this.batchSize = batchSize;
             cancelGeneration = generation;
-            timingGroup = group;
         }
 
         @Override
@@ -273,7 +251,6 @@ public class AutoClickService extends AccessibilityService {
 
     private void startScheduler() {
         Thread current = schedulerThread;
-
         if (current != null && current.isAlive()) return;
 
         Thread worker = new Thread(
@@ -284,10 +261,6 @@ public class AutoClickService extends AccessibilityService {
         worker.start();
     }
 
-    /*
-     * آماده‌سازی گروه و ارسال کلیک هر دو در همین Thread انجام می‌شوند.
-     * هیچ انتقالی از Thread زمان‌بندی به Thread ارسال وجود ندارد.
-     */
     private void schedulerLoop() {
         try {
             Process.setThreadPriority(
@@ -300,143 +273,78 @@ public class AutoClickService extends AccessibilityService {
             long observedVersion = queueVersion.get();
             long wakeNanos = SystemClock.elapsedRealtimeNanos();
 
-            ClickRequest dispatchRequest = null;
-            List<ClickRequest> rejected = null;
-
-            long selectNanos = 0L;
-            long schedulerLockWaitNanos = 0L;
-            long dispatchQueueWaitNanos = 0L;
-
+            ClickRequest selected = null;
             long waitUntilNanos = Long.MAX_VALUE;
+            long lockWaitNanos = 0L;
 
             long lockStart = SystemClock.elapsedRealtimeNanos();
 
             synchronized (queueLock) {
 
-                schedulerLockWaitNanos =
+                lockWaitNanos =
                         SystemClock.elapsedRealtimeNanos() - lockStart;
 
                 if (schedulerStopping) break;
 
                 long now = SystemClock.elapsedRealtimeNanos();
 
-                ClickRequest pendingHead = pending.peek();
+                ClickRequest head = ready.peek();
+                ClickRequest armed = armedRequest;
 
-                if (pendingHead != null) {
+                if (armed != null && head != null
+                        && head.dispatchTargetNanos
+                        < armed.dispatchTargetNanos) {
 
-                    TimingGroup group = pendingHead.timingGroup;
+                    armedRequest = null;
+                    ready.offer(armed);
+                    armed = null;
+                }
 
-                    long armAt =
-                            group.firstTargetNanos
-                                    - STROKE_OFFSET_NS
-                                    - MAX_COMPENSATION_NS
-                                    - ARM_LOOKAHEAD_NS;
+                if (armed == null) {
 
-                    if (now >= armAt) {
-                        rejected = armTimingGroupLocked(group);
+                    head = ready.peek();
+
+                    if (head != null
+                            && head.dispatchTargetNanos
+                            <= now + PRESELECT_LEAD_NS) {
+
+                        armed = ready.poll();
+                        armedRequest = armed;
+
+                        if (armed != null) {
+                            armed.preselectedNanos = now;
+                        }
+                    }
+                }
+
+                armed = armedRequest;
+
+                if (armed != null) {
+
+                    if (armed.dispatchTargetNanos <= now) {
+                        selected = armed;
                     } else {
-                        waitUntilNanos = armAt;
+                        waitUntilNanos =
+                                armed.dispatchTargetNanos - FINAL_SPIN_NS;
                     }
-                }
 
-                if (rejected == null) {
+                } else {
 
-                    ClickRequest readyHead = ready.peek();
+                    head = ready.peek();
 
-                    if (readyHead != null) {
-
-                        now = SystemClock.elapsedRealtimeNanos();
-
-                        if (readyHead.dispatchTargetNanos <= now) {
-
-                            long queueStart =
-                                    SystemClock.elapsedRealtimeNanos();
-
-                            dispatchRequest = ready.poll();
-
-                            dispatchQueueWaitNanos =
-                                    SystemClock.elapsedRealtimeNanos()
-                                            - queueStart;
-
-                            if (dispatchRequest != null
-                                    && dispatchRequest.state.compareAndSet(
-                                    QUEUED, DISPATCHING)) {
-
-                                if (serviceReady
-                                        && !schedulerStopping
-                                        && dispatchRequest.cancelGeneration
-                                        == cancellationGeneration.get()) {
-
-                                    activeRequests.add(dispatchRequest);
-
-                                    if (!dispatchRequest.state.compareAndSet(
-                                            DISPATCHING, ACTIVE)) {
-
-                                        activeRequests.remove(dispatchRequest);
-                                        dispatchRequest = null;
-                                    }
-
-                                } else {
-                                    rejected = new ArrayList<>();
-                                    rejected.add(dispatchRequest);
-                                    dispatchRequest = null;
-                                }
-
-                            } else {
-                                dispatchRequest = null;
-                            }
-
-                            selectNanos =
-                                    SystemClock.elapsedRealtimeNanos();
-
-                        } else if (readyHead.dispatchTargetNanos
-                                < waitUntilNanos) {
-
-                            waitUntilNanos =
-                                    readyHead.dispatchTargetNanos;
-                        }
-                    }
-                }
-
-                if (pendingHead != null && rejected == null) {
-                    ClickRequest nextPending = pending.peek();
-
-                    if (nextPending != null) {
-                        long nextArm =
-                                nextPending.timingGroup.firstTargetNanos
-                                        - STROKE_OFFSET_NS
-                                        - MAX_COMPENSATION_NS
-                                        - ARM_LOOKAHEAD_NS;
-
-                        if (nextArm < waitUntilNanos) {
-                            waitUntilNanos = nextArm;
-                        }
+                    if (head != null) {
+                        waitUntilNanos =
+                                head.dispatchTargetNanos
+                                        - PRESELECT_LEAD_NS;
                     }
                 }
             }
 
-            if (rejected != null) {
-                for (ClickRequest request : rejected) {
-                    finishQueuedOrDispatching(
-                            request,
-                            false,
-                            true,
-                            !serviceReady || schedulerStopping
-                                    ? REASON_SERVICE_STOPPED
-                                    : REASON_CANCELLED);
-                }
-
-                continue;
-            }
-
-            if (dispatchRequest != null) {
+            if (selected != null) {
                 dispatchReadyRequest(
-                        dispatchRequest,
+                        selected,
                         wakeNanos,
-                        selectNanos,
-                        schedulerLockWaitNanos,
-                        dispatchQueueWaitNanos);
-
+                        lockWaitNanos);
                 continue;
             }
 
@@ -449,116 +357,64 @@ public class AutoClickService extends AccessibilityService {
                 continue;
             }
 
-            long remaining =
-                    waitUntilNanos - SystemClock.elapsedRealtimeNanos();
+            long now = SystemClock.elapsedRealtimeNanos();
+            long remaining = waitUntilNanos - now;
 
-            if (remaining > FINAL_SPIN_NS) {
-
-                LockSupport.parkNanos(
-                        this,
-                        remaining - FINAL_SPIN_NS);
-
+            if (remaining > 0L) {
+                LockSupport.parkNanos(this, remaining);
                 continue;
             }
 
-            /*
-             * انتظار فعال در بازه پایانی.
-             * درخواست جدید با تغییر queueVersion باعث خروج فوری می‌شود.
-             */
-            while (!schedulerStopping
-                    && queueVersion.get() == observedVersion
-                    && SystemClock.elapsedRealtimeNanos()
-                    < waitUntilNanos) {
-                // Intentional short spin.
+            ClickRequest armed = armedRequest;
+
+            if (armed != null) {
+                long target = armed.dispatchTargetNanos;
+
+                while (!schedulerStopping
+                        && queueVersion.get() == observedVersion
+                        && SystemClock.elapsedRealtimeNanos() < target) {
+                    // انتظار فعال فقط در پنجره پایانی ۵ میلی‌ثانیه
+                }
             }
         }
-    }
-
-    private List<ClickRequest> armTimingGroupLocked(TimingGroup group) {
-        if (group == null || group.armed) return null;
-
-        if (!serviceReady || schedulerStopping
-                || group.cancelGeneration != cancellationGeneration.get()) {
-
-            List<ClickRequest> rejected =
-                    new ArrayList<>(group.requests);
-
-            for (ClickRequest request : rejected) {
-                pending.remove(request);
-            }
-
-            group.armed = true;
-            queueVersion.incrementAndGet();
-
-            return rejected;
-        }
-
-        if (group.requests.isEmpty()) {
-            group.armed = true;
-            return null;
-        }
-
-        long compensation = clamp(
-                adaptiveCompensationNs.get(),
-                MIN_COMPENSATION_NS,
-                MAX_COMPENSATION_NS);
-
-        long deviation = adaptiveDeviationNs.get();
-
-        for (ClickRequest request : group.requests) {
-
-            pending.remove(request);
-
-            request.compensationNanos = compensation;
-            request.deviationNanos = deviation;
-
-            request.dispatchLeadNanos =
-                    STROKE_OFFSET_NS + compensation;
-
-            request.dispatchTargetNanos =
-                    request.targetNanos - request.dispatchLeadNanos;
-
-            ready.offer(request);
-        }
-
-        group.armed = true;
-        queueVersion.incrementAndGet();
-
-        return null;
     }
 
     private void dispatchReadyRequest(
             ClickRequest request,
             long wakeNanos,
-            long selectNanos,
-            long schedulerLockWaitNanos,
-            long dispatchQueueWaitNanos) {
+            long schedulerLockWaitNanos) {
 
         boolean accepted = false;
         boolean shouldFinish = false;
         boolean expired = false;
-
         String finishReason = REASON_DISPATCH_REJECTED;
-
-        long dispatchLockStart =
-                SystemClock.elapsedRealtimeNanos();
 
         synchronized (dispatchLock) {
 
-            long dispatchLockWait =
-                    SystemClock.elapsedRealtimeNanos()
-                            - dispatchLockStart;
+            long lockEntered = SystemClock.elapsedRealtimeNanos();
+
+            if (armedRequest != request) return;
+
+            armedRequest = null;
+
+            if (!request.state.compareAndSet(QUEUED, ACTIVE)) {
+                queueVersion.incrementAndGet();
+                return;
+            }
+
+            activeRequests.add(request);
 
             request.schedulerWakeNanos = wakeNanos;
-            request.schedulerSelectNanos = selectNanos;
+            request.schedulerSelectNanos = request.preselectedNanos;
             request.schedulerQueueLockWaitNanos =
                     schedulerLockWaitNanos;
-            request.dispatchQueueLockWaitNanos =
-                    dispatchQueueWaitNanos;
-            request.dispatchLockWaitNanos = dispatchLockWait;
-            request.schedulerReadyNanos = selectNanos;
+            request.dispatchLockWaitNanos =
+                    SystemClock.elapsedRealtimeNanos() - lockEntered;
 
-            if (request.state.get() != ACTIVE) return;
+            request.schedulerReadyNanos =
+                    SystemClock.elapsedRealtimeNanos();
+
+            queueVersion.incrementAndGet();
 
             if (!serviceReady || schedulerStopping
                     || request.cancelGeneration
@@ -576,7 +432,6 @@ public class AutoClickService extends AccessibilityService {
                 Handler handler = callbackHandler;
 
                 if (handler == null) {
-
                     shouldFinish = true;
                     expired = true;
                     finishReason = REASON_SERVICE_STOPPED;
@@ -589,11 +444,6 @@ public class AutoClickService extends AccessibilityService {
                             STROKE_OFFSET_NS
                                     + request.touchDurationNanos;
 
-                    /*
-                     * کنترل نهایی مهلت چرخه.
-                     * اگر زمان کافی برای Offset و مدت لمس باقی نمانده باشد
-                     * Gesture ارسال نمی‌شود.
-                     */
                     if (request.deadlineNanos - now
                             < minimumTimeNeeded) {
 
@@ -606,9 +456,6 @@ public class AutoClickService extends AccessibilityService {
                         request.dispatchPrepareNanos =
                                 SystemClock.elapsedRealtimeNanos();
 
-                        /*
-                         * این Timestamp تا حد ممکن نزدیک به فراخوانی API است.
-                         */
                         request.dispatchNanos =
                                 SystemClock.elapsedRealtimeNanos();
 
@@ -622,7 +469,6 @@ public class AutoClickService extends AccessibilityService {
                         }
 
                         synchronized (request.callbackLock) {
-
                             request.dispatchReturnNanos =
                                     SystemClock.elapsedRealtimeNanos();
 
@@ -640,7 +486,6 @@ public class AutoClickService extends AccessibilityService {
                     false,
                     expired,
                     finishReason);
-
             return;
         }
 
@@ -656,16 +501,13 @@ public class AutoClickService extends AccessibilityService {
         boolean pendingExpired;
 
         synchronized (request.callbackLock) {
-
             pendingCallback = request.callbackPending;
             pendingSuccess = request.callbackSuccess;
             pendingExpired = request.callbackExpired;
-
             request.callbackPending = false;
         }
 
         if (pendingCallback) {
-
             finishActive(
                     request,
                     pendingSuccess,
@@ -675,7 +517,6 @@ public class AutoClickService extends AccessibilityService {
                             : REASON_GESTURE_CANCELLED);
 
         } else if (!accepted) {
-
             finishActive(
                     request,
                     false,
@@ -725,7 +566,6 @@ public class AutoClickService extends AccessibilityService {
                 MAX_COMPENSATION_NS);
 
         adaptiveSamples[adaptiveSampleCursor] = latencyEstimate;
-
         adaptiveSampleCursor =
                 (adaptiveSampleCursor + 1) % ADAPTIVE_WINDOW;
 
@@ -791,7 +631,6 @@ public class AutoClickService extends AccessibilityService {
 
     private static void sortPrefix(long[] values, int length) {
         for (int i = 1; i < length; i++) {
-
             long value = values[i];
             int j = i - 1;
 
@@ -841,11 +680,12 @@ public class AutoClickService extends AccessibilityService {
 
                 cancellationGeneration.incrementAndGet();
 
-                ClickRequest request;
+                ClickRequest armed = armedRequest;
+                armedRequest = null;
 
-                while ((request = pending.poll()) != null) {
-                    queued.add(request);
-                }
+                if (armed != null) queued.add(armed);
+
+                ClickRequest request;
 
                 while ((request = ready.poll()) != null) {
                     queued.add(request);
@@ -913,7 +753,6 @@ public class AutoClickService extends AccessibilityService {
     }
 
     public void setTarget(int x, int y) {
-
         int newX = Math.max(0, x);
         int newY = Math.max(0, y);
 
@@ -1044,9 +883,6 @@ public class AutoClickService extends AccessibilityService {
 
         long generation = cancellationGeneration.get();
 
-        TimingGroup group =
-                new TimingGroup(targetNanos, generation);
-
         ClickRequest request = new ClickRequest(
                 cycleStartNanos,
                 targetNanos,
@@ -1056,12 +892,13 @@ public class AutoClickService extends AccessibilityService {
                 completion,
                 1,
                 1,
-                generation,
-                group);
+                generation);
 
-        group.requests.add(request);
-
-        if (!enqueueGroup(group)) return false;
+        if (!enqueueRequests(
+                java.util.Collections.singletonList(request),
+                generation)) {
+            return false;
+        }
 
         lastRequestError = "";
         return true;
@@ -1115,7 +952,7 @@ public class AutoClickService extends AccessibilityService {
         long generation = cancellationGeneration.get();
         long previous = Long.MIN_VALUE;
 
-        List<Long> validatedTargets =
+        List<ClickRequest> requests =
                 new ArrayList<>(targets.length);
 
         for (int i = 0; i < targets.length; i++) {
@@ -1147,54 +984,61 @@ public class AutoClickService extends AccessibilityService {
             }
 
             previous = target;
-            validatedTargets.add(target);
-        }
 
-        TimingGroup group = new TimingGroup(
-                validatedTargets.get(0),
-                generation);
-
-        for (int i = 0; i < targets.length; i++) {
-
-            group.requests.add(new ClickRequest(
+            requests.add(new ClickRequest(
                     cycleStart,
-                    targets[i],
+                    target,
                     deadline,
                     touchDurationNanos,
                     gesture,
                     completions[i],
                     i + 1,
                     targets.length,
-                    generation,
-                    group));
+                    generation));
         }
 
-        if (!enqueueGroup(group)) return false;
+        if (!enqueueRequests(requests, generation)) return false;
 
         lastRequestError = "";
         return true;
     }
 
-    private boolean enqueueGroup(TimingGroup group) {
+    private boolean enqueueRequests(
+            List<ClickRequest> requests,
+            long generation) {
 
         if (!serviceReady || schedulerStopping) {
-            lastRequestError =
-                    "سرویس کلیک متوقف شده است";
+            lastRequestError = "سرویس کلیک متوقف شده است";
             return false;
+        }
+
+        long compensation = clamp(
+                adaptiveCompensationNs.get(),
+                MIN_COMPENSATION_NS,
+                MAX_COMPENSATION_NS);
+
+        long deviation = adaptiveDeviationNs.get();
+
+        for (ClickRequest request : requests) {
+            request.compensationNanos = compensation;
+            request.deviationNanos = deviation;
+            request.dispatchLeadNanos =
+                    STROKE_OFFSET_NS + compensation;
+            request.dispatchTargetNanos =
+                    request.targetNanos - request.dispatchLeadNanos;
         }
 
         synchronized (queueLock) {
 
             if (!serviceReady || schedulerStopping
-                    || group.cancelGeneration
-                    != cancellationGeneration.get()) {
+                    || generation != cancellationGeneration.get()) {
 
                 lastRequestError =
                         "درخواست هنگام ثبت لغو شده است";
                 return false;
             }
 
-            pending.addAll(group.requests);
+            ready.addAll(requests);
             queueVersion.incrementAndGet();
         }
 
@@ -1204,10 +1048,7 @@ public class AutoClickService extends AccessibilityService {
 
     private void wakeScheduler() {
         Thread worker = schedulerThread;
-
-        if (worker != null) {
-            LockSupport.unpark(worker);
-        }
+        if (worker != null) LockSupport.unpark(worker);
     }
 
     private void finishQueuedOrDispatching(
@@ -1216,17 +1057,11 @@ public class AutoClickService extends AccessibilityService {
             boolean expired,
             String reason) {
 
-        int state;
-
-        do {
-            state = request.state.get();
-
-            if (state == FINISHED || state == ACTIVE) return;
-
-        } while (!request.state.compareAndSet(state, FINISHED));
+        if (!request.state.compareAndSet(QUEUED, FINISHED)) {
+            return;
+        }
 
         request.terminalReason = reason;
-
         deliverCompletion(request, success, expired);
     }
 
@@ -1303,11 +1138,12 @@ public class AutoClickService extends AccessibilityService {
 
                 cancellationGeneration.incrementAndGet();
 
-                ClickRequest request;
+                ClickRequest armed = armedRequest;
+                armedRequest = null;
 
-                while ((request = pending.poll()) != null) {
-                    queued.add(request);
-                }
+                if (armed != null) queued.add(armed);
+
+                ClickRequest request;
 
                 while ((request = ready.poll()) != null) {
                     queued.add(request);
@@ -1334,22 +1170,14 @@ public class AutoClickService extends AccessibilityService {
 
         File directory = getExternalFilesDir("benchmark");
 
-        if (directory == null) {
-            directory = getFilesDir();
-        }
+        if (directory == null) directory = getFilesDir();
 
-        if (!directory.exists() && !directory.mkdirs()) {
-            return;
-        }
+        if (!directory.exists() && !directory.mkdirs()) return;
 
         benchmarkFile = new File(directory, CSV_NAME);
 
         benchmarkWriter = Executors.newSingleThreadExecutor(r -> {
-
-            Thread thread = new Thread(
-                    r,
-                    "ClickBenchmarkWriter");
-
+            Thread thread = new Thread(r, "ClickBenchmarkWriter");
             thread.setPriority(Thread.NORM_PRIORITY - 1);
             return thread;
         });
@@ -1364,13 +1192,12 @@ public class AutoClickService extends AccessibilityService {
                     "session_start_epoch_ms,request_id,"
                     + "cycle_start_elapsed_ns,target_elapsed_ns,"
                     + "dispatch_target_elapsed_ns,deadline_elapsed_ns,"
-                    + "enqueue_elapsed_ns,scheduler_wake_elapsed_ns,"
-                    + "scheduler_select_elapsed_ns,"
-                    + "scheduler_queue_lock_wait_ns,"
-                    + "dispatch_queue_lock_wait_ns,"
-                    + "dispatch_lock_wait_ns,dispatch_prepare_elapsed_ns,"
-                    + "scheduler_ready_elapsed_ns,dispatch_elapsed_ns,"
-                    + "dispatch_pipeline_ns,scheduler_ready_late_ns,"
+                    + "enqueue_elapsed_ns,preselected_elapsed_ns,"
+                    + "scheduler_wake_elapsed_ns,scheduler_select_elapsed_ns,"
+                    + "scheduler_queue_lock_wait_ns,dispatch_lock_wait_ns,"
+                    + "scheduler_ready_elapsed_ns,dispatch_prepare_elapsed_ns,"
+                    + "dispatch_elapsed_ns,dispatch_pipeline_ns,"
+                    + "preselect_lead_ns,scheduler_ready_late_ns,"
                     + "dispatch_late_ns,dispatch_schedule_late_ns,"
                     + "estimated_stroke_start_error_ns,"
                     + "adaptive_compensation_ns,adaptive_deviation_ns,"
@@ -1383,7 +1210,6 @@ public class AutoClickService extends AccessibilityService {
             try (FileWriter writer = new FileWriter(output, true)) {
                 writer.write(header);
                 writer.flush();
-
             } catch (IOException ignored) {
             }
         });
@@ -1394,42 +1220,38 @@ public class AutoClickService extends AccessibilityService {
         ExecutorService writer = benchmarkWriter;
         File output = benchmarkFile;
 
-        if (writer == null || output == null || request == null) {
-            return;
-        }
+        if (writer == null || output == null || request == null) return;
 
         long dispatch = request.dispatchNanos;
         long callback = request.callbackNanos;
         long readyTime = request.schedulerReadyNanos;
 
         long late = dispatch == 0L
-                ? 0L
-                : dispatch - request.targetNanos;
+                ? 0L : dispatch - request.targetNanos;
 
         long scheduleLate = dispatch == 0L
-                ? 0L
-                : dispatch - request.dispatchTargetNanos;
+                ? 0L : dispatch - request.dispatchTargetNanos;
 
         long pipeline = dispatch == 0L || readyTime == 0L
-                ? 0L
-                : dispatch - readyTime;
+                ? 0L : dispatch - readyTime;
 
         long readyLate = readyTime == 0L
-                ? 0L
-                : readyTime - request.dispatchTargetNanos;
+                ? 0L : readyTime - request.dispatchTargetNanos;
 
         long strokeError = dispatch == 0L
                 ? 0L
                 : dispatch + STROKE_OFFSET_NS - request.targetNanos;
 
         long callbackDelay = dispatch == 0L || callback == 0L
-                ? 0L
-                : callback - dispatch;
+                ? 0L : callback - dispatch;
 
         long callDuration = request.dispatchReturnNanos == 0L
                 || dispatch == 0L
+                ? 0L : request.dispatchReturnNanos - dispatch;
+
+        long preselectLead = request.preselectedNanos == 0L
                 ? 0L
-                : request.dispatchReturnNanos - dispatch;
+                : request.dispatchTargetNanos - request.preselectedNanos;
 
         String reason = request.terminalReason;
 
@@ -1437,10 +1259,8 @@ public class AutoClickService extends AccessibilityService {
             reason = REASON_GESTURE_CANCELLED;
         }
 
-        String result =
-                REASON_SUCCESS.equals(reason)
-                        ? "SUCCESS"
-                        : "FAILED";
+        String result = REASON_SUCCESS.equals(reason)
+                ? "SUCCESS" : "FAILED";
 
         String row =
                 benchmarkSessionId + ","
@@ -1450,15 +1270,16 @@ public class AutoClickService extends AccessibilityService {
                 + request.dispatchTargetNanos + ","
                 + request.deadlineNanos + ","
                 + request.enqueueNanos + ","
+                + request.preselectedNanos + ","
                 + request.schedulerWakeNanos + ","
                 + request.schedulerSelectNanos + ","
                 + request.schedulerQueueLockWaitNanos + ","
-                + request.dispatchQueueLockWaitNanos + ","
                 + request.dispatchLockWaitNanos + ","
-                + request.dispatchPrepareNanos + ","
                 + readyTime + ","
+                + request.dispatchPrepareNanos + ","
                 + dispatch + ","
                 + pipeline + ","
+                + preselectLead + ","
                 + readyLate + ","
                 + late + ","
                 + scheduleLate + ","
@@ -1479,34 +1300,25 @@ public class AutoClickService extends AccessibilityService {
 
         try {
             writer.execute(() -> {
-
                 try (BufferedWriter out =
                              new BufferedWriter(
                                      new FileWriter(output, true))) {
-
                     out.write(row);
                     out.flush();
-
                 } catch (IOException ignored) {
                 }
             });
-
         } catch (Exception ignored) {
         }
     }
 
     private void stopBenchmarkWriter() {
-
         ExecutorService writer = benchmarkWriter;
         benchmarkWriter = null;
-
-        if (writer != null) {
-            writer.shutdown();
-        }
+        if (writer != null) writer.shutdown();
     }
 
     private void runOnMain(Runnable action) {
-
         if (Looper.myLooper() == Looper.getMainLooper()) {
             action.run();
         } else {
