@@ -1,3 +1,4 @@
+```yaml
 name: Build Precision Loop Auto Clicker
 
 on:
@@ -27,9 +28,13 @@ jobs:
           packages: 'platform-tools'
           accept-android-sdk-licenses: true
 
-      - name: Install Android SDK packages
+      - name: Install Android SDK, NDK and CMake
         run: |
-          sdkmanager --install "platforms;android-35" "build-tools;35.0.0"
+          sdkmanager --install \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;27.2.12479018" \
+            "cmake;3.22.1"
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -45,3 +50,4 @@ jobs:
           name: Precision-Loop-Auto-Clicker-APK
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+```
