@@ -1,48 +1,71 @@
-name: "Build Precision Loop Auto Clicker"
+name: Build Precision Loop Auto Clicker
 
 on:
   workflow_dispatch:
   push:
     branches:
-      - "main"
+      - main
 
 jobs:
   build:
-    name: "Build Android APK"
-    runs-on: "ubuntu-latest"
+    name: Build Android APK and Native Test
+    runs-on: ubuntu-latest
 
     steps:
-      - name: "Checkout repository"
+      - name: Checkout repository
         uses: actions/checkout@v5
 
-      - name: "Setup JDK 17"
+      - name: Setup JDK 17
         uses: actions/setup-java@v5
         with:
-          distribution: "temurin"
-          java-version: "17"
+          distribution: temurin
+          java-version: '17'
 
-      - name: "Setup Android SDK"
+      - name: Setup Android SDK
         uses: android-actions/setup-android@v4
-        with:
-          packages: "platform-tools"
-          accept-android-sdk-licenses: true
 
-      - name: "Install Android SDK packages"
+      - name: Install Android SDK, NDK and CMake
         run: |
-          sdkmanager --install "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
+          sdkmanager --install \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;27.2.12479018" \
+            "cmake;3.22.1"
 
-      - name: "Setup Gradle"
+      - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: "8.9"
+          gradle-version: '8.9'
 
-      - name: "Build Debug APK"
+      - name: Build Native uinput Test
+        run: |
+          NDK_DIR="$ANDROID_HOME/ndk/27.2.12479018"
+          CLANG="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi26-clang++"
+
+          mkdir -p native-test/output
+
+          "$CLANG" \
+            -std=c++17 \
+            -O2 \
+            -Wall \
+            native-test/uinput_test.cpp \
+            -o native-test/output/uinput_test
+
+          file native-test/output/uinput_test
+
+      - name: Build Debug APK
         run: gradle assembleDebug
 
-      - name: "Upload APK"
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: "Precision-Loop-Auto-Clicker-APK"
-          path: "app/build/outputs/apk/debug/app-debug.apk"
-          if-no-files-found: "error"
+          name: Precision-Loop-Auto-Clicker-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
 
+      - name: Upload Native Test
+        uses: actions/upload-artifact@v4
+        with:
+          name: uinput-test-armeabi-v7a
+          path: native-test/output/uinput_test
+          if-no-files-found: error
